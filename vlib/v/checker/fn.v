@@ -118,6 +118,10 @@ fn (mut c Checker) fn_decl(mut node ast.FnDecl) {
 			}
 		}
 	}
+	if node.return_type == ast.no_type {
+		c.error('invalid return type in fn `${node.name}`', node.pos)
+		return
+	}
 	c.fn_return_type = node.return_type
 	return_type_unaliased := c.table.unaliased_type(node.return_type)
 	if node.return_type.has_flag(.option) && return_type_unaliased.has_flag(.result) {
@@ -747,8 +751,23 @@ fn (mut c Checker) call_expr(mut node ast.CallExpr) ast.Type {
 		c.inside_or_block_value = true
 		c.check_or_expr(node.or_block, typ, c.expected_or_type, node)
 		c.inside_or_block_value = old_inside_or_block_value
+	} else if node.or_block.kind == .propagate_option || node.or_block.kind == .propagate_result {
+		if c.pref.skip_unused && !c.is_builtin_mod && c.mod != 'strings' {
+			c.table.used_features.option_or_result = true
+		}
 	}
 	c.expected_or_type = old_expected_or_type
+	if c.pref.skip_unused && !c.is_builtin_mod && c.mod == 'main' {
+		if node.is_method {
+			type_str := c.table.type_to_str(node.left_type)
+			if c.table.sym(node.left_type).is_builtin()
+				&& type_str !in c.table.used_features.used_modules {
+				c.table.used_features.used_modules[type_str] = true
+			}
+		} else if node.name.contains('.') {
+			c.table.used_features.used_modules[node.name.all_before('.')] = true
+		}
+	}
 
 	if !c.inside_const && c.table.cur_fn != unsafe { nil } && !c.table.cur_fn.is_main
 		&& !c.table.cur_fn.is_test {
@@ -765,7 +784,6 @@ fn (mut c Checker) call_expr(mut node ast.CallExpr) ast.Type {
 				node.or_block.pos)
 		}
 	}
-
 	return typ
 }
 
@@ -850,6 +868,7 @@ fn (mut c Checker) fn_call(mut node ast.CallExpr, mut continue_check &bool) ast.
 		if c.table.cur_fn != unsafe { nil } {
 			node.left_type, fn_name = c.table.convert_generic_static_type_name(fn_name,
 				c.table.cur_fn.generic_names, c.table.cur_concrete_types)
+			c.table.used_features.comptime_calls[fn_name] = true
 		}
 	}
 	if fn_name == 'main' {
@@ -983,6 +1002,11 @@ fn (mut c Checker) fn_call(mut node ast.CallExpr, mut continue_check &bool) ast.
 	mut func := ast.Fn{}
 	mut found := false
 	mut found_in_args := false
+	defer {
+		if found {
+			c.check_must_use_call_result(node, func, 'function')
+		}
+	}
 	// anon fn direct call
 	if node.left is ast.AnonFn {
 		// it was set to anon for checker errors, clear for gen
@@ -1328,6 +1352,7 @@ fn (mut c Checker) fn_call(mut node ast.CallExpr, mut continue_check &bool) ast.
 		c.error('unknown function: ${node.get_name()}', node.pos)
 		return ast.void_type
 	}
+
 	node.is_file_translated = func.is_file_translated
 	node.is_noreturn = func.is_noreturn
 	node.is_expand_simple_interpolation = func.is_expand_simple_interpolation
@@ -1392,14 +1417,15 @@ fn (mut c Checker) fn_call(mut node ast.CallExpr, mut continue_check &bool) ast.
 	// println / eprintln / panic can print anything
 	if node.args.len > 0 && fn_name in print_everything_fns {
 		c.builtin_args(mut node, fn_name, func)
-		if c.pref.skip_unused && !c.is_builtin_mod && node.args[0].expr !is ast.StringLiteral {
+		if c.pref.skip_unused && !c.is_builtin_mod && c.mod != 'math.bits'
+			&& node.args[0].expr !is ast.StringLiteral {
 			if !c.table.sym(c.unwrap_generic(node.args[0].typ)).has_method('str') {
 				c.table.used_features.auto_str = true
-				if node.args[0].typ.is_ptr() {
-					c.table.used_features.auto_str_ptr = true
-				}
 			} else {
 				c.table.used_features.print_types[node.args[0].typ.idx()] = true
+			}
+			if node.args[0].typ.is_ptr() {
+				c.table.used_features.auto_str_ptr = true
 			}
 		}
 		return func.return_type
@@ -2153,8 +2179,14 @@ fn (mut c Checker) method_call(mut node ast.CallExpr, mut continue_check &bool) 
 		continue_check = false
 		return ast.void_type
 	}
-	if c.pref.skip_unused && !c.is_builtin_mod && c.mod != 'strings' {
-		c.table.used_features.builtin_types = true
+	if c.pref.skip_unused {
+		if !left_type.has_flag(.generic) && mut left_expr is ast.Ident {
+			if left_expr.obj is ast.Var && left_expr.obj.ct_type_var == .smartcast {
+				c.table.used_features.comptime_calls['${int(left_type)}.${node.name}'] = true
+			}
+		} else if left_type.has_flag(.generic) {
+			c.table.used_features.comptime_calls['${int(c.unwrap_generic(left_type))}.${node.name}'] = true
+		}
 	}
 	c.expected_type = left_type
 	mut is_generic := left_type.has_flag(.generic)
@@ -2234,6 +2266,11 @@ fn (mut c Checker) method_call(mut node ast.CallExpr, mut continue_check &bool) 
 	mut method := ast.Fn{}
 	mut has_method := false
 	mut is_method_from_embed := false
+	defer {
+		if has_method && node.is_method {
+			c.check_must_use_call_result(node, method, 'method')
+		}
+	}
 	if m := c.table.find_method(left_sym, method_name) {
 		method = m
 		has_method = true
@@ -2281,6 +2318,9 @@ fn (mut c Checker) method_call(mut node ast.CallExpr, mut continue_check &bool) 
 			if embed_types.len != 0 {
 				is_method_from_embed = true
 				node.from_embed_types = embed_types
+				if c.pref.skip_unused && node.left_type.has_flag(.generic) {
+					c.table.used_features.comptime_calls['${int(method.receiver_type)}.${method.name}'] = true
+				}
 			}
 		}
 		if final_left_sym.kind == .aggregate {
@@ -2303,6 +2343,9 @@ fn (mut c Checker) method_call(mut node ast.CallExpr, mut continue_check &bool) 
 				c.error('.str() method calls should have no arguments', node.pos)
 			}
 			c.fail_if_unreadable(node.left, left_type, 'receiver')
+			if !c.is_builtin_mod {
+				c.table.used_features.auto_str = true
+			}
 			return ast.string_type
 		} else if method_name == 'free' {
 			if !c.is_builtin_mod && !c.inside_unsafe && !method.is_unsafe {
@@ -2935,6 +2978,9 @@ fn (mut c Checker) check_expected_arg_count(mut node ast.CallExpr, f &ast.Fn) ! 
 	}
 	if f.is_variadic {
 		min_required_params--
+		if c.pref.skip_unused && !c.is_builtin_mod {
+			c.table.used_features.arr_init = true
+		}
 	} else {
 		has_decompose := node.args.any(it.expr is ast.ArrayDecompose)
 		if has_decompose {
@@ -3315,6 +3361,7 @@ fn (mut c Checker) array_builtin_method_call(mut node ast.CallExpr, left_type as
 					return ast.void_type
 				}
 			}
+			c.table.used_features.arr_insert = true
 		} else {
 			c.table.used_features.arr_prepend = true
 			if node.args.len != 1 {
@@ -3423,9 +3470,9 @@ fn (mut c Checker) array_builtin_method_call(mut node ast.CallExpr, left_type as
 				} else if left_name == right_name {
 					c.error('`.${method_name}()` cannot use same argument', node.pos)
 				}
-				if node.args[0].expr.left !in [ast.Ident, ast.SelectorExpr, ast.IndexExpr]
-					|| node.args[0].expr.right !in [ast.Ident, ast.SelectorExpr, ast.IndexExpr] {
-					c.error('`.${method_name}()` can only use ident, index or selector as argument, \ne.g. `arr.${method_name}(a < b)`, `arr.${method_name}(a.id < b.id)`, `arr.${method_name}(a[0] < b[0])`',
+				if node.args[0].expr.left !in [ast.CallExpr, ast.Ident, ast.SelectorExpr, ast.IndexExpr]
+					|| node.args[0].expr.right !in [ast.CallExpr, ast.Ident, ast.SelectorExpr, ast.IndexExpr] {
+					c.error('`.${method_name}()` can only use ident, index, selector or call as argument, \ne.g. `arr.${method_name}(a < b)`, `arr.${method_name}(a.id < b.id)`, `arr.${method_name}(a[0] < b[0])`',
 						node.pos)
 				}
 			} else {
@@ -3551,7 +3598,7 @@ fn (mut c Checker) array_builtin_method_call(mut node ast.CallExpr, left_type as
 		}
 		node.return_type = ast.int_type
 	} else if method_name in ['first', 'last', 'pop'] {
-		if c.pref.skip_unused {
+		if c.pref.skip_unused && !c.is_builtin_mod {
 			if method_name == 'first' {
 				c.table.used_features.arr_first = true
 			}
@@ -3573,6 +3620,9 @@ fn (mut c Checker) array_builtin_method_call(mut node ast.CallExpr, left_type as
 			node.receiver_type = node.left_type
 		}
 	} else if method_name == 'delete' {
+		if c.pref.skip_unused && !c.is_builtin_mod {
+			c.table.used_features.arr_delete = true
+		}
 		c.check_for_mut_receiver(mut node.left)
 		unwrapped_left_sym := c.table.sym(unwrapped_left_type)
 		if method := c.table.find_method(unwrapped_left_sym, method_name) {
@@ -3587,6 +3637,8 @@ fn (mut c Checker) array_builtin_method_call(mut node ast.CallExpr, left_type as
 			}
 		}
 		node.return_type = ast.void_type
+	} else if method_name == 'reverse' {
+		c.table.used_features.arr_reverse = true
 	}
 	return node.return_type
 }
@@ -3948,4 +4000,21 @@ fn (mut c Checker) resolve_return_type(node ast.CallExpr) ast.Type {
 		}
 	}
 	return node.return_type
+}
+
+fn (mut c Checker) check_must_use_call_result(node &ast.CallExpr, f &ast.Fn, label string) {
+	if node.is_return_used {
+		return
+	}
+	if f.return_type == ast.void_type {
+		return
+	}
+	if f.is_must_use {
+		c.warn('return value must be used, ${label} `${f.name}` was tagged with `@[must_use]`',
+			node.pos)
+		return
+	}
+	if c.pref.is_check_return {
+		c.note('return value must be used', node.pos)
+	}
 }

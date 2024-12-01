@@ -154,6 +154,7 @@ mut:
 	inside_for_c_stmt         bool
 	inside_cast_in_heap       int // inside cast to interface type in heap (resolve recursive calls)
 	inside_cast               bool
+	inside_memset             bool
 	inside_const              bool
 	inside_array_item         bool
 	inside_const_opt_or_res   bool
@@ -667,6 +668,11 @@ pub fn gen(files []&ast.File, mut table ast.Table, pref_ &pref.Preferences) (str
 
 fn cgen_process_one_file_cb(mut p pool.PoolProcessor, idx int, wid int) &Gen {
 	file := p.get_item[&ast.File](idx)
+	timing_label_for_thread := 'C GEN thread ${wid}'
+	util.timing_start(timing_label_for_thread)
+	defer {
+		util.timing_measure_cumulative(timing_label_for_thread)
+	}
 	mut global_g := unsafe { &Gen(p.get_shared_context()) }
 	mut g := &Gen{
 		file:                  file
@@ -856,6 +862,12 @@ pub fn (mut g Gen) init() {
 	if g.pref.os == .ios {
 		g.cheaders.writeln('#define __TARGET_IOS__ 1')
 		g.cheaders.writeln('#include <spawn.h>')
+	}
+	if g.pref.os == .linux {
+		g.cheaders.writeln('#if __GLIBC__ == 2 && __GLIBC_MINOR__ < 30')
+		g.cheaders.writeln('#include <sys/syscall.h>')
+		g.cheaders.writeln('#define gettid() syscall(SYS_gettid)')
+		g.cheaders.writeln('#endif')
 	}
 	g.write_builtin_types()
 	g.options_pos_forward = g.type_definitions.len
@@ -1626,6 +1638,7 @@ static inline void __${sym.cname}_pushval(${sym.cname} ch, ${push_arg} val) {
 }
 
 pub fn (mut g Gen) write_alias_typesymbol_declaration(sym ast.TypeSymbol) {
+	mut levels := 0
 	parent := g.table.type_symbols[sym.parent_idx]
 	is_c_parent := parent.name.len > 2 && parent.name[0] == `C` && parent.name[1] == `.`
 	mut is_fixed_array_of_non_builtin := false
@@ -1639,9 +1652,30 @@ pub fn (mut g Gen) write_alias_typesymbol_declaration(sym ast.TypeSymbol) {
 			parent_styp = g.styp(sym.info.parent_type)
 			parent_sym := g.table.sym(sym.info.parent_type)
 			if parent_sym.info is ast.ArrayFixed {
-				elem_sym := g.table.sym(parent_sym.info.elem_type)
+				mut elem_sym := g.table.sym(parent_sym.info.elem_type)
 				if !elem_sym.is_builtin() {
 					is_fixed_array_of_non_builtin = true
+				}
+
+				mut parent_elem_info := parent_sym.info as ast.ArrayFixed
+				mut parent_elem_styp := g.styp(sym.info.parent_type)
+				mut out := strings.new_builder(50)
+				for {
+					if mut elem_sym.info is ast.ArrayFixed {
+						old := out.str()
+						out.clear()
+						out.writeln('typedef ${elem_sym.cname} ${parent_elem_styp} [${parent_elem_info.size}];')
+						out.writeln(old)
+						parent_elem_styp = elem_sym.cname
+						parent_elem_info = elem_sym.info as ast.ArrayFixed
+						elem_sym = g.table.sym(elem_sym.info.elem_type)
+						levels++
+					} else {
+						break
+					}
+				}
+				if out.len != 0 {
+					g.type_definitions.writeln(out.str())
 				}
 			}
 		}
@@ -1650,7 +1684,7 @@ pub fn (mut g Gen) write_alias_typesymbol_declaration(sym ast.TypeSymbol) {
 		// TODO: remove this check; it is here just to fix V rebuilding in -cstrict mode with clang-12
 		return
 	}
-	if is_fixed_array_of_non_builtin {
+	if is_fixed_array_of_non_builtin && levels == 0 {
 		g.alias_definitions.writeln('typedef ${parent_styp} ${sym.cname};')
 	} else {
 		g.type_definitions.writeln('typedef ${parent_styp} ${sym.cname};')
@@ -2557,7 +2591,7 @@ fn (mut g Gen) call_cfn_for_casting_expr(fname string, expr ast.Expr, exp_is_ptr
 }
 
 // use instead of expr() when you need a var to use as reference
-fn (mut g Gen) expr_with_var(expr ast.Expr, expected_type ast.Type) string {
+fn (mut g Gen) expr_with_var(expr ast.Expr, expected_type ast.Type, do_cast bool) string {
 	stmt_str := g.go_before_last_stmt().trim_space()
 	g.empty_line = true
 	tmp_var := g.new_tmp_var()
@@ -2565,6 +2599,9 @@ fn (mut g Gen) expr_with_var(expr ast.Expr, expected_type ast.Type) string {
 
 	g.writeln('${styp} ${tmp_var};')
 	g.write('memcpy(&${tmp_var}, ')
+	if do_cast {
+		g.write('(${styp})')
+	}
 	g.expr(expr)
 	g.writeln(', sizeof(${styp}));')
 	g.write(stmt_str)
@@ -5515,9 +5552,10 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 	g.set_current_pos_as_last_stmt_pos()
 	g.write_v_source_line_info_stmt(node)
 
+	old_inside_return := g.inside_return
 	g.inside_return = true
 	defer {
-		g.inside_return = false
+		g.inside_return = old_inside_return
 	}
 
 	if node.exprs.len > 0 {
@@ -5896,8 +5934,10 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 			if expr is ast.Ident {
 				g.returned_var_name = expr.name
 			}
+			if !use_tmp_var && !g.is_builtin_mod {
+				use_tmp_var = expr is ast.CallExpr
+			}
 		}
-		// free := g.is_autofree && !g.is_builtin_mod // node.exprs[0] is ast.CallExpr
 		// Create a temporary variable for the return expression
 		if use_tmp_var || !g.is_builtin_mod {
 			// `return foo(a, b, c)`
@@ -5906,11 +5946,10 @@ fn (mut g Gen) return_stmt(node ast.Return) {
 			// Don't use a tmp var if a variable is simply returned: `return x`
 			// Just in case of defer statements exists, that the return values cannot
 			// be modified.
-			if use_tmp_var || !(node.exprs[0].is_literal() || node.exprs[0] is ast.Ident) {
+			if use_tmp_var {
 				use_tmp_var = true
 				g.write('${ret_typ} ${tmpvar} = ')
 			} else {
-				use_tmp_var = false
 				if !g.is_builtin_mod {
 					g.autofree_scope_vars(node.pos.pos - 1, node.pos.line_nr, true)
 				}
@@ -6647,7 +6686,7 @@ fn (mut g Gen) write_init_function() {
 		g.write('\tas_cast_type_indexes = ')
 		g.writeln(g.as_cast_name_table())
 	}
-	if !g.pref.is_shared && (!g.pref.skip_unused || g.table.used_features.builtin_types) {
+	if !g.pref.is_shared && (!g.pref.skip_unused || g.table.used_features.used_modules.len > 0) {
 		// shared object does not need this
 		g.writeln('\tbuiltin_init();')
 	}
@@ -6730,7 +6769,9 @@ fn (mut g Gen) write_init_function() {
 		for mod_name in reversed_table_modules {
 			g.writeln2('\t// Cleanups for module ${mod_name} :', g.cleanups[mod_name].str())
 		}
-		g.writeln('\tarray_free(&as_cast_type_indexes);')
+		if g.as_cast_type_names.len > 0 {
+			g.writeln('\tarray_free(&as_cast_type_indexes);')
+		}
 	}
 	for x in cleaning_up_array.reverse() {
 		g.writeln(x)
@@ -6893,7 +6934,7 @@ fn (mut g Gen) write_types(symbols []&ast.TypeSymbol) {
 					if variant in idxs {
 						continue
 					}
-					g.type_definitions.writeln('//          | ${variant:4d} = ${g.styp(variant.idx_type()):-20s}')
+					g.type_definitions.writeln('//          | ${variant:4d} = ${g.styp(variant.idx_type())}')
 					idxs << variant
 				}
 				idxs.clear()
@@ -6924,7 +6965,7 @@ fn (mut g Gen) write_types(symbols []&ast.TypeSymbol) {
 				if sym.info.fields.len > 0 {
 					g.writeln('\t// pointers to common sumtype fields')
 					for field in sym.info.fields {
-						g.type_definitions.writeln('\t${g.styp(field.typ.ref())} ${c_name(field.name)};')
+						g.type_definitions.writeln('\t${g.styp(field.typ)}* ${c_name(field.name)};')
 					}
 				}
 				g.type_definitions.writeln('};')
@@ -7795,8 +7836,16 @@ fn (mut g Gen) as_cast(node ast.AsCast) {
 	} else {
 		mut is_optional_ident_var := false
 		if node.expr is ast.Ident {
-			if node.expr.info is ast.IdentVar && node.expr.info.is_option {
+			if node.expr.info is ast.IdentVar && node.expr.info.is_option
+				&& !unwrapped_node_typ.has_flag(.option) {
 				g.unwrap_option_type(unwrapped_node_typ, node.expr.name, node.expr.is_auto_heap())
+				is_optional_ident_var = true
+			}
+		} else if node.expr is ast.SelectorExpr {
+			if node.expr.expr is ast.Ident && node.expr.typ.has_flag(.option)
+				&& !unwrapped_node_typ.has_flag(.option) {
+				g.unwrap_option_type(node.expr.typ, '${node.expr.expr.name}.${node.expr.field_name}',
+					node.expr.expr.is_auto_heap())
 				is_optional_ident_var = true
 			}
 		}

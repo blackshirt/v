@@ -80,6 +80,12 @@ pub fn (mut w Walker) mark_global_as_used(ckey string) {
 	w.used_globals[ckey] = true
 	gfield := w.all_globals[ckey] or { return }
 	w.expr(gfield.expr)
+	if !gfield.has_expr && gfield.typ != 0 {
+		sym := w.table.sym(gfield.typ)
+		if sym.info is ast.Struct {
+			w.a_struct_info(sym.name, sym.info)
+		}
+	}
 }
 
 pub fn (mut w Walker) mark_root_fns(all_fn_root_names []string) {
@@ -90,6 +96,19 @@ pub fn (mut w Walker) mark_root_fns(all_fn_root_names []string) {
 			}
 			unsafe { w.fn_decl(mut w.all_fns[fn_name]) }
 		}
+	}
+}
+
+pub fn (mut w Walker) mark_veb_actions() {
+	for _, mut func in w.all_fns {
+		if func.return_type == w.table.veb_res_idx_cache {
+			// if fn_name !in w.used_fns {
+			$if trace_skip_veb_actions ? {
+				println('>>>> walking veb action func: ${func.name} ...')
+			}
+			w.fn_decl(mut func)
+		}
+		//}
 	}
 }
 
@@ -104,7 +123,7 @@ pub fn (mut w Walker) mark_exported_fns() {
 	}
 }
 
-pub fn (mut w Walker) mark_markused_fns() {
+pub fn (mut w Walker) mark_markused_fn_decls() {
 	for _, mut func in w.all_fns {
 		if func.is_markused {
 			$if trace_skip_unused_markused_fns ? {
@@ -286,6 +305,10 @@ fn (mut w Walker) expr(node_ ast.Expr) {
 			w.fn_decl(mut node.decl)
 		}
 		ast.ArrayInit {
+			sym := w.table.final_sym(node.elem_type)
+			if sym.info is ast.Struct {
+				w.a_struct_info(sym.name, sym.info)
+			}
 			w.expr(node.len_expr)
 			w.expr(node.cap_expr)
 			w.expr(node.init_expr)
@@ -406,6 +429,7 @@ fn (mut w Walker) expr(node_ ast.Expr) {
 					// println('>>> else, ast.Ident kind: $node.kind')
 				}
 			}
+			w.or_block(node.or_expr)
 		}
 		ast.LambdaExpr {
 			w.expr(node.func)
@@ -416,6 +440,9 @@ fn (mut w Walker) expr(node_ ast.Expr) {
 		ast.MapInit {
 			w.exprs(node.keys)
 			w.exprs(node.vals)
+			if node.has_update_expr {
+				w.expr(node.update_expr)
+			}
 			w.features.used_maps++
 		}
 		ast.MatchExpr {
@@ -457,6 +484,7 @@ fn (mut w Walker) expr(node_ ast.Expr) {
 					w.fn_by_name(method.fkey())
 				}
 			}
+			w.or_block(node.or_block)
 		}
 		ast.SqlExpr {
 			w.expr(node.db_expr)
@@ -470,9 +498,8 @@ fn (mut w Walker) expr(node_ ast.Expr) {
 				return
 			}
 			sym := w.table.sym(node.typ)
-			if sym.kind == .struct {
-				info := sym.info as ast.Struct
-				w.a_struct_info(sym.name, info)
+			if sym.info is ast.Struct {
+				w.a_struct_info(sym.name, sym.info)
 			}
 			if node.has_update_expr {
 				w.expr(node.update_expr)
@@ -498,7 +525,14 @@ fn (mut w Walker) expr(node_ ast.Expr) {
 			w.expr(node.orig)
 		}
 		ast.Comment {}
-		ast.EnumVal {}
+		ast.EnumVal {
+			if e := w.table.enum_decls[node.enum_name] {
+				filtered := e.fields.filter(it.name == node.val)
+				if filtered.len != 0 && filtered[0].expr !is ast.EmptyExpr {
+					w.expr(filtered[0].expr)
+				}
+			}
+		}
 		ast.LockExpr {
 			w.stmts(node.stmts)
 		}
@@ -531,19 +565,45 @@ pub fn (mut w Walker) a_struct_info(sname string, info ast.Struct) {
 		}
 		if ifield.typ != 0 {
 			fsym := w.table.sym(ifield.typ)
-			if fsym.kind == .map {
-				w.features.used_maps++
-			} else if fsym.kind == .array {
-				w.features.used_arrays++
-			} else if fsym.kind == .struct {
-				w.a_struct_info(fsym.name, fsym.struct_info())
+			match fsym.info {
+				ast.Struct {
+					w.a_struct_info(fsym.name, fsym.info)
+				}
+				ast.Alias {
+					value_sym := w.table.final_sym(ifield.typ)
+					if value_sym.info is ast.Struct {
+						w.a_struct_info(value_sym.name, value_sym.info)
+					}
+				}
+				ast.Array, ast.ArrayFixed {
+					w.features.used_arrays++
+					value_sym := w.table.final_sym(w.table.value_type(ifield.typ))
+					if value_sym.info is ast.Struct {
+						w.a_struct_info(value_sym.name, value_sym.info)
+					}
+				}
+				ast.Map {
+					w.features.used_maps++
+					value_sym := w.table.final_sym(w.table.value_type(ifield.typ))
+					if value_sym.info is ast.Struct {
+						w.a_struct_info(value_sym.name, value_sym.info)
+					}
+				}
+				else {}
 			}
+		}
+	}
+	for embed in info.embeds {
+		sym := w.table.final_sym(embed)
+		if sym.info is ast.Struct {
+			w.a_struct_info(sym.name, sym.info)
 		}
 	}
 }
 
 pub fn (mut w Walker) fn_decl(mut node ast.FnDecl) {
 	if node.language == .c {
+		w.mark_fn_as_used(node.fkey())
 		return
 	}
 	fkey := node.fkey()
@@ -568,11 +628,32 @@ pub fn (mut w Walker) call_expr(mut node ast.CallExpr) {
 	if node.is_method && node.left_type != 0 {
 		left_sym := w.table.sym(node.left_type)
 		if left_sym.info is ast.Aggregate {
-			for types in left_sym.info.types {
-				fn_name := '${types.idx()}.${node.name}'
-				if !w.used_fns[fn_name] {
-					w.mark_aggregate_call_used(fn_name, types)
+			for receiver_type in left_sym.info.types {
+				receiver_sym := w.table.sym(receiver_type)
+				if m := receiver_sym.find_method(node.name) {
+					fn_name := '${int(m.receiver_type)}.${node.name}'
+					if !w.used_fns[fn_name] {
+						w.fn_by_name(fn_name)
+					}
 				}
+			}
+		} else if left_sym.info is ast.Interface {
+			for typ in left_sym.info.types {
+				sym := w.table.sym(typ)
+				_, embed_types := w.table.find_method_from_embeds(sym, node.name) or {
+					ast.Fn{}, []ast.Type{}
+				}
+				if embed_types.len != 0 {
+					fn_embed := '${int(embed_types.last())}.${node.name}'
+					w.fn_by_name(fn_embed)
+				}
+			}
+		} else if node.from_embed_types.len != 0 && !node.left_type.has_flag(.generic) {
+			_, embed_types := w.table.find_method_from_embeds(w.table.final_sym(node.left_type),
+				node.name) or { ast.Fn{}, []ast.Type{} }
+			if embed_types.len != 0 {
+				fn_embed := '${int(embed_types.last())}.${node.name}'
+				w.fn_by_name(fn_embed)
 			}
 		}
 	}
@@ -596,15 +677,21 @@ pub fn (mut w Walker) call_expr(mut node ast.CallExpr) {
 				else {}
 			}
 		}
+	} else if node.is_fn_a_const {
+		const_fn_name := '${node.mod}.${fn_name}'
+		if const_fn_name in w.all_consts {
+			w.mark_const_as_used(const_fn_name)
+		}
+	} else if node.is_fn_var {
+		w.mark_global_as_used(node.name)
 	}
-
 	w.mark_fn_as_used(fn_name)
 	if node.is_method && node.receiver_type.has_flag(.generic) && node.receiver_concrete_type != 0
 		&& !node.receiver_concrete_type.has_flag(.generic) {
 		// if receiver is generic, then cgen requires `node.receiver_type` to be T.
 		// We therefore need to get the concrete type from `node.receiver_concrete_type`.
 		fkey := '${int(node.receiver_concrete_type)}.${node.name}'
-		w.used_fns[fkey] = true
+		w.mark_fn_as_used(fkey)
 	}
 	stmt := w.all_fns[fn_name] or { return }
 	if stmt.name == node.name {
@@ -612,16 +699,6 @@ pub fn (mut w Walker) call_expr(mut node ast.CallExpr) {
 			w.stmts(stmt.stmts)
 		}
 	}
-}
-
-// visit aggregate type method declaration
-pub fn (mut w Walker) mark_aggregate_call_used(fn_name string, left_type ast.Type) {
-	if w.used_fns[fn_name] {
-		return
-	}
-	w.mark_fn_as_used(fn_name)
-	stmt := w.all_fns[fn_name] or { return }
-	w.stmts(stmt.stmts)
 }
 
 pub fn (mut w Walker) fn_by_name(fn_name string) {

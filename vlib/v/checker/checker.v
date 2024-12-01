@@ -1728,6 +1728,9 @@ fn (mut c Checker) selector_expr(mut node ast.SelectorExpr) ast.Type {
 		return field.typ
 	}
 	if mut method := c.table.sym(c.unwrap_generic(typ)).find_method_with_generic_parent(field_name) {
+		if c.pref.skip_unused && typ.has_flag(.generic) {
+			c.table.used_features.comptime_calls['${int(method.params[0].typ)}.${field_name}'] = true
+		}
 		if c.expected_type != 0 && c.expected_type != ast.none_type {
 			fn_type := ast.new_type(c.table.find_or_register_fn_type(method, false, true))
 			// if the expected type includes the receiver, don't hide it behind a closure
@@ -2150,7 +2153,9 @@ fn (mut c Checker) stmt(mut node ast.Stmt) {
 			}
 		}
 		ast.NodeError {}
-		ast.DebuggerStmt {}
+		ast.DebuggerStmt {
+			c.table.used_features.debugger = true
+		}
 		ast.AsmStmt {
 			c.asm_stmt(mut node)
 		}
@@ -2175,6 +2180,7 @@ fn (mut c Checker) stmt(mut node ast.Stmt) {
 			c.inside_const = false
 		}
 		ast.DeferStmt {
+			c.inside_defer = true
 			if node.idx_in_fn < 0 && c.table.cur_fn != unsafe { nil } {
 				node.idx_in_fn = c.table.cur_fn.defer_stmts.len
 				c.table.cur_fn.defer_stmts << unsafe { &node }
@@ -2201,7 +2207,6 @@ fn (mut c Checker) stmt(mut node ast.Stmt) {
 					node.defer_vars[i] = id
 				}
 			}
-			c.inside_defer = true
 			c.stmts(mut node.stmts)
 			c.inside_defer = false
 		}
@@ -2300,11 +2305,20 @@ fn (mut c Checker) stmt(mut node ast.Stmt) {
 
 fn (mut c Checker) assert_stmt(mut node ast.AssertStmt) {
 	if node.is_used {
-		c.table.used_features.auto_str = true
+		c.table.used_features.asserts = true
 	}
 	cur_exp_typ := c.expected_type
 	c.expected_type = ast.bool_type
 	assert_type := c.check_expr_option_or_result_call(node.expr, c.expr(mut node.expr))
+	if c.pref.skip_unused && !c.table.used_features.auto_str && !c.is_builtin_mod
+		&& mut node.expr is ast.InfixExpr {
+		if !c.table.sym(c.unwrap_generic(node.expr.left_type)).has_method('str') {
+			c.table.used_features.auto_str = true
+		}
+		if !c.table.sym(c.unwrap_generic(node.expr.right_type)).has_method('str') {
+			c.table.used_features.auto_str = true
+		}
+	}
 	if assert_type != ast.bool_type_idx {
 		atype_name := c.table.sym(assert_type).name
 		c.error('assert can be used only with `bool` expressions, but found `${atype_name}` instead',
@@ -2947,6 +2961,7 @@ pub fn (mut c Checker) expr(mut node ast.Expr) ast.Type {
 			return c.concat_expr(mut node)
 		}
 		ast.DumpExpr {
+			c.table.used_features.dump = true
 			c.expected_type = ast.string_type
 			node.expr_type = c.expr(mut node.expr)
 			if c.pref.skip_unused && !c.is_builtin_mod {
@@ -3181,6 +3196,10 @@ pub fn (mut c Checker) expr(mut node ast.Expr) ast.Type {
 		ast.StructInit {
 			if node.unresolved {
 				mut expr_ := c.table.resolve_init(node, c.unwrap_generic(node.typ))
+				if c.pref.skip_unused && c.table.used_features.used_maps == 0
+					&& expr_ is ast.MapInit {
+					c.table.used_features.used_maps++
+				}
 				return c.expr(mut expr_)
 			}
 			mut inited_fields := []string{}
@@ -3266,8 +3285,15 @@ fn (mut c Checker) cast_expr(mut node ast.CastExpr) ast.Type {
 		to_type
 	}
 	final_to_is_ptr := to_type.is_ptr() || final_to_type.is_ptr()
-	if to_type.is_ptr() {
-		c.table.used_features.cast_ptr = true
+	if c.pref.skip_unused && !c.is_builtin_mod {
+		if c.table.used_features.used_maps == 0 && mut final_to_sym.info is ast.SumType {
+			if final_to_sym.info.variants.any(c.table.final_sym(it).kind == .map) {
+				c.table.used_features.used_maps++
+			}
+		}
+		if c.mod !in ['strings', 'math.bits'] && to_type.is_ptr() {
+			c.table.used_features.cast_ptr = true
+		}
 	}
 	if to_type.has_flag(.result) {
 		c.error('casting to Result type is forbidden', node.pos)
@@ -3882,6 +3908,9 @@ fn (mut c Checker) ident(mut node ast.Ident) ast.Type {
 		if node.tok_kind == .assign && node.is_mut {
 			c.error('`mut` is not allowed with `=` (use `:=` to declare a variable)',
 				node.pos)
+		}
+		if c.pref.skip_unused && !c.is_builtin_mod && node.language == .v && node.name.contains('.') {
+			c.table.used_features.used_modules[node.name.all_before('.')] = true
 		}
 		if mut obj := node.scope.find(node.name) {
 			match mut obj {
@@ -4761,9 +4790,11 @@ fn (mut c Checker) index_expr(mut node ast.IndexExpr) ast.Type {
 		}
 		else {}
 	}
-	c.table.used_features.index = true
-	if node.index is ast.RangeExpr {
-		c.table.used_features.range_index = true
+	if !c.is_builtin_mod && c.mod !in ['strings', 'math.bits'] {
+		if node.index is ast.RangeExpr {
+			c.table.used_features.range_index = true
+		}
+		c.table.used_features.index = true
 	}
 	is_aggregate_arr := typ_sym.kind == .aggregate
 		&& (typ_sym.info as ast.Aggregate).types.filter(c.table.type_kind(it) !in [.array, .array_fixed, .string, .map]).len == 0

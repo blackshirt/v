@@ -15,6 +15,11 @@ fn (mut g Gen) is_used_by_main(node ast.FnDecl) bool {
 	}
 	mut is_used_by_main := true
 	if g.pref.skip_unused {
+		if node.is_markused {
+			// TODO for some reason markused walker doesn't set used_fns[key] true for
+			// [markused] fndecls
+			return true
+		}
 		fkey := node.fkey()
 		is_used_by_main = g.table.used_features.used_fns[fkey]
 		$if trace_skip_unused_fns ? {
@@ -1021,7 +1026,7 @@ fn (mut g Gen) call_expr(node ast.CallExpr) {
 				}
 				if node.is_return_used {
 					// return value is used, so we need to write the unwrapped temporary var
-					g.write('\n ${cur_line} (*(${unwrapped_styp}*)${tmp_opt}.data)')
+					g.write('\n ${cur_line}(*(${unwrapped_styp}*)${tmp_opt}.data)')
 				} else {
 					g.write('\n ${cur_line}')
 				}

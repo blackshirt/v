@@ -13,7 +13,6 @@ pub fn mark_used(mut table ast.Table, mut pref_ pref.Preferences, ast_files []&a
 	defer {
 		util.timing_measure(@METHOD)
 	}
-	mut allow_noscan := true
 	// Functions that must be generated and can't be skipped
 	mut all_fn_root_names := []string{}
 	if pref_.backend == .native {
@@ -25,46 +24,73 @@ pub fn mark_used(mut table ast.Table, mut pref_ pref.Preferences, ast_files []&a
 		string_idx_str := '${ast.string_type_idx}'
 		array_idx_str := '${ast.array_type_idx}'
 		map_idx_str := '${ast.map_type_idx}'
+		ref_map_idx_str := '${int(ast.map_type.ref())}'
+		ref_densearray_idx_str := '${int(table.find_type('DenseArray').ref())}'
 		ref_array_idx_str := '${int(ast.array_type.ref())}'
+		is_gc_none := pref_.gc_mode == .no_gc
+
 		mut core_fns := [
 			'main.main',
 			'init_global_allocator', // needed for linux_bare and wasm_bare
 			'v_realloc', // needed for _STR
-			'malloc',
-			'malloc_noscan',
-			'vcalloc',
-			'vcalloc_noscan',
 			'memdup',
-			'vstrlen',
 			'tos',
 			'tos2',
 			'error',
 			'builtin_init',
 			'fast_string_eq',
-			// TODO: process the _vinit const initializations automatically too
-			'main.vtest_init',
-			'main.vtest_new_metainfo',
-			'main.vtest_new_filemetainfo',
+			'println',
+			'ptr_str',
 		]
+
 		$if debug_used_features ? {
 			dump(table.used_features)
 		}
 		panic_deps := [
 			'__new_array_with_default',
+			'__new_array_with_default_noscan',
 			'str_intp',
 			ref_array_idx_str + '.push',
+			ref_array_idx_str + '.push_noscan',
 			string_idx_str + '.substr',
 			array_idx_str + '.slice',
 			array_idx_str + '.get',
 			'v_fixed_index',
+			charptr_idx_str + '.vstring_literal',
 		]
-		// real world apps
-		if table.used_features.builtin_types || table.used_features.as_cast
-			|| table.used_features.auto_str {
+		if ast.float_literal_type.idx() in table.used_features.print_types
+			|| ast.f64_type_idx in table.used_features.print_types
+			|| ast.f32_type_idx in table.used_features.print_types {
 			core_fns << panic_deps
+		}
+		$if windows {
+			if 'no_backtrace' !in pref_.compile_defines {
+				core_fns << panic_deps
+			}
+		} $else {
+			if 'use_libbacktrace' in pref_.compile_defines {
+				core_fns << 'print_libbacktrace'
+			}
+		}
+		if 'callstack' in pref_.compile_defines {
+			core_fns << ref_array_idx_str + '.push'
+			core_fns << ref_array_idx_str + '.pop'
+		}
+		if table.used_features.used_modules.len > 0 {
+			core_fns << panic_deps
+		}
+		if pref_.autofree {
+			core_fns << string_idx_str + '.clone_static'
+		}
+		if table.used_features.as_cast || table.used_features.auto_str || pref_.is_shared {
+			core_fns << panic_deps
+			core_fns << 'isnil'
 			core_fns << '__new_array'
+			core_fns << '__new_array_noscan'
 			core_fns << '__new_array_with_multi_default'
+			core_fns << '__new_array_with_multi_default_noscan'
 			core_fns << '__new_array_with_array_default'
+			core_fns << '__new_array_with_array_default_noscan'
 			core_fns << 'new_array_from_c_array'
 			// byteptr and charptr
 			core_fns << byteptr_idx_str + '.vstring'
@@ -73,65 +99,91 @@ pub fn mark_used(mut table ast.Table, mut pref_ pref.Preferences, ast_files []&a
 			core_fns << charptr_idx_str + '.vstring'
 			core_fns << charptr_idx_str + '.vstring_with_len'
 			core_fns << charptr_idx_str + '.vstring_literal'
-
-			if table.used_features.index {
-				core_fns << string_idx_str + '.at_with_check'
-				core_fns << string_idx_str + '.clone'
-				core_fns << string_idx_str + '.clone_static'
-				core_fns << string_idx_str + '.at'
-				core_fns << array_idx_str + '.set'
-				core_fns << ref_array_idx_str + '.set'
-				core_fns << map_idx_str + '.get'
-				core_fns << map_idx_str + '.set'
+		}
+		if table.used_features.index || pref_.is_shared {
+			core_fns << panic_deps
+			core_fns << string_idx_str + '.at_with_check'
+			core_fns << string_idx_str + '.clone'
+			core_fns << string_idx_str + '.clone_static'
+			core_fns << string_idx_str + '.at'
+			core_fns << array_idx_str + '.set'
+			core_fns << array_idx_str + '.get_with_check' // used for `x := a[i] or {}`
+			core_fns << ref_array_idx_str + '.set'
+			core_fns << map_idx_str + '.get'
+			core_fns << map_idx_str + '.set'
+			core_fns << '__new_array_noscan'
+			core_fns << ref_array_idx_str + '.push_noscan'
+			core_fns << ref_array_idx_str + '.push_many_noscan'
+		}
+		if table.used_features.range_index || pref_.is_shared {
+			core_fns << string_idx_str + '.substr_with_check'
+			core_fns << string_idx_str + '.substr_ni'
+			core_fns << array_idx_str + '.slice_ni'
+			core_fns << array_idx_str + '.get_with_check' // used for `x := a[i] or {}`
+			core_fns << array_idx_str + '.clone_static_to_depth'
+			core_fns << array_idx_str + '.clone_to_depth'
+		}
+		if table.used_features.auto_str || table.used_features.dump {
+			core_fns << string_idx_str + '.repeat'
+			core_fns << 'tos3'
+		}
+		if table.used_features.auto_str_ptr {
+			core_fns << 'isnil'
+			core_fns << panic_deps
+		}
+		if table.used_features.arr_prepend {
+			core_fns << ref_array_idx_str + '.prepend_many'
+		}
+		if table.used_features.arr_reverse {
+			core_fns << array_idx_str + '.reverse'
+		}
+		if table.used_features.arr_pop {
+			core_fns << ref_array_idx_str + '.pop'
+		}
+		if table.used_features.arr_first {
+			core_fns << array_idx_str + '.first'
+		}
+		if table.used_features.arr_last {
+			core_fns << array_idx_str + '.last'
+		}
+		if table.used_features.arr_delete {
+			core_fns << panic_deps
+		}
+		if table.used_features.arr_insert {
+			if is_gc_none {
+				core_fns << ref_array_idx_str + '.insert_many'
 			}
-			if table.used_features.range_index {
-				core_fns << string_idx_str + '.substr_with_check'
-				core_fns << string_idx_str + '.substr_ni'
-				core_fns << array_idx_str + '.slice_ni'
-				core_fns << array_idx_str + '.get_with_check' // used for `x := a[i] or {}`
-				core_fns << array_idx_str + '.clone_static_to_depth'
-				core_fns << array_idx_str + '.clone_to_depth'
-			}
-			if table.used_features.cast_ptr {
-				core_fns << 'ptr_str' // TODO: remove this. It is currently needed for the auto str methods for &u8, fn types, etc; See `./v -skip-unused vlib/builtin/int_test.v`
-			}
-			if table.used_features.auto_str {
-				core_fns << string_idx_str + '.repeat'
-				core_fns << 'tos3'
-			}
-			if table.used_features.auto_str_ptr {
-				core_fns << 'isnil'
-			}
-			if table.used_features.arr_prepend {
-				core_fns << ref_array_idx_str + '.prepend_many'
-			}
-			if table.used_features.arr_pop {
-				core_fns << ref_array_idx_str + '.pop'
-			}
-			if table.used_features.arr_first {
-				core_fns << array_idx_str + '.first'
-			}
-			if table.used_features.arr_last {
-				core_fns << array_idx_str + '.last'
-			}
-		} else {
-			// TODO: this *should not* depend on the used compiler, which is brittle, but only on info in the AST...
-			// hello world apps
-			if pref_.ccompiler_type != .tinyc && 'no_backtrace' !in pref_.compile_defines {
-				// with backtrace on gcc/clang more code needs be generated
-				allow_noscan = true
-				core_fns << panic_deps
-			} else {
-				allow_noscan = false
-			}
+		}
+		if pref_.ccompiler_type != .tinyc && 'no_backtrace' !in pref_.compile_defines {
+			// with backtrace on gcc/clang more code needs be generated
+			core_fns << panic_deps
+		}
+		if table.used_features.interpolation {
+			core_fns << panic_deps
+		}
+		if table.used_features.dump {
+			core_fns << panic_deps
+			builderptr_idx := int(table.find_type('strings.Builder').ref())
+			core_fns << [
+				'${builderptr_idx}.str',
+				'${builderptr_idx}.free',
+				'${builderptr_idx}.write_rune',
+			]
+		}
+		if table.used_features.arr_init || table.used_features.comptime_for {
+			core_fns << panic_deps
+			core_fns << '__new_array'
+			core_fns << 'new_array_from_c_array'
+			core_fns << 'new_array_from_c_array_noscan'
+			core_fns << '__new_array_with_multi_default'
+			core_fns << '__new_array_with_multi_default_noscan'
+			core_fns << '__new_array_with_array_default'
 		}
 		if table.used_features.option_or_result {
 			core_fns << '_option_ok'
 			core_fns << '_result_ok'
-			if !allow_noscan {
-				core_fns << panic_deps
-				allow_noscan = true
-			}
+			core_fns << charptr_idx_str + '.vstring_literal'
+			core_fns << panic_deps
 		}
 		if table.used_features.as_cast {
 			core_fns << '__as_cast'
@@ -139,9 +191,35 @@ pub fn mark_used(mut table ast.Table, mut pref_ pref.Preferences, ast_files []&a
 		if table.used_features.anon_fn {
 			core_fns << 'memdup_uncollectable'
 		}
+		if table.used_features.arr_map {
+			core_fns << panic_deps
+			core_fns << '__new_array_with_map_default'
+			core_fns << 'new_map_noscan_key'
+			core_fns << ref_map_idx_str + '.clone'
+			core_fns << ref_densearray_idx_str + '.clone'
+			core_fns << map_idx_str + '.clone'
+			table.used_features.used_maps++
+		}
+		if table.used_features.map_update {
+			core_fns << panic_deps
+			core_fns << 'new_map_update_init'
+			table.used_features.used_maps++
+		}
+		if table.used_features.asserts {
+			core_fns << panic_deps
+			core_fns << '__print_assert_failure'
+			core_fns << 'isnil'
+		}
+		if pref_.trace_calls || pref_.trace_fns.len > 0 {
+			core_fns << panic_deps
+			core_fns << 'vgettid'
+			core_fns << 'C.gettid'
+			core_fns << 'v.trace_calls.on_c_main'
+			core_fns << 'v.trace_calls.current_time'
+			core_fns << 'v.trace_calls.on_call'
+		}
 		all_fn_root_names << core_fns
 	}
-
 	if pref_.is_bare {
 		all_fn_root_names << [
 			'strlen',
@@ -154,13 +232,18 @@ pub fn mark_used(mut table ast.Table, mut pref_ pref.Preferences, ast_files []&a
 	}
 
 	is_noscan_whitelisted := pref_.gc_mode in [.boehm_full_opt, .boehm_incr_opt]
-
+	has_noscan := all_fn_root_names.any(it.contains('noscan')
+		&& it !in ['vcalloc_noscan', 'malloc_noscan'])
 	for k, mut mfn in all_fns {
 		$if trace_skip_unused_all_fns ? {
 			println('k: ${k} | mfn: ${mfn.name}')
 		}
+		if k in table.used_features.comptime_calls {
+			all_fn_root_names << k
+			continue
+		}
 		// _noscan functions/methods are selected when the `-gc boehm` is on:
-		if allow_noscan && is_noscan_whitelisted && mfn.name.ends_with('_noscan') {
+		if has_noscan && is_noscan_whitelisted && mfn.name.ends_with('_noscan') {
 			all_fn_root_names << k
 			continue
 		}
@@ -173,26 +256,28 @@ pub fn mark_used(mut table ast.Table, mut pref_ pref.Preferences, ast_files []&a
 			all_fn_root_names << k
 			continue
 		}
-		if method_receiver_typename == '&strings.Builder'
-			&& (table.used_features.builtin_types || table.used_features.auto_str) {
+		if method_receiver_typename == '&strings.Builder' && table.used_features.auto_str {
 			// implicit string builders are generated in auto_eq_methods.v
 			all_fn_root_names << k
 			continue
 		}
 		// auto generated string interpolation functions, may
 		// call .str or .auto_str methods for user types:
-		if k.ends_with('.str') || k.ends_with('.auto_str') {
-			if table.used_features.auto_str
-				|| table.used_features.print_types[mfn.receiver.typ.idx()] {
+		if k.ends_with('.str') || k.ends_with('.auto_str')
+			|| (k.starts_with('_Atomic_') && k.ends_with('_str')) {
+			if table.used_features.auto_str || table.used_features.dump
+				|| table.used_features.print_types[mfn.receiver.typ.idx()]
+				|| table.used_features.asserts || table.used_features.debugger
+				|| table.used_features.used_modules.len > 0 {
 				all_fn_root_names << k
 			}
 			continue
 		}
-		if k.ends_with('.init') {
+		if k.ends_with('.init') || k.ends_with('.cleanup') {
 			all_fn_root_names << k
 			continue
 		}
-		if table.used_features.builtin_types && k.ends_with('.free') {
+		if (pref_.autofree || table.used_features.used_modules.len > 0) && k.ends_with('.free') {
 			all_fn_root_names << k
 			continue
 		}
@@ -236,7 +321,7 @@ pub fn mark_used(mut table ast.Table, mut pref_ pref.Preferences, ast_files []&a
 		}
 		// testing framework:
 		if pref_.is_test {
-			if k.starts_with('test_') || k.contains('.test_') {
+			if k.starts_with('test_') || k.contains('.test_') || k.contains('.vtest_') {
 				all_fn_root_names << k
 				continue
 			}
@@ -303,12 +388,19 @@ pub fn mark_used(mut table ast.Table, mut pref_ pref.Preferences, ast_files []&a
 			interface_types := [ptype, ntype]
 			for method in interface_info.methods {
 				for typ in interface_types {
-					interface_implementation_method_name := '${int(typ)}.${method.name}'
+					interface_implementation_method_name := '${int(typ.clear_flags())}.${method.name}'
 					$if trace_skip_unused_interface_methods ? {
 						eprintln('>> isym.name: ${isym.name} | interface_implementation_method_name: ${interface_implementation_method_name}')
 					}
 					all_fn_root_names << interface_implementation_method_name
 				}
+			}
+			for embed_method in table.get_embed_methods(table.sym(itype)) {
+				interface_implementation_method_name := '${int(embed_method.params[0].typ.clear_flags())}.${embed_method.name}'
+				$if trace_skip_unused_interface_methods ? {
+					eprintln('>> isym.name: ${isym.name} | interface_implementation_method_name: ${interface_implementation_method_name} (embeded)')
+				}
+				all_fn_root_names << interface_implementation_method_name
 			}
 		}
 	}
@@ -338,7 +430,10 @@ pub fn mark_used(mut table ast.Table, mut pref_ pref.Preferences, ast_files []&a
 
 	if 'C.cJSON_Parse' in all_fns {
 		all_fn_root_names << 'tos5'
+		all_fn_root_names << 'time.unix' // used by json
+		table.used_features.used_maps++ // json needs new_map etc
 	}
+
 	mut walker := Walker.new(
 		table:       table
 		files:       ast_files
@@ -347,16 +442,18 @@ pub fn mark_used(mut table ast.Table, mut pref_ pref.Preferences, ast_files []&a
 		all_globals: all_globals
 		pref:        pref_
 	)
-	// println( all_fns.keys() )
-	walker.mark_markused_fns() // tagged with `@[markused]`
+	walker.mark_markused_fn_decls() // tagged with `@[markused]`
 	walker.mark_markused_consts() // tagged with `@[markused]`
 	walker.mark_markused_globals() // tagged with `@[markused]`
 	walker.mark_exported_fns()
-	walker.mark_root_fns(all_fn_root_names)
 
-	if walker.n_asserts > 0 {
-		unsafe { walker.fn_decl(mut all_fns['__print_assert_failure']) }
+	for k, _ in table.used_features.comptime_calls {
+		walker.fn_by_name(k)
 	}
+
+	walker.mark_root_fns(all_fn_root_names)
+	walker.mark_veb_actions()
+
 	if table.used_features.used_maps > 0 {
 		for k, mut mfn in all_fns {
 			mut method_receiver_typename := ''
@@ -405,6 +502,7 @@ pub fn mark_used(mut table ast.Table, mut pref_ pref.Preferences, ast_files []&a
 			walker.mark_const_as_used(kcon)
 		}
 	}
+
 	table.used_features.used_fns = walker.used_fns.move()
 	table.used_features.used_consts = walker.used_consts.move()
 	table.used_features.used_globals = walker.used_globals.move()
@@ -452,6 +550,13 @@ fn all_fn_const_and_global(ast_files []&ast.File) (map[string]ast.FnDecl, map[st
 	return all_fns, all_consts, all_globals
 }
 
+fn mark_all_methods_used(mut table ast.Table, mut all_fn_root_names []string, typ ast.Type) {
+	sym := table.sym(typ)
+	for method in sym.methods {
+		all_fn_root_names << '${int(typ)}.${method.name}'
+	}
+}
+
 fn handle_vweb(mut table ast.Table, mut all_fn_root_names []string, result_name string, filter_name string,
 	context_name string) {
 	// handle vweb magic router methods:
@@ -459,7 +564,7 @@ fn handle_vweb(mut table ast.Table, mut all_fn_root_names []string, result_name 
 	if result_type_idx != 0 {
 		all_fn_root_names << filter_name
 		typ_vweb_context := table.find_type(context_name).set_nr_muls(1)
-		all_fn_root_names << '${int(typ_vweb_context)}.html'
+		mark_all_methods_used(mut table, mut all_fn_root_names, typ_vweb_context)
 		for vgt in table.used_features.used_veb_types {
 			sym_app := table.sym(vgt)
 			for m in sym_app.methods {

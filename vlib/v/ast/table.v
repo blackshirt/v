@@ -12,18 +12,25 @@ pub struct UsedFeatures {
 pub mut:
 	interfaces       bool            // interface
 	dump             bool            // dump()
-	builtin_types    bool            // uses any builtin type
 	index            bool            // string[0]
 	range_index      bool            // string[0..1]
 	cast_ptr         bool            // &u8(...)
+	asserts          bool            // assert expr
 	as_cast          bool            // expr as Type
 	anon_fn          bool            // fn () { }
 	auto_str         bool            // auto str fns
 	auto_str_ptr     bool            // auto str fns for ptr type
 	arr_prepend      bool            // arr.prepend()
+	arr_insert       bool            // arr.insert()
 	arr_first        bool            // arr.first()
 	arr_last         bool            // arr.last()
 	arr_pop          bool            // arr.pop()
+	arr_delete       bool            // arr.delete()
+	arr_reverse      bool            // arr.reverse()
+	arr_init         bool            // [1, 2, 3]
+	arr_map          bool            // []map[key]value
+	map_update       bool            // {...foo}
+	interpolation    bool            // '${foo} ${bar}'
 	option_or_result bool            // has panic call
 	print_types      map[int]bool    // print() idx types
 	used_fns         map[string]bool // filled in by markused
@@ -32,6 +39,11 @@ pub mut:
 	used_veb_types   []Type          // veb context types, filled in by checker
 	used_maps        int             // how many times maps were used, filled in by markused
 	used_arrays      int             // how many times arrays were used, filled in by markused
+	used_modules     map[string]bool // filled in checker
+	// json             bool            // json is imported
+	debugger       bool            // debugger is used
+	comptime_calls map[string]bool // resolved name to call on comptime
+	comptime_for   bool            // uses $for
 }
 
 @[unsafe]
@@ -65,7 +77,7 @@ pub mut:
 	sumtypes           map[int]SumTypeDecl
 	cmod_prefix        string // needed for ast.type_to_str(Type) while vfmt; contains `os.`
 	is_fmt             bool
-	used_features      &UsedFeatures = &UsedFeatures{} // filled in by the checker/markused, when pref.skip_unused = true;
+	used_features      &UsedFeatures = &UsedFeatures{} // filled in by the builder via markused module, when pref.skip_unused = true;
 	veb_res_idx_cache  int // Cache of `veb.Result` type
 	veb_ctx_idx_cache  int // Cache of `veb.Context` type
 	panic_handler      FnPanicHandler = default_table_panic_handler
