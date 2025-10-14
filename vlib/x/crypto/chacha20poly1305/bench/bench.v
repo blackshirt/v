@@ -31,6 +31,34 @@
 //
 //   Standard ChaCha20Poly1305 decrypt:        83151 ns per hash
 //   ChaCha20Poly1305 PSIV decrypt:           111155 ns per hash
+//
+// The latest patch:
+// Standard ChaCha20Poly1305 AEAD and PSIV construct output performance comparison
+// ===============================================================================
+// Iterations per test: 1000
+// ------------------------------------------------------------------------------------------------------
+//    Data Size |        Std |       PSIV | Enc (std/psiv) ||        Std |         PSIV | Dec (std/psiv)|
+// ------------------------------------------------------------------------------------------------------
+//          6 B |    12.00ms |    14.00ms |          0.84x ||    11.00ms |      14.00ms |         0.78x |
+//          8 B |    11.00ms |    14.00ms |          0.76x ||    11.00ms |      14.00ms |         0.79x |
+//         12 B |    10.00ms |    14.00ms |          0.76x ||    11.00ms |      14.00ms |         0.76x |
+//         16 B |    10.00ms |    13.00ms |          0.79x ||    12.00ms |      14.00ms |         0.82x |
+//         64 B |    15.00ms |    17.00ms |          0.85x ||    15.00ms |      18.00ms |         0.85x |
+//         75 B |    20.00ms |    23.00ms |          0.85x ||    20.00ms |      24.00ms |         0.86x |
+//        256 B |    41.00ms |    42.00ms |          0.97x ||    40.00ms |      42.00ms |         0.96x |
+//       1028 B |   152.00ms |   145.00ms |          1.05x ||   147.00ms |     148.00ms |         1.00x |
+//       2049 B |   283.00ms |   269.00ms |          1.05x ||   275.00ms |     272.00ms |         1.01x |
+// ------------------------------------------------------------------------------------------------------
+//        Total |   558.00ms |   556.00ms |          1.00x ||   547.00ms |     563.00ms |          0.97x|
+// ------------------------------------------------------------------------------------------------------
+//
+// Per-operation averages:
+//   Standard ChaCha20Poly1305 encrypt:        62019 ns per hash
+//   ChaCha20Poly1305 PSIV encrypt:            61869 ns per hash
+//
+//   Standard ChaCha20Poly1305 decrypt:        60777 ns per hash
+//   ChaCha20Poly1305 PSIV decrypt:            62666 ns per hash
+//
 module main
 
 import rand

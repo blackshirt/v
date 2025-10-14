@@ -26,8 +26,8 @@ pub fn new_psiv(key []u8) !&Chacha20Poly1305RE {
 	enc_key := fe_k(key)
 
 	mut x := chacha20.State{}
-	mut x64 := []u8{len: 64}
-	unsafe { vmemcpy(x64.data, pol_key, pol_key.len) }
+	mut x64 := [64]u8{}
+	unsafe { vmemcpy(x64, pol_key, pol_key.len) }
 	unpack_into_state(mut x, x64)
 	ws := chacha20_core(x)
 
@@ -83,11 +83,11 @@ mut:
 @[unsafe]
 pub fn (mut c Chacha20Poly1305RE) free() {
 	unsafe {
-		// c.key.free()
 		vmemset(c.mac_key, 0, 36)
 		vmemset(c.enc_key, 0, 36)
 		c.po = nil
 	}
+	// marked this cipher as unusable anymore
 	c.done = true
 }
 
@@ -179,17 +179,17 @@ fn psiv_encrypt_internal(mut dst []u8, plaintext []u8, dkey [36]u8, tag []u8, no
 	mut tc := []u8{len: 8} // counter buffer
 	mut tt := merge_drv_key(dkey, nonce, tag[0..8], tag[8..16])
 	mut s := chacha20.State{}
-	mut b64 := []u8{len: 64} // state buffer
+	mut b64 := [64]u8{} // state buffer
 
 	mut j := 0
 	mut n := 0
 	// process for every block of plaintext bytes
 	for plaintext[n..].len > 0 {
+		// how many bytes we want to process that currently availables
 		want_len := if plaintext[n..].len < 64 { plaintext[n..].len } else { 64 }
 		// loads current counter
 		binary.little_endian_put_u64(mut tc, ctr)
 
-		// copy(mut tt[48..], tc)
 		unsafe { vmemcpy(tt[48], tc.data, tc.len) }
 		unpack_into_state(mut s, tt)
 		buf := chacha20_core(s)
@@ -243,8 +243,8 @@ fn update_with_padding(mut po poly1305.Poly1305, data []u8) {
 
 // merge_drv_key merges provided bytes into 64-bytes key
 @[direct_array_access; inline]
-fn merge_drv_key(dkey [36]u8, nonce []u8, tag_ctr []u8, tag_rest []u8) []u8 {
-	mut x := []u8{len: 64}
+fn merge_drv_key(dkey [36]u8, nonce []u8, tag_ctr []u8, tag_rest []u8) [64]u8 {
+	mut x := [64]u8{}
 
 	// 0..36
 	for i := 0; i < dkey.len; i++ {
@@ -394,7 +394,7 @@ fn fe_k(k []u8) [36]u8 {
 
 // unpack_into_state deserializes (in little-endian form) 64-bytes of data in x into state s.
 @[direct_array_access; inline]
-fn unpack_into_state(mut s chacha20.State, x []u8) {
+fn unpack_into_state(mut s chacha20.State, x [64]u8) {
 	for i := 0; i < 16; i++ {
 		s[i] = u32(x[i * 4]) | (u32(x[i * 4 + 1]) << u32(8)) | (u32(x[i * 4 + 2]) << u32(16)) | (u32(x[
 			i * 4 + 3]) << u32(24))
@@ -403,10 +403,9 @@ fn unpack_into_state(mut s chacha20.State, x []u8) {
 
 // pack64_from_state serializes state s into 64-bytes output in little-endian form.
 @[direct_array_access; inline]
-fn pack64_from_state(mut b []u8, s chacha20.State) {
+fn pack64_from_state(mut b [64]u8, s chacha20.State) {
 	mut j := 0
 	for v in s {
-		// binary.little_endian_put_u32(mut out[i * 4..(i + 1) * 4], v)
 		b[j] = u8(v)
 		b[j + 1] = u8(v >> u32(8))
 		b[j + 2] = u8(v >> u32(16))
@@ -420,7 +419,6 @@ fn pack64_from_state(mut b []u8, s chacha20.State) {
 fn pack32_from_state(mut b []u8, s chacha20.State) {
 	mut j := 0
 	for v in s[0..8] {
-		// binary.little_endian_put_u32(mut out[i * 4..(i + 1) * 4], s[i])
 		b[j] = u8(v)
 		b[j + 1] = u8(v >> u32(8))
 		b[j + 2] = u8(v >> u32(16))
@@ -434,7 +432,6 @@ fn pack32_from_state(mut b []u8, s chacha20.State) {
 fn pack16_from_state(mut b []u8, s chacha20.State) {
 	mut j := 0
 	for v in s[0..4] {
-		// binary.little_endian_put_u32(mut out[i * 4..(i + 1) * 4], s[i])
 		b[j] = u8(v)
 		b[j + 1] = u8(v >> u32(8))
 		b[j + 2] = u8(v >> u32(16))
