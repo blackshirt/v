@@ -139,10 +139,12 @@ fn test_psiv_insternal_encryption_of_encrypted_text_is_plaintext() ! {
 		tag := rand.bytes(16)!
 		nonce := rand.bytes(12)!
 
-		out := psiv_encrypt_internal(input, key, tag, nonce)!
+		mut out := []u8{len: input.len}
+		psiv_encrypt_internal(mut out, input, key, tag, nonce)!
 
 		// encrypting this output with the same params was result in original input
-		awal := psiv_encrypt_internal(out, key, tag, nonce)!
+		mut awal := []u8{len: input.len}
+		psiv_encrypt_internal(mut awal, out, key, tag, nonce)!
 		assert awal == input
 	}
 }
