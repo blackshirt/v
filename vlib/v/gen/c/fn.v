@@ -83,6 +83,14 @@ fn (mut g Gen) fn_decl(node ast.FnDecl) {
 		g.is_direct_array_access = prev_is_direct_array_access
 	}
 
+	// handle `@[ignore_overflow] fn abc() {}` and -check-overflow :
+	prev_do_int_overflow_checks := g.do_int_overflow_checks
+	g.do_int_overflow_checks = g.pref.is_check_overflow && !g.is_builtin_overflow_mod
+		&& !node.is_ignore_overflow
+	defer {
+		g.do_int_overflow_checks = prev_do_int_overflow_checks
+	}
+
 	// handle `@[c_extern] fn C.some_name() int` declarations:
 	old_inside_c_extern := g.inside_c_extern
 	defer {
@@ -1025,8 +1033,8 @@ fn (mut g Gen) call_expr(node ast.CallExpr) {
 			g.indent++
 			g.write('${tmp_opt} = ')
 		} else if !g.inside_curry_call {
-			if g.assign_ct_type != 0 && node.or_block.kind in [.propagate_option, .propagate_result] {
-				styp = g.styp(g.assign_ct_type.derive(ret_typ))
+			if g.assign_ct_type[node.pos.pos] != 0 && node.or_block.kind != .absent {
+				styp = g.styp(g.assign_ct_type[node.pos.pos].derive(ret_typ))
 			}
 			g.write('${styp} ${tmp_opt} = ')
 			if node.left is ast.AnonFn {
@@ -1068,9 +1076,8 @@ fn (mut g Gen) call_expr(node ast.CallExpr) {
 			g.write('\n ${cur_line}')
 		} else if !g.inside_curry_call {
 			if !g.inside_const_opt_or_res {
-				if g.assign_ct_type != 0
-					&& node.or_block.kind in [.propagate_option, .propagate_result] {
-					unwrapped_styp = g.styp(g.assign_ct_type.derive(node.return_type).clear_option_and_result())
+				if g.assign_ct_type[node.pos.pos] != 0 && node.or_block.kind != .absent {
+					unwrapped_styp = g.styp(g.assign_ct_type[node.pos.pos].derive(node.return_type).clear_option_and_result())
 				}
 				if g.table.sym(node.return_type).kind == .array_fixed
 					&& unwrapped_styp.starts_with('_v_') {
@@ -1297,6 +1304,9 @@ fn (mut g Gen) gen_array_method_call(node ast.CallExpr, left_type ast.Type, left
 
 fn (mut g Gen) gen_fixed_array_method_call(node ast.CallExpr, left_type ast.Type) bool {
 	match node.name {
+		'filter' {
+			g.gen_array_filter(node)
+		}
 		'index' {
 			g.gen_array_index(node)
 		}

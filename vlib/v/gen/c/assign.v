@@ -194,7 +194,7 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 	is_decl := node.op == .decl_assign
 	g.assign_op = node.op
 	g.inside_assign = true
-	g.assign_ct_type = 0
+	g.assign_ct_type = map[int]ast.Type{}
 	g.arraymap_set_pos = 0
 	g.is_arraymap_set = false
 	g.is_assign_lhs = false
@@ -202,7 +202,7 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 	defer {
 		g.assign_op = .unknown
 		g.inside_assign = false
-		g.assign_ct_type = 0
+		g.assign_ct_type.clear()
 		g.arraymap_set_pos = 0
 		g.is_arraymap_set = false
 		g.is_assign_lhs = false
@@ -307,6 +307,10 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 			scope: unsafe { nil }
 		}
 		mut cur_indexexpr := -1
+		consider_int_overflow := g.do_int_overflow_checks && g.unwrap_generic(var_type).is_int()
+		is_safe_add_assign := node.op == .plus_assign && consider_int_overflow
+		is_safe_sub_assign := node.op == .minus_assign && consider_int_overflow
+		is_safe_mul_assign := node.op == .mult_assign && consider_int_overflow
 		left_sym := g.table.sym(g.unwrap_generic(var_type))
 		is_va_list = left_sym.language == .c && left_sym.name == 'C.va_list'
 		if mut left is ast.Ident {
@@ -338,7 +342,7 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 								var_type = val_type.clear_flag(.option)
 							}
 							left.obj.typ = var_type
-							g.assign_ct_type = var_type
+							g.assign_ct_type[val.pos.pos] = var_type
 						}
 					} else if val is ast.ComptimeSelector {
 						if val.typ_key != '' {
@@ -351,13 +355,13 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 								val_type = g.type_resolver.get_ct_type_or_default(val.typ_key,
 									var_type)
 							}
-							g.assign_ct_type = var_type
+							g.assign_ct_type[val.pos.pos] = var_type
 						}
 					} else if val is ast.ComptimeCall {
 						key_str := '${val.method_name}.return_type'
 						var_type = g.type_resolver.get_ct_type_or_default(key_str, var_type)
 						left.obj.typ = var_type
-						g.assign_ct_type = var_type
+						g.assign_ct_type[val.pos.pos] = var_type
 					} else if val is ast.Ident && val.info is ast.IdentVar {
 						val_info := (val as ast.Ident).info as ast.IdentVar
 						gen_or = val.or_expr.kind != .absent
@@ -373,7 +377,7 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 								val_type = var_type
 								left.obj.typ = var_type
 							}
-							g.assign_ct_type = var_type
+							g.assign_ct_type[val.pos.pos] = var_type
 						}
 					} else if val is ast.IndexExpr && (val.left is ast.Ident && val.left.ct_expr) {
 						ctyp := g.unwrap_generic(g.type_resolver.get_type(val))
@@ -381,7 +385,7 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 							var_type = ctyp
 							val_type = var_type
 							left.obj.typ = var_type
-							g.assign_ct_type = var_type
+							g.assign_ct_type[val.pos.pos] = var_type
 						}
 					} else if left.obj.ct_type_var == .generic_var && val is ast.CallExpr {
 						if val.return_type_generic != 0
@@ -391,13 +395,14 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 								var_type = fn_ret_type
 								val_type = var_type
 								left.obj.typ = var_type
+								g.assign_ct_type[val.pos.pos] = var_type
 							}
 						} else if val.is_static_method && val.left_type.has_flag(.generic) {
 							fn_ret_type := g.resolve_return_type(val)
 							var_type = fn_ret_type
 							val_type = var_type
 							left.obj.typ = var_type
-							g.assign_ct_type = var_type
+							g.assign_ct_type[val.pos.pos] = var_type
 						} else if val.left_type != 0 && g.table.type_kind(val.left_type) == .array
 							&& val.name == 'map' && val.args.len > 0
 							&& val.args[0].expr is ast.AsCast
@@ -405,7 +410,7 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 							var_type = g.table.find_or_register_array(g.unwrap_generic((val.args[0].expr as ast.AsCast).typ))
 							val_type = var_type
 							left.obj.typ = var_type
-							g.assign_ct_type = var_type
+							g.assign_ct_type[val.pos.pos] = var_type
 						}
 					} else if val is ast.InfixExpr && val.op in [.plus, .minus, .mul, .div, .mod]
 						&& val.left_ct_expr {
@@ -420,7 +425,7 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 							var_type = ctyp
 							val_type = var_type
 							left.obj.typ = var_type
-							g.assign_ct_type = var_type
+							g.assign_ct_type[val.pos.pos] = var_type
 						}
 					} else if val is ast.PostfixExpr && val.op == .question
 						&& (val.expr is ast.Ident && val.expr.ct_expr) {
@@ -429,7 +434,7 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 							var_type = ctyp
 							val_type = var_type
 							left.obj.typ = var_type
-							g.assign_ct_type = var_type
+							g.assign_ct_type[val.pos.pos] = var_type
 
 							ct_type_var := g.comptime.get_ct_type_var(val.expr)
 							if ct_type_var == .field_var {
@@ -451,20 +456,20 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 			if left.typ_key != '' {
 				var_type = g.type_resolver.get_ct_type_or_default(left.typ_key, var_type)
 			}
-			g.assign_ct_type = var_type
+			g.assign_ct_type[left.pos.pos] = var_type
 			if val is ast.ComptimeSelector {
 				if val.typ_key != '' {
 					val_type = g.type_resolver.get_ct_type_or_default(val.typ_key, var_type)
 				}
 			} else if val is ast.CallExpr && val.return_type_generic.has_flag(.generic) {
-				g.assign_ct_type = g.comptime.comptime_for_field_type
+				g.assign_ct_type[val.pos.pos] = g.comptime.comptime_for_field_type
 				val_type = var_type
 			}
 		} else if mut left is ast.IndexExpr && val is ast.ComptimeSelector {
 			if val.typ_key != '' {
 				val_type = g.type_resolver.get_ct_type_or_default(val.typ_key, var_type)
 			}
-			g.assign_ct_type = val_type
+			g.assign_ct_type[val.pos.pos] = val_type
 		}
 		mut styp := g.styp(var_type)
 		mut is_fixed_array_init := false
@@ -918,10 +923,23 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 					}
 				}
 			} else if !var_type.has_flag(.option_mut_param_t) && cur_indexexpr == -1 && !str_add
-				&& !op_overloaded {
+				&& !op_overloaded && !is_safe_add_assign && !is_safe_sub_assign
+				&& !is_safe_mul_assign {
 				g.write(' ${op} ')
-			} else if str_add || op_overloaded {
+			} else if (str_add || op_overloaded) && !is_safe_add_assign && !is_safe_sub_assign
+				&& !is_safe_mul_assign {
 				g.write(', ')
+			} else if is_safe_add_assign || is_safe_sub_assign || is_safe_mul_assign {
+				overflow_styp := g.styp(get_overflow_fn_type(var_type))
+				vsafe_fn_name := match true {
+					is_safe_add_assign { 'builtin__overflow__add_${overflow_styp}' }
+					is_safe_sub_assign { 'builtin__overflow__sub_${overflow_styp}' }
+					is_safe_mul_assign { 'builtin__overflow__mul_${overflow_styp}' }
+					else { '' }
+				}
+				g.write(' = ${vsafe_fn_name}(')
+				g.expr(left)
+				g.write(',')
 			}
 			mut cloned := false
 			if g.is_autofree {
@@ -1075,7 +1093,8 @@ fn (mut g Gen) assign_stmt(node_ ast.AssignStmt) {
 					}
 				}
 			}
-			if str_add || op_overloaded {
+			if str_add || op_overloaded || is_safe_add_assign || is_safe_sub_assign
+				|| is_safe_mul_assign {
 				g.write(')')
 			}
 			if node_.op == .assign && var_type.has_flag(.option_mut_param_t) {
@@ -1246,10 +1265,10 @@ fn (mut g Gen) gen_cross_var_assign(node &ast.AssignStmt) {
 				sym := g.table.sym(g.table.unaliased_type(left.left_type))
 				if sym.kind == .array {
 					info := sym.info as ast.Array
-					elem_typ := g.table.sym(info.elem_type)
+					elem_sym := g.table.sym(info.elem_type)
 					needs_clone := info.elem_type == ast.string_type && g.is_autofree
 
-					if elem_typ.kind == .function {
+					if elem_sym.kind == .function {
 						left_typ := node.left_types[i]
 						left_sym := g.table.sym(left_typ)
 						g.write_fn_ptr_decl(left_sym.info as ast.FnType, '_var_${left.pos.pos}')
@@ -1273,8 +1292,8 @@ fn (mut g Gen) gen_cross_var_assign(node &ast.AssignStmt) {
 					g.writeln(');')
 				} else if sym.kind == .array_fixed {
 					info := sym.info as ast.ArrayFixed
-					elem_typ := g.table.sym(info.elem_type)
-					if elem_typ.kind == .function {
+					elem_sym := g.table.sym(info.elem_type)
+					if elem_sym.kind == .function {
 						left_typ := node.left_types[i]
 						left_sym := g.table.sym(left_typ)
 						g.write_fn_ptr_decl(left_sym.info as ast.FnType, '_var_${left.pos.pos}')
@@ -1300,8 +1319,8 @@ fn (mut g Gen) gen_cross_var_assign(node &ast.AssignStmt) {
 					skeytyp := g.styp(info.key_type)
 					styp := g.styp(info.value_type)
 					zero := g.type_default(info.value_type)
-					val_typ := g.table.sym(info.value_type)
-					if val_typ.kind == .function {
+					val_sym := g.table.sym(info.value_type)
+					if val_sym.kind == .function {
 						left_type := node.left_types[i]
 						left_sym := g.table.sym(left_type)
 						g.write_fn_ptr_decl(left_sym.info as ast.FnType, '_var_${left.pos.pos}')
@@ -1319,7 +1338,7 @@ fn (mut g Gen) gen_cross_var_assign(node &ast.AssignStmt) {
 					g.write(', &(${skeytyp}[]){')
 					g.expr(left.index)
 					g.write('}')
-					if val_typ.kind == .function {
+					if val_sym.kind == .function {
 						g.writeln(', &(voidptr[]){ ${zero} });')
 					} else {
 						g.writeln(', &(${styp}[]){ ${zero} });')
