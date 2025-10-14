@@ -25,11 +25,11 @@ pub fn new_psiv(key []u8) !&Chacha20Poly1305RE {
 	mac_key := fm_k(key)
 	enc_key := fe_k(key)
 
-	mut x := chacha20.State{}
+	mut s := chacha20.State{}
 	mut x64 := [64]u8{}
-	unsafe { vmemcpy(x64, pol_key, pol_key.len) }
-	unpack_into_state(mut x, x64)
-	ws := chacha20_core(x)
+	unsafe { vmemcpy(x64, pol_key[0], 36) }
+	unpack64_into_state(mut s, x64)
+	ws := chacha20_core(s)
 
 	// For poly1305 mac, we only take a first 32-bytes of the state as a key
 	mut poly1305_key := []u8{len: 32}
@@ -72,17 +72,17 @@ pub fn psiv_decrypt(ciphertext []u8, key []u8, nonce []u8, ad []u8) ![]u8 {
 @[noinit]
 pub struct Chacha20Poly1305RE implements AEAD {
 mut:
-	// flags that tells this instance should not be used anymore
-	done    bool
 	mac_key [36]u8
 	enc_key [36]u8
 	po      &poly1305.Poly1305 = unsafe { nil }
+	done    bool
 }
 
 // free releases resources taken by c. Dont use c after `.free` call.
 @[unsafe]
 pub fn (mut c Chacha20Poly1305RE) free() {
 	unsafe {
+		// we only reset derived keys
 		vmemset(c.mac_key, 0, 36)
 		vmemset(c.enc_key, 0, 36)
 		c.po = nil
@@ -124,6 +124,7 @@ pub fn (c Chacha20Poly1305RE) encrypt(plaintext []u8, nonce []u8, ad []u8) ![]u8
 	// build the tag
 	psiv_gen_tag(mut out[plaintext.len..], mut po_ad_clone, plaintext, ad.len, c.mac_key,
 		nonce)
+	// generates ciphertext
 	psiv_encrypt_internal(mut out[0..plaintext.len], plaintext, c.enc_key, out[plaintext.len..],
 		nonce)!
 
@@ -185,15 +186,17 @@ fn psiv_encrypt_internal(mut dst []u8, plaintext []u8, dkey [36]u8, tag []u8, no
 	mut n := 0
 	// process for every block of plaintext bytes
 	for plaintext[n..].len > 0 {
-		// how many bytes we want to process that currently availables
+		// how many bytes we want to process
 		want_len := if plaintext[n..].len < 64 { plaintext[n..].len } else { 64 }
 		// loads current counter
 		binary.little_endian_put_u64(mut tc, ctr)
 
 		unsafe { vmemcpy(tt[48], tc.data, tc.len) }
-		unpack_into_state(mut s, tt)
+		unpack64_into_state(mut s, tt)
 		buf := chacha20_core(s)
 		pack64_from_state(mut b64, buf)
+
+		// xor every bytes of plaintext with bytes on b64, stores result in dst
 		for i in 0 .. want_len {
 			dst[j] = plaintext[j] ^ b64[i]
 			j++
@@ -216,17 +219,17 @@ fn psiv_gen_tag(mut tag []u8, mut po poly1305.Poly1305, input []u8, ad_len int, 
 	po.update(length_to_block(ad_len, input.len))
 
 	// produces 16-bytes of mac from current poly1305 state.
-	mut digest := []u8{len: tag_size}
-	po.finish(mut digest)
+	// As note, we reuse the tag buffer as temporary output, internally its has the same length.
+	po.finish(mut tag)
 
 	// The tag was produced from derived key scrambled with chacha20 quarter round routine,
 	// and then truncating the output into 16-bytes tag.
-	drv_key := merge_drv_key(mac_key, nonce, digest[0..8], digest[8..16])
+	drv_key := merge_drv_key(mac_key, nonce, tag[0..8], tag[8..16])
 	mut x := chacha20.State{}
-	unpack_into_state(mut x, drv_key)
+	unpack64_into_state(mut x, drv_key)
 	ws := chacha20_core(x)
 
-	// truncating state output into tag sized bytes
+	// truncating 64-bytes state and serialized into 16-bytes of tag buffer output
 	pack16_from_state(mut tag, ws)
 }
 
@@ -246,19 +249,22 @@ fn update_with_padding(mut po poly1305.Poly1305, data []u8) {
 fn merge_drv_key(dkey [36]u8, nonce []u8, tag_ctr []u8, tag_rest []u8) [64]u8 {
 	mut x := [64]u8{}
 
-	// 0..36
+	// index at 0..36
 	for i := 0; i < dkey.len; i++ {
 		x[i] = dkey[i]
 	}
-	// 36..48
+
+	// index at 36..48
 	for i := 0; i < nonce.len; i++ {
 		x[36 + i] = nonce[i]
 	}
-	// 48..56
+
+	// index at 48..56
 	for i := 0; i < tag_ctr.len; i++ {
 		x[i + 48] = tag_ctr[i]
 	}
-	// 56..64
+
+	// index at 56..64
 	for i := 0; i < tag_rest.len; i++ {
 		x[i + 56] = tag_rest[i]
 	}
@@ -273,35 +279,38 @@ fn merge_drv_key(dkey [36]u8, nonce []u8, tag_ctr []u8, tag_rest []u8) [64]u8 {
 fn fk_k(k []u8) [36]u8 {
 	// fk(K) = 	K1 ∥ K2 ∥ K3 ∥ 03 ∥ K5 ∥ K6 ∥ K7 ∥ 0c ∥ K9 ∥ K10 ∥ K11 ∥ 30
 	//			∥ K4 ∥ K8 ∥ K12 ∥ c0 ∥ K13 ∥ K14 ∥  · · ·  ∥ K32
-	// with 0-based index
+	// or with 0-based index
 	// 			K0 ∥ K1 ∥ K2 ∥ 03 ∥ K4 ∥ K5 ∥ K6 ∥ 0c ∥ K8 ∥ K9 ∥ K10 ∥ 30
 	//			∥ K3 ∥ K7 ∥ K11 ∥ c0 ∥ K12 ∥ K13 ∥  · · ·  ∥ K31
+	//
+	// set output buffer
 	mut x := [36]u8{}
-	// 0 .. 4
+
+	// index at 0 .. 4
 	for i := 0; i < 3; i++ {
 		x[i] = k[i]
 	}
 	x[3] = u8(0x03)
 
-	// 4 .. 8
+	// index at 4 .. 8
 	for i := 4; i < 7; i++ {
 		x[i] = k[i]
 	}
 	x[7] = 0x0c
 
-	// 8 .. 12
+	// index at 8 .. 12
 	for i := 8; i < 11; i++ {
 		x[i] = k[i]
 	}
 	x[11] = 0x30
 
-	// 12 .. 16
+	// index at 12 .. 16
 	x[12] = k[3]
 	x[13] = k[7]
 	x[14] = k[11]
 	x[15] = 0xc0
 
-	// 16 .. 36
+	// index 16 .. 36
 	for i := 16; i < 36; i++ {
 		x[i] = k[i - 4]
 	}
@@ -318,32 +327,34 @@ fn fm_k(k []u8) [36]u8 {
 	// Or, with 0-based index
 	// fm(K) = 	K0 ∥ K1 ∥ K2 ∥ 05 ∥ K4 ∥ K5 ∥ K6 ∥ 0a ∥ K8 ∥ K9 ∥ K10 ∥ 50 ∥
 	//			K3 ∥ K7 ∥ K11 ∥ a0 ∥ K12 ∥ K13 ∥  · · ·  ∥ K31
+	//
+	// set output buffer
 	mut x := [36]u8{}
-	// 0 .. 4
+	// index at 0 .. 4
 	for i := 0; i < 3; i++ {
 		x[i] = k[i]
 	}
 	x[3] = u8(0x05)
 
-	// 4 .. 8
+	// index at 4 .. 8
 	for i := 4; i < 7; i++ {
 		x[i] = k[i]
 	}
 	x[7] = 0x0a
 
-	// 8 .. 12
+	// index at 8 .. 12
 	for i := 8; i < 11; i++ {
 		x[i] = k[i]
 	}
 	x[11] = 0x50
 
-	// 12 .. 16
+	// index at 12 .. 16
 	x[12] = k[3]
 	x[13] = k[7]
 	x[14] = k[11]
 	x[15] = 0xa0
 
-	// 16 .. 36
+	// index at 16 .. 36
 	for i := 16; i < 36; i++ {
 		x[i] = k[i - 4]
 	}
@@ -359,32 +370,35 @@ fn fe_k(k []u8) [36]u8 {
 	// Or, with 0-based index
 	// fe(K) = 	K0 ∥ K1 ∥ K2 ∥ 06 ∥ K4 ∥ K5 ∥ K6 ∥ 09 ∥ K8 ∥ K9 ∥ K10 ∥ 60 ∥
 	// 			K3 ∥ K7 ∥ K11 ∥ 90 ∥ K12 ∥ K13 ∥  · · ·  ∥ K31
+	//
+	// set buffer output
 	mut x := [36]u8{}
-	// 0 .. 4
+
+	// index at 0 .. 4
 	for i := 0; i < 3; i++ {
 		x[i] = k[i]
 	}
 	x[3] = u8(0x06)
 
-	// 4 .. 8
+	// index at 4 .. 8
 	for i := 4; i < 7; i++ {
 		x[i] = k[i]
 	}
 	x[7] = 0x09
 
-	// 8 .. 12
+	// index at 8 .. 12
 	for i := 8; i < 11; i++ {
 		x[i] = k[i]
 	}
 	x[11] = 0x60
 
-	// 12 .. 16
+	// index at 12 .. 16
 	x[12] = k[3]
 	x[13] = k[7]
 	x[14] = k[11]
 	x[15] = 0x90
 
-	// 16 .. 36
+	// index at 16 .. 36
 	for i := 16; i < 36; i++ {
 		x[i] = k[i - 4]
 	}
@@ -392,9 +406,9 @@ fn fe_k(k []u8) [36]u8 {
 	return x
 }
 
-// unpack_into_state deserializes (in little-endian form) 64-bytes of data in x into state s.
+// unpack64_into_state deserializes (in little-endian form) 64-bytes of data in x into state s.
 @[direct_array_access; inline]
-fn unpack_into_state(mut s chacha20.State, x [64]u8) {
+fn unpack64_into_state(mut s chacha20.State, x [64]u8) {
 	for i := 0; i < 16; i++ {
 		s[i] = u32(x[i * 4]) | (u32(x[i * 4 + 1]) << u32(8)) | (u32(x[i * 4 + 2]) << u32(16)) | (u32(x[
 			i * 4 + 3]) << u32(24))
@@ -418,11 +432,11 @@ fn pack64_from_state(mut b [64]u8, s chacha20.State) {
 @[direct_array_access; inline]
 fn pack32_from_state(mut b []u8, s chacha20.State) {
 	mut j := 0
-	for v in s[0..8] {
-		b[j] = u8(v)
-		b[j + 1] = u8(v >> u32(8))
-		b[j + 2] = u8(v >> u32(16))
-		b[j + 3] = u8(v >> u32(24))
+	for i in 0 .. 8 {
+		b[j] = u8(s[i])
+		b[j + 1] = u8(s[i] >> u32(8))
+		b[j + 2] = u8(s[i] >> u32(16))
+		b[j + 3] = u8(s[i] >> u32(24))
 		j += 4
 	}
 }
@@ -431,11 +445,11 @@ fn pack32_from_state(mut b []u8, s chacha20.State) {
 @[direct_array_access; inline]
 fn pack16_from_state(mut b []u8, s chacha20.State) {
 	mut j := 0
-	for v in s[0..4] {
-		b[j] = u8(v)
-		b[j + 1] = u8(v >> u32(8))
-		b[j + 2] = u8(v >> u32(16))
-		b[j + 3] = u8(v >> u32(24))
+	for i in 0 .. 4 {
+		b[j] = u8(s[i])
+		b[j + 1] = u8(s[i] >> u32(8))
+		b[j + 2] = u8(s[i] >> u32(16))
+		b[j + 3] = u8(s[i] >> u32(24))
 		j += 4
 	}
 }

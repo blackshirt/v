@@ -67,7 +67,7 @@ import x.crypto.chacha20poly1305
 
 const benchmark_iterations = 1000
 
-const test_data_sizes = [6, 8, 12, 16, 64, 75, 256, 1028, 2049]
+const test_data_sizes = [6, 8, 12, 16, 64, 75, 256, 1028, 2049, 4056]
 
 // standard AEAD_CHACHA20_POLY1305 encryption
 fn benchmark_aead_std_encrypt(msg []u8, key []u8, nonce []u8, ad []u8, iterations int) time.Duration {
@@ -140,7 +140,7 @@ fn main() {
 	key := rand.bytes(32)!
 	nonce := rand.bytes(12)!
 	for size in test_data_sizes {
-		ad := rand.bytes(size)!
+		ad := rand.bytes(size + 5)!
 		test_msg := rand.bytes(size)!
 
 		// Warm up
