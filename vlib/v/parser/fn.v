@@ -301,6 +301,11 @@ fn (mut p Parser) fn_decl() ast.FnDecl {
 		p.next()
 	}
 	p.check(.key_fn)
+	mut comments_before_key_fn := if p.pref.is_vls {
+		p.cur_comments.clone()
+	} else {
+		[]
+	}
 	comments << p.eat_comments()
 	p.open_scope()
 	defer {
@@ -676,7 +681,11 @@ run them via `v file.v` instead',
 		p.inside_fn = true
 		p.inside_unsafe_fn = is_unsafe
 		p.cur_fn_scope = p.scope
-		stmts = p.parse_block_no_scope(true)
+		if p.is_vls_skip_file {
+			p.skip_scope()
+		} else {
+			stmts = p.parse_block_no_scope(true)
+		}
 		p.cur_fn_scope = last_fn_scope
 		p.inside_unsafe_fn = false
 		p.inside_fn = false
@@ -760,9 +769,10 @@ run them via `v file.v` instead',
 			''
 		}
 		key := 'fn_${p.mod}[${type_str}]${short_fn_name}'
-		val := ast.VLSInfo{
-			pos:      fn_decl.pos
-			comments: fn_decl.comments // TODO: we need comment just before fn decl
+		val := ast.VlsInfo{
+			pos: fn_decl.pos
+			doc: p.keyword_comments_to_string(short_fn_name, comments_before_key_fn) +
+				p.comments_to_string(fn_decl.end_comments)
 		}
 		p.table.register_vls_info(key, val)
 	}
