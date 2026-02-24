@@ -301,6 +301,48 @@ fn (t &Transformer) find_sumtype_for_variant(variant_name string) string {
 			}
 		}
 	}
+	// Fallback: search sum types in the current module scope for user-defined types.
+	// Only search the current module to avoid cross-module matches that would
+	// incorrectly trigger smartcasting (e.g., types.Type containing Alias).
+	cur_mod := t.cur_module
+	scope := t.get_module_scope(cur_mod) or { return '' }
+	for obj_name, obj in scope.objects {
+		if obj is types.Type {
+			if obj is types.SumType {
+				st_name := if cur_mod != '' && cur_mod != 'main' && cur_mod != 'builtin' {
+					'${cur_mod}__${obj_name}'
+				} else {
+					obj_name
+				}
+				variants := t.get_sum_type_variants(st_name)
+				if variants.len == 0 {
+					// Try short name if qualified name didn't work
+					inner_variants := t.get_sum_type_variants(obj_name)
+					for v in inner_variants {
+						v_short := if v.contains('__') {
+							v.all_after_last('__')
+						} else {
+							v
+						}
+						if v == variant_name || v_short == short_variant || v_short == variant_name {
+							return obj_name
+						}
+					}
+					continue
+				}
+				for v in variants {
+					v_short := if v.contains('__') {
+						v.all_after_last('__')
+					} else {
+						v
+					}
+					if v == variant_name || v_short == short_variant || v_short == variant_name {
+						return st_name
+					}
+				}
+			}
+		}
+	}
 	return ''
 }
 
@@ -349,6 +391,9 @@ fn (t &Transformer) get_var_type_name(name string) string {
 	}
 	// Some malformed/self-host transitional types can carry incomplete payloads.
 	// Avoid forcing `Type.name()` on those values here.
+	// Note: SumType is intentionally not handled here to avoid triggering
+	// incorrect smartcasting for variables of sum type (e.g. types.Type).
+	// Use get_sumtype_name_for_expr() for sum type name resolution.
 	return ''
 }
 
@@ -1199,8 +1244,23 @@ fn (t &Transformer) build_sumtype_init(transformed_value ast.Expr, variant_name 
 
 	// Create the sum type initialization with _data._variant field name
 	// This generates: (SumType){._tag = N, ._data._variant = (void*)...}
-	// Use short variant name for the C field (e.g., "InfixExpr" not "ast__InfixExpr")
-	short_variant := if variant_name.contains('__') {
+	// Convert variant name to C field name matching the union declaration:
+	// - "ast__InfixExpr" → "InfixExpr" (strip module prefix)
+	// - "[]ast__Attribute" → "Array_ast__Attribute" (array variant)
+	// - "map[K]V" → "Map_K_V" (map variant)
+	short_variant := if variant_name.starts_with('[]') {
+		'Array_${variant_name[2..]}'
+	} else if variant_name.starts_with('map[') {
+		// map[K]V → Map_K_V
+		inner := variant_name[4..] // after 'map['
+		if bracket_idx := inner.index(']') {
+			key := inner[..bracket_idx]
+			val := inner[bracket_idx + 1..]
+			'Map_${key}_${val}'
+		} else {
+			variant_name
+		}
+	} else if variant_name.contains('__') {
 		variant_name.all_after_last('__')
 	} else {
 		variant_name
