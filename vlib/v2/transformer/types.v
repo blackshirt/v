@@ -168,6 +168,16 @@ fn (t &Transformer) is_callable_type(typ types.Type) bool {
 	}
 }
 
+// is_fn_ident checks if an Ident refers to a function (for detecting function pointer args
+// in .filter()/.map() calls, e.g., arr.filter(my_predicate))
+fn (t &Transformer) is_fn_ident(ident ast.Ident) bool {
+	if typ := t.get_expr_type(ident) {
+		return t.is_callable_type(typ)
+	}
+	// Fallback: check if the name exists as a registered function
+	return t.env.lookup_fn('', ident.name) != none || t.env.lookup_fn('builtin', ident.name) != none
+}
+
 // is_interface_type checks if a type is an Interface
 fn (t &Transformer) is_interface_type_check(typ types.Type) bool {
 	return typ is types.Interface
@@ -1410,6 +1420,78 @@ fn (t &Transformer) get_module_scope(module_name string) ?&types.Scope {
 	return none
 }
 
+// resolve_module_name resolves a module alias to its real module name via scope lookup.
+// Returns the full module name (e.g., 'rand' for alias 'rand', 'seed' for sub-module 'seed').
+fn (t &Transformer) resolve_module_name(name string) ?string {
+	if t.scope != unsafe { nil } {
+		mut scope := unsafe { t.scope }
+		if obj := scope.lookup_parent(name, 0) {
+			if obj is types.Module {
+				mod := unsafe { &types.Module(&obj) }
+				if mod.name != '' {
+					return mod.name
+				}
+				return name
+			}
+		}
+	}
+	// Fallback: check current module scope
+	if t.cur_module != '' {
+		if mut mod_scope := t.get_module_scope(t.cur_module) {
+			if obj := mod_scope.lookup_parent(name, 0) {
+				if obj is types.Module {
+					mod := unsafe { &types.Module(&obj) }
+					if mod.name != '' {
+						return mod.name
+					}
+					return name
+				}
+			}
+		}
+	}
+	return none
+}
+
+// is_module_ident checks if an identifier refers to a module
+fn (t &Transformer) is_module_ident(name string) bool {
+	return t.resolve_module_name(name) != none
+}
+
+// type_is_string checks if a type is string, including &string (Pointer to String)
+fn (t &Transformer) type_is_string(typ types.Type) bool {
+	if typ is types.String {
+		return true
+	}
+	if typ is types.Struct && (typ as types.Struct).name == 'string' {
+		return true
+	}
+	if typ is types.Pointer {
+		return t.type_is_string(typ.base_type)
+	}
+	return false
+}
+
+// is_ptr_to_string_expr returns true if the expression has type &string (pointer to string)
+fn (t &Transformer) is_ptr_to_string_expr(expr ast.Expr) bool {
+	if expr_type := t.get_expr_type(expr) {
+		if expr_type is types.Pointer {
+			return t.type_is_string(expr_type.base_type)
+		}
+	}
+	// Also check scope for identifiers
+	if expr is ast.Ident {
+		if mut scope := t.get_current_scope() {
+			if obj := scope.lookup_parent(expr.name, 0) {
+				typ := obj.typ()
+				if typ is types.Pointer {
+					return t.type_is_string(typ.base_type)
+				}
+			}
+		}
+	}
+	return false
+}
+
 // get_expr_type returns the types.Type for an expression by looking it up in the environment
 fn (t &Transformer) get_expr_type(expr ast.Expr) ?types.Type {
 	pos := expr.pos()
@@ -1732,6 +1814,16 @@ fn (t &Transformer) unwrap_alias_and_pointer_type(typ types.Type) types.Type {
 	return cur
 }
 
+// get_array_nesting_depth returns the nesting depth of an array type.
+// []int → 1, [][]int → 2, [][][]int → 3, non-array → 0
+fn (t &Transformer) get_array_nesting_depth(typ types.Type) int {
+	base := t.unwrap_alias_and_pointer_type(typ)
+	if base is types.Array {
+		return 1 + t.get_array_nesting_depth(base.elem_type)
+	}
+	return 0
+}
+
 fn (t &Transformer) array_elem_type_name_for_helpers(elem_type types.Type) string {
 	if elem_type is types.FnType {
 		return 'voidptr'
@@ -1908,6 +2000,9 @@ fn (t &Transformer) type_to_c_name(typ types.Type) string {
 			// For other pointer types, use mangled ptr suffix for type names
 			// (This is used in map type names like Map_int_Intervalptr)
 			return '${base_name}ptr'
+		}
+		types.FnType {
+			return 'voidptr'
 		}
 		else {
 			return 'int'
@@ -2136,4 +2231,138 @@ fn (t &Transformer) get_array_init_elem_type(expr ast.ArrayInitExpr) string {
 		}
 	}
 	return 'int' // Default
+}
+
+// resolve_typeof_expr resolves typeof(expr) to a V type name string.
+fn (t &Transformer) resolve_typeof_expr(expr ast.Expr) string {
+	if raw_type := t.get_expr_type(expr) {
+		return t.types_type_to_v(raw_type)
+	}
+	return ''
+}
+
+// c_name_to_v_name converts a C-mangled name (e.g. "os__File") to V format ("os.File").
+// Strips "builtin__" and "main__" prefixes since V doesn't show them in typeof.
+fn c_name_to_v_name(name string) string {
+	if name.starts_with('builtin__') {
+		return name['builtin__'.len..]
+	}
+	if name.starts_with('main__') {
+		return name['main__'.len..]
+	}
+	// Convert module__Name to module.Name
+	if idx := name.index('__') {
+		return name[..idx] + '.' + name[idx + 2..]
+	}
+	return name
+}
+
+// types_type_to_v converts a types.Type to a V type name string (e.g. "map[rune]int", "[]string").
+// Used for typeof(expr) which needs V syntax, not C type names.
+fn (t &Transformer) types_type_to_v(typ types.Type) string {
+	match typ {
+		types.Primitive {
+			if typ.props.has(.integer) {
+				if typ.props.has(.untyped) {
+					return 'int'
+				}
+				size := if typ.size == 0 { 32 } else { int(typ.size) }
+				is_signed := !typ.props.has(.unsigned)
+				return if is_signed {
+					match size {
+						8 { 'i8' }
+						16 { 'i16' }
+						32 { 'int' }
+						64 { 'i64' }
+						else { 'int' }
+					}
+				} else {
+					match size {
+						8 { 'u8' }
+						16 { 'u16' }
+						32 { 'u32' }
+						else { 'u64' }
+					}
+				}
+			} else if typ.props.has(.float) {
+				if typ.props.has(.untyped) {
+					return 'f64'
+				}
+				return if typ.size == 32 { 'f32' } else { 'f64' }
+			} else if typ.props.has(.boolean) {
+				return 'bool'
+			}
+			return 'int'
+		}
+		types.Pointer {
+			base := t.types_type_to_v(typ.base_type)
+			return '&' + base
+		}
+		types.Array {
+			elem := t.types_type_to_v(typ.elem_type)
+			return '[]' + elem
+		}
+		types.ArrayFixed {
+			elem := t.types_type_to_v(typ.elem_type)
+			return '[' + typ.len.str() + ']' + elem
+		}
+		types.Struct {
+			return c_name_to_v_name(typ.name)
+		}
+		types.String {
+			return 'string'
+		}
+		types.Alias {
+			return c_name_to_v_name(typ.name)
+		}
+		types.Char {
+			return 'char'
+		}
+		types.Rune {
+			return 'rune'
+		}
+		types.Void {
+			return 'void'
+		}
+		types.Enum {
+			return c_name_to_v_name(typ.name)
+		}
+		types.Interface {
+			return c_name_to_v_name(typ.name)
+		}
+		types.SumType {
+			return c_name_to_v_name(types.sum_type_name(typ))
+		}
+		types.Map {
+			key := t.types_type_to_v(typ.key_type)
+			val := t.types_type_to_v(typ.value_type)
+			return 'map[' + key + ']' + val
+		}
+		types.OptionType {
+			base := t.types_type_to_v(typ.base_type)
+			return '?' + base
+		}
+		types.ResultType {
+			base := t.types_type_to_v(typ.base_type)
+			return '!' + base
+		}
+		types.FnType {
+			return 'fn ()'
+		}
+		types.ISize {
+			return 'isize'
+		}
+		types.USize {
+			return 'usize'
+		}
+		types.Nil {
+			return 'voidptr'
+		}
+		types.None {
+			return 'void'
+		}
+		else {
+			return 'int'
+		}
+	}
 }

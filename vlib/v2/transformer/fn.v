@@ -568,7 +568,10 @@ fn (mut t Transformer) transform_fn_decl(decl ast.FnDecl) ast.FnDecl {
 	}
 
 	// Transform function body
+	old_fn_name_str := t.cur_fn_name_str
+	t.cur_fn_name_str = decl.name
 	transformed_stmts := t.transform_stmts(decl.stmts)
+	t.cur_fn_name_str = old_fn_name_str
 	t.cur_fn_ret_type_name = old_fn_ret_type_name
 
 	// Lower defer statements: collect defers, remove them from body,
@@ -685,20 +688,20 @@ fn (mut t Transformer) transform_call_expr(expr ast.CallExpr) ast.Expr {
 				value: '0'
 			})
 		}
-		// `arr.sort(a < b)` comparator lambdas are not lowered yet.
-		// Keep C generation valid by passing nil callback for now.
-		if sel.rhs.name in ['sort', 'sorted'] && expr.args.len == 1
-			&& t.is_sort_compare_lambda_expr(expr.args[0]) {
-			return ast.CallExpr{
-				lhs:  ast.SelectorExpr{
-					lhs: t.transform_expr(sel.lhs)
-					rhs: sel.rhs
-					pos: sel.pos
+		// arr.sort() or arr.sort(a < b) - generate comparator and use sort_with_compare
+		if sel.rhs.name in ['sort', 'sorted'] {
+			if expr.args.len == 0 {
+				// .sort() with no args: default ascending
+				if result := t.transform_sort_call(sel.lhs, sel.rhs.name, [], expr.pos) {
+					return result
 				}
-				args: [ast.Expr(ast.Ident{
-					name: 'nil'
-				})]
-				pos:  expr.pos
+			} else if expr.args.len == 1 && t.is_sort_compare_lambda_expr(expr.args[0]) {
+				// .sort(a < b) with lambda comparator
+				if result := t.transform_sort_call(sel.lhs, sel.rhs.name, [expr.args[0]],
+					expr.pos)
+				{
+					return result
+				}
 			}
 		}
 		method_name := sel.rhs.name
@@ -858,10 +861,63 @@ fn (mut t Transformer) transform_call_expr(expr ast.CallExpr) ast.Expr {
 	// Method call resolution: rewrite receiver.method(args) -> Type__method(receiver, args)
 	if expr.lhs is ast.SelectorExpr {
 		sel := expr.lhs as ast.SelectorExpr
+		// Nested module call: rand.seed.time_seed_array() -> seed__time_seed_array()
+		if sel.lhs is ast.SelectorExpr {
+			inner := sel.lhs as ast.SelectorExpr
+			if inner.lhs is ast.Ident && t.is_module_ident(inner.lhs.name) {
+				sub_mod := inner.rhs.name
+				fn_name := sel.rhs.name
+				// Check if sub_mod is actually a module scope (not a variable like os.args)
+				mut resolved_name := ''
+				if t.get_module_scope(sub_mod) != none {
+					resolved_name = '${sub_mod}__${fn_name}'
+				} else {
+					full_mod := '${inner.lhs.name}__${sub_mod}'
+					if t.get_module_scope(full_mod) != none {
+						resolved_name = '${full_mod}__${fn_name}'
+					}
+				}
+				if resolved_name != '' {
+					mut args := []ast.Expr{cap: expr.args.len}
+					for arg in expr.args {
+						args << t.transform_expr(arg)
+					}
+					return ast.CallExpr{
+						lhs:  ast.Ident{
+							name: resolved_name
+						}
+						args: args
+						pos:  expr.pos
+					}
+				}
+			}
+		}
 		is_module_call := sel.lhs is ast.Ident && t.get_module_scope(sel.lhs.name) != none
 			&& t.lookup_var_type(sel.lhs.name) == none
 		if !is_module_call {
 			if resolved := t.resolve_method_call_name(sel.lhs, sel.rhs.name) {
+				// For nested array .clone(), use clone_to_depth with the correct depth
+				// so inner arrays are deeply cloned instead of shallow-copied.
+				if resolved == 'array__clone' && expr.args.len == 0 {
+					if recv_type := t.get_expr_type(sel.lhs) {
+						depth := t.get_array_nesting_depth(recv_type)
+						if depth > 1 {
+							return ast.CallExpr{
+								lhs:  ast.Ident{
+									name: 'array__clone_to_depth'
+								}
+								args: [
+									t.transform_expr(sel.lhs),
+									ast.Expr(ast.BasicLiteral{
+										kind:  .number
+										value: '${depth - 1}'
+									}),
+								]
+								pos:  expr.pos
+							}
+						}
+					}
+				}
 				call_args := t.lower_missing_call_args(expr.lhs, expr.args)
 				is_static := t.is_static_method_call(sel.lhs)
 				mut transformed_call_args := []ast.Expr{cap: call_args.len}
@@ -1581,19 +1637,10 @@ fn (mut t Transformer) transform_call_or_cast_expr(expr ast.CallOrCastExpr) ast.
 				value: '0'
 			})
 		}
-		// `arr.sort(a < b)` may be parsed as CallOrCastExpr in single-arg form.
-		// Keep C generation valid by passing nil callback for now.
+		// arr.sort(a < b) may be parsed as CallOrCastExpr in single-arg form.
 		if sel.rhs.name in ['sort', 'sorted'] && t.is_sort_compare_lambda_expr(expr.expr) {
-			return ast.CallExpr{
-				lhs:  ast.SelectorExpr{
-					lhs: t.transform_expr(sel.lhs)
-					rhs: sel.rhs
-					pos: sel.pos
-				}
-				args: [ast.Expr(ast.Ident{
-					name: 'nil'
-				})]
-				pos:  expr.pos
+			if result := t.transform_sort_call(sel.lhs, sel.rhs.name, [expr.expr], expr.pos) {
+				return result
 			}
 		}
 		method_name := sel.rhs.name
@@ -1933,6 +1980,12 @@ fn (t &Transformer) call_or_cast_lhs_is_type(lhs ast.Expr) bool {
 			return true
 		}
 		ast.Ident {
+			// Built-in primitive types are always casts, never function calls.
+			if lhs.name in ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'f32',
+				'f64', 'bool', 'byte', 'char', 'rune', 'usize', 'isize', 'string', 'byteptr',
+				'charptr', 'voidptr'] {
+				return true
+			}
 			// Prefer functions when names clash (even if uppercase).
 			if _ := t.get_fn_return_type(lhs.name) {
 				return false
