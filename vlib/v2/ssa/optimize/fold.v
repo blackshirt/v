@@ -8,8 +8,8 @@ import v2.ssa
 
 fn constant_fold(mut m ssa.Module) bool {
 	mut changed := false
-	for func in m.funcs {
-		for blk_id in func.blocks {
+	for fi in 0 .. m.funcs.len {
+		for blk_id in m.funcs[fi].blocks {
 			// Iterate directly without cloning - we don't modify the array during iteration
 			for val_id in m.blocks[blk_id].instrs {
 				if m.values[val_id].kind != .instruction {
@@ -44,8 +44,11 @@ fn constant_fold(mut m ssa.Module) bool {
 							}
 							typ := m.values[val_id].typ
 							one_val := m.get_or_add_const(typ, '1')
-							m.instrs[m.values[val_id].index].op = .shl
-							m.instrs[m.values[val_id].index].operands = [other_id, one_val]
+							// Avoid m.instrs[X].field = ... -- chained field assign broken in ARM64 self-hosted
+							mut shl_instr := m.instrs[m.values[val_id].index]
+							shl_instr.op = .shl
+							shl_instr.operands = [other_id, one_val]
+							m.instrs[m.values[val_id].index] = shl_instr
 							changed = true
 							continue
 						} else if needs_zero {
@@ -185,14 +188,13 @@ fn constant_fold(mut m ssa.Module) bool {
 // Branch folding: simplify conditional branches with constant conditions
 fn branch_fold(mut m ssa.Module) bool {
 	mut changed := false
-	for func in m.funcs {
-		for blk_id in func.blocks {
-			blk := m.blocks[blk_id]
-			if blk.instrs.len == 0 {
+	for fi in 0 .. m.funcs.len {
+		for blk_id in m.funcs[fi].blocks {
+			if m.blocks[blk_id].instrs.len == 0 {
 				continue
 			}
 
-			term_val_id := blk.instrs.last()
+			term_val_id := m.blocks[blk_id].instrs[m.blocks[blk_id].instrs.len - 1]
 			term := m.instrs[m.values[term_val_id].index]
 
 			if term.op == .br {
@@ -202,8 +204,11 @@ fn branch_fold(mut m ssa.Module) bool {
 					cond_int := cond_val.name.i64()
 					// Replace with unconditional jump to the taken branch
 					target := if cond_int != 0 { term.operands[1] } else { term.operands[2] }
-					m.instrs[m.values[term_val_id].index].op = .jmp
-					m.instrs[m.values[term_val_id].index].operands = [target]
+					// Avoid m.instrs[X].field = ... -- chained field assign broken in ARM64 self-hosted
+					mut jmp_instr := m.instrs[m.values[term_val_id].index]
+					jmp_instr.op = .jmp
+					jmp_instr.operands = [target]
+					m.instrs[m.values[term_val_id].index] = jmp_instr
 					changed = true
 				}
 			}
@@ -214,7 +219,7 @@ fn branch_fold(mut m ssa.Module) bool {
 
 // Algebraic simplifications: x+0=x, x*1=x, x*0=0, x-x=0, x^x=0, x&x=x, x|x=x, x*2=x<<1, etc.
 // Returns (replacement_id, needs_zero) - if needs_zero is true, caller should create zero constant
-fn try_algebraic_simplify(m ssa.Module, val_id int, instr ssa.Instruction, lhs ssa.Value, rhs ssa.Value) (int, bool) {
+fn try_algebraic_simplify(m &ssa.Module, val_id int, instr ssa.Instruction, lhs ssa.Value, rhs ssa.Value) (int, bool) {
 	lhs_id := instr.operands[0]
 	rhs_id := instr.operands[1]
 

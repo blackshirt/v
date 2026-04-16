@@ -23,6 +23,8 @@ struct Parser {
 mut:
 	modules              map[string]Module
 	checked_settings_vcs bool
+	search_modules       []string
+	search_loaded        bool
 	errors               int
 }
 
@@ -31,12 +33,13 @@ enum ModuleKind {
 	https
 	http
 	ssh
+	local
 }
 
-fn parse_query(query []string) []Module {
+fn parse_query(query []string, mut selector VpmInstallServerSelector) []Module {
 	mut p := Parser{}
 	for m in query {
-		p.parse_module(m)
+		p.parse_module(m, mut selector)
 	}
 	if p.errors > 0 && p.errors == query.len {
 		exit(1)
@@ -44,11 +47,42 @@ fn parse_query(query []string) []Module {
 	return p.modules.values()
 }
 
-fn (mut p Parser) parse_module(m string) {
+fn (mut p Parser) lookup_registered_name_for_url(manifest_name string, ident string, mut selector VpmInstallServerSelector) ?string {
+	if manifest_name == '' || manifest_name.contains('.') {
+		return none
+	}
+	expected_url := normalize_repo_lookup_url(ident) or { return none }
+	if !p.search_loaded {
+		p.search_modules = get_all_modules_for_search_with_selector(mut selector) or {
+			vpm_log(@FILE_LINE, @FN, 'failed to load the VPM search index for `${ident}`: ${err}')
+			p.search_loaded = true
+			return none
+		}
+		p.search_loaded = true
+	}
+	target_name := normalize_mod_path(manifest_name)
+	for registered_name in p.search_modules {
+		if normalize_mod_path(registered_name.all_after_last('.')) != target_name {
+			continue
+		}
+		info := get_mod_vpm_info_with_selector(registered_name, mut selector) or {
+			vpm_log(@FILE_LINE, @FN, 'failed to retrieve metadata for `${registered_name}`: ${err}')
+			continue
+		}
+		registered_url := normalize_repo_lookup_url(info.url) or { continue }
+		if registered_url == expected_url {
+			return info.name
+		}
+	}
+	return none
+}
+
+fn (mut p Parser) parse_module(m string, mut selector VpmInstallServerSelector) {
 	kind := match true {
 		m.starts_with('https://') { ModuleKind.https }
 		m.starts_with('git@') { ModuleKind.ssh }
 		m.starts_with('http://') { ModuleKind.http }
+		is_local_repository(m) { ModuleKind.local }
 		else { ModuleKind.registered }
 	}
 	ident, version := if kind == .ssh {
@@ -111,10 +145,21 @@ fn (mut p Parser) parse_module(m string) {
 			p.errors++
 			return
 		}
-		mod_path := normalize_mod_path(os.join_path(if kind == .http { publisher } else { '' },
-			manifest.name))
+		// Reuse the registered VPM name when a direct VCS URL points to the same repository.
+		registered_name := if kind in [.https, .ssh] {
+			p.lookup_registered_name_for_url(manifest.name, ident, mut selector) or { '' }
+		} else {
+			''
+		}
+		final_name := if registered_name != '' { registered_name } else { manifest.name }
+		mod_path := if registered_name != '' {
+			normalize_mod_path(final_name.replace('.', os.path_separator))
+		} else {
+			normalize_mod_path(os.join_path(if kind == .http { publisher } else { '' },
+				manifest.name))
+		}
 		Module{
-			name:         manifest.name
+			name:         final_name
 			url:          ident
 			version:      version
 			install_path: os.real_path(os.join_path(settings.vmodules_path, mod_path))
@@ -124,7 +169,7 @@ fn (mut p Parser) parse_module(m string) {
 		}
 	} else {
 		// VPM registered module.
-		info := get_mod_vpm_info(ident) or {
+		info := get_mod_vpm_info_with_selector(ident, mut selector) or {
 			vpm_error('failed to retrieve metadata for `${ident}`.', details: err.msg())
 			p.errors++
 			return
@@ -187,9 +232,33 @@ fn (mut p Parser) parse_module(m string) {
 	if mod.manifest.dependencies.len > 0 {
 		verbose_println('Found ${mod.manifest.dependencies.len} dependencies for `${mod.name}`: ${mod.manifest.dependencies}.')
 		for d in mod.manifest.dependencies {
-			p.parse_module(d)
+			p.parse_module(d, mut selector)
 		}
 	}
+}
+
+fn is_local_repository(query string) bool {
+	if query.starts_with('file://') {
+		return true
+	}
+	mut path_candidates := [query]
+	if !query.starts_with('git@') {
+		ident, _ := query.rsplit_once('@') or { query, '' }
+		if ident != query {
+			path_candidates << ident
+		}
+	}
+	for candidate in path_candidates {
+		path := os.expand_tilde_to_home(candidate)
+		if os.is_abs_path(path) || path.starts_with('./') || path.starts_with('../')
+			|| path.starts_with('~/') {
+			return true
+		}
+		if os.exists(path) {
+			return true
+		}
+	}
+	return false
 }
 
 fn (mut m Module) get_installed() {

@@ -61,3 +61,34 @@ pub mut:
 	}
 	assert pipeline_container.tags == ['@[heap]']
 }
+
+fn test_generated_enum_helpers_are_documented() {
+	mod_doc := doc.generate_from_mod('gg', false, true) or {
+		eprintln(err)
+		assert false
+		doc.Doc{}
+	}
+
+	mouse_buttons := mod_doc.contents['MouseButtons']!
+	mouse_button_methods := mouse_buttons.children.filter(it.kind == .method).map(it.name)
+	assert 'all' in mouse_button_methods
+	assert 'has' in mouse_button_methods
+	assert 'is_empty' in mouse_button_methods
+
+	mouse_buttons_from := mod_doc.contents['MouseButtons.from']!
+	assert mouse_buttons_from.kind == .method
+	assert mouse_buttons_from.content.contains('MouseButtons.from')
+
+	mouse_buttons_zero := mod_doc.contents['MouseButtons.zero']!
+	assert mouse_buttons_zero.kind == .method
+	assert mouse_buttons_zero.content.contains('MouseButtons.zero')
+}
+
+fn test_merge_doc_comments_keeps_blockquotes_on_separate_lines() {
+	comments := [
+		doc.DocComment{
+			text: '> **Note**\n> line one\n> line two'
+		},
+	]
+	assert doc.merge_doc_comments(comments).trim_space() == '> **Note**\n> line one\n> line two'
+}

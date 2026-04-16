@@ -11,6 +11,7 @@ struct User {
 	age           int
 	role          string @[index]
 	status        int    @[index]
+	level         UserLevel
 	salary        int
 	title         string
 	score         int
@@ -40,6 +41,12 @@ struct User {
 	option_f64    ?f64
 	option_bool   ?bool
 	option_string ?string
+}
+
+enum UserLevel {
+	beginner
+	intermediate
+	advanced
 }
 
 // UserPart is part of User, so we can access only part of the `sys_users` table
@@ -76,8 +83,8 @@ fn test_orm_func_where() {
 
 	// and_or_combination
 	qb.reset()
-	qb.where('name = ? AND status = ? OR role = ? || id = ? && title = ?', 'Alice', 1,
-		'admin', 1, 'st')!
+	qb.where('name = ? AND status = ? OR role = ? || id = ? && title = ?', 'Alice', 1, 'admin', 1,
+		'st')!
 	assert qb.where.fields == ['name', 'status', 'role', 'id', 'title']
 	assert qb.where.kinds == [.eq, .eq, .eq, .eq, .eq]
 	assert qb.where.is_and == [true, false, false, true]
@@ -109,6 +116,20 @@ fn test_orm_func_where() {
 	qb.where('name in ? AND age not in ?', ['Tom'], [2])!
 	assert qb.where.fields == ['name', 'age']
 	assert qb.where.kinds == [.in, .not_in]
+
+	// variable arrays for in and not in
+	names := ['Tom']
+	ages := [2]
+	qb.reset()
+	qb.where('name IN ? AND age NOT IN ?', names, ages)!
+	assert qb.where.fields == ['name', 'age']
+	assert qb.where.kinds == [.in, .not_in]
+	assert qb.where.data[0] is []orm.Primitive
+	assert qb.where.data[1] is []orm.Primitive
+	name_params := qb.where.data[0] as []orm.Primitive
+	age_params := qb.where.data[1] as []orm.Primitive
+	assert name_params == [orm.Primitive('Tom')]
+	assert age_params == [orm.Primitive(2)]
 }
 
 fn test_orm_func_stmts() {
@@ -258,6 +279,7 @@ fn test_orm_func_stmts() {
 			age:         27
 			role:        'employer'
 			status:      5
+			level:       .intermediate
 			salary:      2500
 			title:       'doctor'
 			score:       81
@@ -524,6 +546,8 @@ fn test_orm_func_stmts() {
 	selected_users := qb.where('created_at IS NULL && ((salary > ? && age < ?) || (role LIKE ?))',
 		2000, 30, '%employee%')!.query()!
 	assert selected_users[0].name == 'Silly'
+	// Check enum
+	assert selected_users[0].level == .intermediate
 	assert selected_users.len == 1
 
 	// complex select with lowercase `is null` and `like`
@@ -601,7 +625,7 @@ fn test_orm_func_invalid_index_field_name1() {
 	mut qb := orm.new_query[InvalidIndexFieldName1](db)
 
 	qb.create() or {
-		assert err.msg() == "table `InvalidIndexFieldName1` has no field's name: `age_f33`"
+		assert err.msg() == "table `invalidindexfieldname1` has no field's name: `age_f33`"
 		return
 	}
 	assert false, 'should not be here'
@@ -624,7 +648,7 @@ fn test_orm_func_invalid_index_field_name2() {
 	mut qb := orm.new_query[InvalidIndexFieldName2](db)
 
 	qb.create() or {
-		assert err.msg() == "table `InvalidIndexFieldName2` has no field's name: `age_f32`"
+		assert err.msg() == "table `invalidindexfieldname2` has no field's name: `age_f32`"
 		return
 	}
 	assert false, 'should not be here'

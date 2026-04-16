@@ -45,7 +45,8 @@ fn test_out_files() {
 	mut total_oks_panic := 0
 	mut total_skips := 0
 	paths := vtest.filter_vtest_only(tests, basepath: testdata_folder).sorted()
-	println(term.colorize(term.green, '> testing whether ${paths.len} .out files in ${local_tdata_path} match:'))
+	println(term.colorize(term.green,
+		'> testing whether ${paths.len} .out files in ${local_tdata_path} match:'))
 	for out_path in paths {
 		basename, path, relpath, out_relpath := target2paths(out_path, '.out')
 		if should_skip(relpath) {
@@ -134,7 +135,8 @@ fn test_c_must_have_files() {
 	mut total_oks_panic := 0
 	mut total_skips := 0
 	mut failed_descriptions := []string{cap: paths.len}
-	println(term.colorize(term.green, '> testing whether all line patterns in ${paths.len} `.c.must_have` files in ${local_tdata_path} match:'))
+	println(term.colorize(term.green,
+		'> testing whether all line patterns in ${paths.len} `.c.must_have` files in ${local_tdata_path} match:'))
 	for must_have_path in paths {
 		basename, path, relpath, must_have_relpath := target2paths(must_have_path, '.c.must_have')
 		if should_skip(relpath) {
@@ -263,8 +265,14 @@ pub fn get_file_options(file string) FileOptions {
 const github_job = os.getenv('GITHUB_JOB')
 
 fn should_skip(relpath string) bool {
-	if github_job == 'docker-ubuntu-musl' && relpath.ends_with('autofree_sql_or_block.vv') {
-		eprintln('> skipping ${relpath} on docker-ubuntu-musl, since it uses db.sqlite, and its headers are not available to the C compiler in that environment')
+	if github_job.contains('musl') && relpath.ends_with('autofree_sql_or_block.vv') {
+		eprintln('> skipping ${relpath} on ${github_job}, since it uses db.sqlite, and its headers are not available to the C compiler in that environment')
+		return true
+	}
+	if github_job.contains('musl') && (relpath.ends_with('print_boehm_leak.vv')
+		|| relpath.ends_with('scope_cleanup_boehm_leak.vv')
+		|| relpath.ends_with('gc_debugger_linux.vv')) {
+		eprintln('> skipping ${relpath} on ${github_job}, since gc related tests are not compatible with `-gc none`')
 		return true
 	}
 	if user_os == 'windows' {
@@ -287,6 +295,10 @@ fn should_skip(relpath string) bool {
 		$if msvc {
 			if relpath.contains('_not_msvc_windows.vv') {
 				eprintln('> skipping ${relpath} on msvc')
+				return true
+			}
+			if relpath.contains('asm_') {
+				eprintln('> skipping ${relpath} on msvc, since it uses gcc-style inline asm')
 				return true
 			}
 		}

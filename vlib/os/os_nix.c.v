@@ -201,7 +201,7 @@ fn native_glob_pattern(pattern string, mut matches []string) ! {
 
 // utime changes the access and modification times of the inode specified by path.
 // It returns POSIX error message, if it can not do so.
-pub fn utime(path string, actime int, modtime int) ! {
+pub fn utime(path string, actime i64, modtime i64) ! {
 	u := C.utimbuf{actime, modtime}
 	if C.utime(&char(path.str), &u) != 0 {
 		return error_with_code(posix_get_error_msg(C.errno), C.errno)
@@ -410,7 +410,10 @@ pub fn readlink(path string) !string {
 			return last_error()
 		}
 		if res2 < size {
-			return unsafe { tos(&u8(&buf2[0]), res2) }
+			unsafe {
+				buf2[res2] = 0
+				return cstring_to_vstring(buf2)
+			}
 		}
 		unsafe { free(buf2) } // and then loop around to try again with a larger one.
 	}

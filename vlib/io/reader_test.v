@@ -38,6 +38,37 @@ fn test_read_all_huge() {
 	assert res == '123'.repeat(100000).bytes()
 }
 
+struct ZeroReadAfterDataReader {
+mut:
+	call_count int
+}
+
+fn (mut r ZeroReadAfterDataReader) read(mut buf []u8) !int {
+	match r.call_count {
+		0 {
+			r.call_count++
+			return copy(mut buf, 'hello'.bytes())
+		}
+		1 {
+			r.call_count++
+			return 0
+		}
+		else {
+			return error('unexpected extra read after zero-length read')
+		}
+	}
+}
+
+fn test_read_all_stops_on_zero_length_read_after_partial_data() {
+	mut reader := &ZeroReadAfterDataReader{}
+	res := read_all(reader: reader) or {
+		assert false
+		''.bytes()
+	}
+	assert res == 'hello'.bytes()
+	assert reader.call_count == 2
+}
+
 struct StringReaderTest {
 	text string
 mut:
@@ -45,6 +76,30 @@ mut:
 }
 
 fn (mut s StringReaderTest) read(mut buf []u8) !int {
+	if s.place >= s.text.len {
+		return Eof{}
+	}
+	read := copy(mut buf, s.text[s.place..].bytes())
+	s.place += read
+	return read
+}
+
+struct ZeroThenDataReader {
+pub:
+	text string
+mut:
+	place       int
+	empty_reads int
+}
+
+fn (mut s ZeroThenDataReader) read(mut buf []u8) !int {
+	if buf.len == 0 {
+		return 0
+	}
+	if s.empty_reads == 0 {
+		s.empty_reads++
+		return 0
+	}
 	if s.place >= s.text.len {
 		return Eof{}
 	}
@@ -140,6 +195,23 @@ fn test_totalread_read() {
 		panic('bad')
 	}
 
+	assert r.total_read == total
+}
+
+fn test_buffered_reader_retries_zero_length_reads() {
+	text := 'Some testing text'
+	mut s := ZeroThenDataReader{
+		text: text
+	}
+	mut r := new_buffered_reader(reader: s, retries: 2)
+	mut buf := []u8{len: text.len}
+	total := r.read(mut buf) or {
+		assert false
+		panic('bad')
+	}
+
+	assert total == text.len
+	assert buf[..total] == text.bytes()
 	assert r.total_read == total
 }
 

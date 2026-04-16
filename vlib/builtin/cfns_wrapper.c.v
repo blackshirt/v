@@ -4,14 +4,14 @@ module builtin
 // The C string is expected to be a &u8 pointer.
 @[inline; unsafe]
 pub fn vstrlen(s &u8) int {
-	return unsafe { C.strlen(&char(s)) }
+	return int(unsafe { C.strlen(&char(s)) })
 }
 
 // vstrlen_char returns the V length of the C string `s` (0 terminator is not counted).
 // The C string is expected to be a &char pointer.
 @[inline; unsafe]
 pub fn vstrlen_char(s &char) int {
-	return unsafe { C.strlen(s) }
+	return int(unsafe { C.strlen(s) })
 }
 
 // vmemcpy copies n bytes from memory area src to memory area dest.
@@ -24,8 +24,8 @@ pub fn vmemcpy(dest voidptr, const_src voidptr, n isize) voidptr {
 	}
 	$if trace_vmemcpy_nulls ? {
 		if dest == unsafe { 0 } || const_src == unsafe { 0 } {
-			C.fprintf(C.stderr, c'vmemcpy null pointers passed, dest: %p src: %p n: %6ld\n',
-				dest, const_src, n)
+			C.fprintf(C.stderr, c'vmemcpy null pointers passed, dest: %p src: %p n: %6ld\n', dest,
+				const_src, n)
 			print_backtrace()
 		}
 	}
@@ -89,8 +89,7 @@ pub fn vmemset(s voidptr, c int, n isize) voidptr {
 	}
 	$if trace_vmemset_nulls ? {
 		if s == unsafe { 0 } {
-			C.fprintf(C.stderr, c'vmemset null pointers passed s: %p, c: %6d, n: %6ld\n',
-				s, c, n)
+			C.fprintf(C.stderr, c'vmemset null pointers passed s: %p, c: %6d, n: %6ld\n', s, c, n)
 			print_backtrace()
 		}
 	}
@@ -107,15 +106,16 @@ type FnSortCB = fn (const_a voidptr, const_b voidptr) int
 @[inline; unsafe]
 fn vqsort(base voidptr, nmemb usize, size usize, sort_cb FnSortCB) {
 	$if trace_vqsort ? {
-		C.fprintf(C.stderr, c'vqsort base: %p, nmemb: %6uld, size: %6uld, sort_cb: %p\n',
-			base, nmemb, size, sort_cb)
+		C.fprintf(C.stderr, c'vqsort base: %p, nmemb: %6uld, size: %6uld, sort_cb: %p\n', base,
+			nmemb, size, sort_cb)
 	}
 	if nmemb == 0 {
 		return
 	}
 	$if trace_vqsort_nulls ? {
-		if base == unsafe { 0 } || u64(sort_cb) == 0 {
-			C.fprintf(C.stderr, c'vqsort null pointers passed base: %p, nmemb: %6uld, size: %6uld, sort_cb: %p\n',
+		if base == unsafe { 0 } || voidptr(sort_cb) == unsafe { nil } {
+			C.fprintf(C.stderr,
+				c'vqsort null pointers passed base: %p, nmemb: %6uld, size: %6uld, sort_cb: %p\n',
 				base, nmemb, size, sort_cb)
 			print_backtrace()
 		}

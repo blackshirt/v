@@ -906,8 +906,7 @@ pub fn (mut f Gen) enum_decl(node ast.EnumDecl) {
 
 pub fn (mut f Gen) fn_decl(node ast.FnDecl) {
 	f.attrs(node.attrs)
-	f.write(f.table.stringify_fn_decl(&node, f.cur_mod, f.mod2alias, false).replace('fn ',
-		'func '))
+	f.write(f.table.stringify_fn_decl(&node, f.cur_mod, f.mod2alias, false).replace('fn ', 'func '))
 	f.fn_body(node)
 }
 
@@ -1286,8 +1285,7 @@ pub fn (mut f Gen) fn_type_decl(node ast.FnTypeDecl) {
 	f.write(')')
 	if fn_info.return_type.idx() != ast.void_type_idx {
 		f.mark_types_import_as_used(fn_info.return_type)
-		ret_str := f.no_cur_mod(f.table.type_to_str_using_aliases(fn_info.return_type,
-			f.mod2alias))
+		ret_str := f.no_cur_mod(f.table.type_to_str_using_aliases(fn_info.return_type, f.mod2alias))
 		f.write(' ${ret_str}')
 	} else if fn_info.return_type.has_flag(.option) {
 		f.write(' ?')
@@ -1820,7 +1818,7 @@ fn split_up_infix(infix_str string, ignore_paren bool, is_cond_infix bool) ([]st
 
 const wsinfix_depth_max = 10
 
-fn (mut f Gen) write_splitted_infix(conditions []string, penalties []int, ignore_paren bool, is_cond bool) {
+fn (mut f Gen) write_splitted_infix(conditions []string, _penalties []int, _ignore_paren bool, _is_cond bool) {
 	f.wsinfix_depth++
 	defer {
 		f.wsinfix_depth--
@@ -2175,8 +2173,16 @@ pub fn (mut f Gen) sql_expr(node ast.SqlExpr) {
 	f.writeln(' {')
 	f.write('\tselect ')
 	table_name := util.strip_mod_name(f.table.sym(node.table_expr.typ).name)
-	if node.is_count {
-		f.write('count ')
+	if node.aggregate_kind != .none {
+		match node.aggregate_kind {
+			.count {
+				f.write('count ')
+			}
+			.sum, .avg, .min, .max {
+				f.write('${node.aggregate_kind}(${node.aggregate_field}) ')
+			}
+			.none {}
+		}
 	} else {
 		for i, fd in node.fields {
 			f.write(fd.name)

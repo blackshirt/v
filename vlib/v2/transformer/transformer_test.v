@@ -1,16 +1,23 @@
 // Copyright (c) 2026 Alexander Medvednikov. All rights reserved.
 // Use of this source code is governed by an MIT license
 // that can be found in the LICENSE file.
+// vtest build: !windows
 module transformer
 
+import os
 import v2.ast
+import v2.parser
+import v2.pref as vpref
+import v2.token
 import v2.types
 
 // Helper to create a minimal transformer for testing
 fn create_test_transformer() &Transformer {
 	env := &types.Environment{}
 	return &Transformer{
+		pref:                        &vpref.Preferences{}
 		env:                         unsafe { env }
+		needed_clone_fns:            map[string]string{}
 		needed_array_contains_fns:   map[string]ArrayMethodInfo{}
 		needed_array_index_fns:      map[string]ArrayMethodInfo{}
 		needed_array_last_index_fns: map[string]ArrayMethodInfo{}
@@ -26,12 +33,34 @@ fn create_transformer_with_vars(vars map[string]types.Type) &Transformer {
 		scope.insert(name, typ)
 	}
 	return &Transformer{
+		pref:                        &vpref.Preferences{}
 		env:                         unsafe { env }
 		scope:                       scope
+		needed_clone_fns:            map[string]string{}
 		needed_array_contains_fns:   map[string]ArrayMethodInfo{}
 		needed_array_index_fns:      map[string]ArrayMethodInfo{}
 		needed_array_last_index_fns: map[string]ArrayMethodInfo{}
 	}
+}
+
+fn transform_code_for_test(code string) []ast.File {
+	tmp_file := '/tmp/v2_transformer_test_${os.getpid()}.v'
+	os.write_file(tmp_file, code) or { panic('failed to write temp file') }
+	defer {
+		os.rm(tmp_file) or {}
+	}
+	prefs := &vpref.Preferences{
+		backend:     .cleanc
+		no_parallel: true
+	}
+	mut file_set := token.FileSet.new()
+	mut par := parser.Parser.new(prefs)
+	files := par.parse_files([tmp_file], mut file_set)
+	env := types.Environment.new()
+	mut checker := types.Checker.new(prefs, file_set, env)
+	checker.check_files(files)
+	mut transformer := Transformer.new_with_pref(files, env, prefs)
+	return transformer.transform_files(files)
 }
 
 // string_type returns the builtin v2 string type.
@@ -44,6 +73,136 @@ fn rune_type() types.Type {
 	return types.Alias{
 		name: 'rune'
 	}
+}
+
+fn test_transform_comptime_embed_file_call_or_cast_expr_to_init_expr() {
+	raw_dir := os.join_path(os.temp_dir(), 'v2_transformer_embed_file_${os.getpid()}')
+	os.mkdir_all(raw_dir) or { panic(err) }
+	tmp_dir := os.real_path(raw_dir)
+	defer {
+		os.rmdir_all(tmp_dir) or {}
+	}
+	source_path := os.join_path(tmp_dir, 'main.v')
+	asset_path := os.join_path(tmp_dir, 'asset.txt')
+	os.write_file(source_path, 'fn main() {}') or { panic(err) }
+	os.write_file(asset_path, 'hello') or { panic(err) }
+
+	mut t := create_test_transformer()
+	t.cur_file_name = source_path
+
+	result := t.transform_comptime_expr(ast.ComptimeExpr{
+		expr: ast.Expr(ast.CallOrCastExpr{
+			lhs:  ast.Expr(ast.Ident{
+				name: 'embed_file'
+			})
+			expr: ast.Expr(ast.StringLiteral{
+				kind:  .v
+				value: "'asset.txt'"
+			})
+		})
+	})
+
+	assert t.needed_embed_file_helper
+	assert result is ast.InitExpr, 'expected InitExpr, got ${result.type_name()}'
+	init := result as ast.InitExpr
+	assert init.typ is ast.Ident
+	assert (init.typ as ast.Ident).name == embed_file_helper_type_name
+	assert init.fields.len == 4
+	assert init.fields[0].name == '_data'
+	assert init.fields[0].value is ast.StringLiteral
+	assert (init.fields[0].value as ast.StringLiteral).value == "'hello'"
+	assert init.fields[1].name == 'len'
+	assert init.fields[1].value is ast.BasicLiteral
+	assert (init.fields[1].value as ast.BasicLiteral).value == '5'
+	assert init.fields[2].name == 'path'
+	assert init.fields[3].name == 'apath'
+	assert init.fields[3].value is ast.StringLiteral
+	assert (init.fields[3].value as ast.StringLiteral).value == quote_v_string_literal(asset_path)
+}
+
+fn test_transform_comptime_embed_file_chained_method_call() {
+	raw_dir := os.join_path(os.temp_dir(), 'v2_transformer_embed_file_chain_${os.getpid()}')
+	os.mkdir_all(raw_dir) or { panic(err) }
+	tmp_dir := os.real_path(raw_dir)
+	defer {
+		os.rmdir_all(tmp_dir) or {}
+	}
+	source_path := os.join_path(tmp_dir, 'main.v')
+	asset_path := os.join_path(tmp_dir, 'asset.txt')
+	os.write_file(source_path, 'fn main() {}') or { panic(err) }
+	os.write_file(asset_path, 'hello') or { panic(err) }
+
+	mut t := create_test_transformer()
+	t.cur_file_name = source_path
+
+	result := t.transform_comptime_expr(ast.ComptimeExpr{
+		expr: ast.Expr(ast.CallExpr{
+			lhs:  ast.Expr(ast.SelectorExpr{
+				lhs: ast.Expr(ast.CallOrCastExpr{
+					lhs:  ast.Expr(ast.Ident{
+						name: 'embed_file'
+					})
+					expr: ast.Expr(ast.StringLiteral{
+						kind:  .v
+						value: "'asset.txt'"
+					})
+				})
+				rhs: ast.Ident{
+					name: 'to_bytes'
+				}
+			})
+			args: []
+		})
+	})
+
+	assert t.needed_embed_file_helper
+	assert result is ast.CallExpr, 'expected CallExpr, got ${result.type_name()}'
+	call := result as ast.CallExpr
+	assert call.lhs is ast.SelectorExpr
+	sel := call.lhs as ast.SelectorExpr
+	assert sel.lhs is ast.InitExpr
+	init := sel.lhs as ast.InitExpr
+	assert init.typ is ast.Ident
+	assert (init.typ as ast.Ident).name == embed_file_helper_type_name
+	assert sel.rhs.name == 'to_bytes'
+	assert init.fields.len == 4
+	assert init.fields[0].value is ast.StringLiteral
+	assert (init.fields[0].value as ast.StringLiteral).value == "'hello'"
+	assert init.fields[3].value is ast.StringLiteral
+	assert (init.fields[3].value as ast.StringLiteral).value == quote_v_string_literal(asset_path)
+}
+
+fn test_inject_embed_file_helper_adds_builtin_helper_once() {
+	mut t := create_test_transformer()
+	mut files := [
+		ast.File{
+			mod:   'builtin'
+			name:  'builtin.v'
+			stmts: [
+				ast.Stmt(ast.StructDecl{
+					name: 'Existing'
+				}),
+			]
+		},
+		ast.File{
+			mod:  'main'
+			name: 'main.v'
+		},
+	]
+
+	t.inject_embed_file_helper(mut files)
+	t.inject_embed_file_helper(mut files)
+
+	assert files[0].stmts.len == 7
+	assert files[0].stmts[1] is ast.StructDecl
+	assert (files[0].stmts[1] as ast.StructDecl).name == embed_file_helper_type_name
+	mut helper_count := 0
+	for stmt in files[0].stmts {
+		if stmt is ast.StructDecl && stmt.name == embed_file_helper_type_name {
+			helper_count++
+		}
+	}
+	assert helper_count == 1
 }
 
 fn test_transform_ident_vmodroot_to_string_literal() {
@@ -68,6 +227,67 @@ fn test_transform_ident_vmodroot_empty_root() {
 	lit := result as ast.StringLiteral
 	assert lit.kind == .v
 	assert lit.value == "''"
+}
+
+fn test_transform_autogenerates_clone_helpers_for_iclone_structs() {
+	files := transform_code_for_test('
+interface IClone {}
+
+struct Inner implements IClone {
+	name string
+}
+
+struct Outer implements IClone {
+	inner Inner
+	nums []int
+}
+
+fn use_clone(value Outer) Outer {
+	return value.clone()
+}
+')
+	assert files.len == 1
+	file := files[0]
+	mut saw_inner_clone := false
+	mut saw_outer_clone := false
+	mut saw_lowered_call := false
+	for stmt in file.stmts {
+		if stmt is ast.FnDecl && stmt.name == 'use_clone' {
+			assert stmt.stmts.len == 1
+			ret := stmt.stmts[0] as ast.ReturnStmt
+			assert ret.exprs.len == 1
+			assert ret.exprs[0] is ast.CallExpr
+			call := ret.exprs[0] as ast.CallExpr
+			assert call.lhs is ast.Ident
+			assert (call.lhs as ast.Ident).name == 'Outer__clone'
+			saw_lowered_call = true
+		}
+		if stmt is ast.FnDecl && stmt.name == 'Inner__clone' {
+			saw_inner_clone = true
+		}
+		if stmt is ast.FnDecl && stmt.name == 'Outer__clone' {
+			saw_outer_clone = true
+			assert stmt.stmts.len == 1
+			ret := stmt.stmts[0] as ast.ReturnStmt
+			assert ret.exprs.len == 1
+			assert ret.exprs[0] is ast.InitExpr
+			init := ret.exprs[0] as ast.InitExpr
+			assert init.fields.len == 2
+			assert init.fields[0].name == 'inner'
+			assert init.fields[0].value is ast.CallExpr
+			inner_call := init.fields[0].value as ast.CallExpr
+			assert inner_call.lhs is ast.Ident
+			assert (inner_call.lhs as ast.Ident).name == 'Inner__clone'
+			assert init.fields[1].name == 'nums'
+			assert init.fields[1].value is ast.CallExpr
+			nums_call := init.fields[1].value as ast.CallExpr
+			assert nums_call.lhs is ast.Ident
+			assert (nums_call.lhs as ast.Ident).name == 'array__clone'
+		}
+	}
+	assert saw_lowered_call
+	assert saw_inner_clone
+	assert saw_outer_clone
 }
 
 fn test_array_comparison_eq() {
@@ -186,6 +406,49 @@ fn test_transform_index_expr_string_slice_lowered() {
 	assert call.args.len == 3
 }
 
+fn test_transform_index_expr_string_call_slice_open_ended_uses_max_int() {
+	mut env := &types.Environment{}
+	env.set_expr_type(1, types.string_)
+	mut t := &Transformer{
+		pref:                        &vpref.Preferences{}
+		env:                         unsafe { env }
+		needed_array_contains_fns:   map[string]ArrayMethodInfo{}
+		needed_array_index_fns:      map[string]ArrayMethodInfo{}
+		needed_array_last_index_fns: map[string]ArrayMethodInfo{}
+	}
+
+	expr := ast.IndexExpr{
+		lhs:  ast.CallExpr{
+			lhs: ast.Ident{
+				name: 'get_type'
+			}
+			pos: token.Pos{
+				id: 1
+			}
+		}
+		expr: ast.RangeExpr{
+			op:    .dotdot
+			start: ast.BasicLiteral{
+				kind:  .number
+				value: '2'
+			}
+			end:   ast.empty_expr
+		}
+	}
+
+	result := t.transform_expr(expr)
+	assert result is ast.CallExpr, 'expected CallExpr, got ${result.type_name()}'
+	call := result as ast.CallExpr
+	assert call.lhs is ast.Ident
+	assert (call.lhs as ast.Ident).name == 'string__substr'
+	assert call.args.len == 3
+	assert call.args[0] is ast.CallExpr
+	assert call.args[2] is ast.BasicLiteral
+	end := call.args[2] as ast.BasicLiteral
+	assert end.kind == .number
+	assert end.value == '2147483647'
+}
+
 fn test_transform_index_expr_array_slice_lowered() {
 	mut t := create_transformer_with_vars({
 		'arr': types.Type(types.Array{ elem_type: types.int_ })
@@ -282,6 +545,106 @@ fn test_transform_call_expr_array_contains_fixed_array() {
 	assert call.args.len == 2
 	assert call.args[1] is ast.BasicLiteral
 	assert 'Array_fixed_int_3_contains' in t.needed_array_contains_fns
+}
+
+fn test_generate_array_method_elem_expr_registers_elem_type() {
+	mut t := create_test_transformer()
+	elem_expr := t.generate_array_method_elem_expr(ArrayMethodInfo{
+		array_type: 'Array_string'
+		elem_type:  'string'
+	}, ast.Expr(ast.Ident{
+		name: 'i'
+	}))
+	assert elem_expr is ast.IndexExpr
+	assert elem_expr.pos().id < 0
+	elem_type := t.synth_types[elem_expr.pos().id] or {
+		assert false, 'expected synthesized element type for array helper index expr'
+		return
+	}
+	assert t.type_to_c_name(elem_type) == 'string'
+}
+
+fn test_resolve_expr_with_expected_type_resolves_enum_shorthand() {
+	mut t := create_test_transformer()
+	resolved := t.resolve_expr_with_expected_type(ast.Expr(ast.SelectorExpr{
+		lhs: ast.empty_expr
+		rhs: ast.Ident{
+			name: 'v'
+		}
+	}), types.Type(types.Enum{
+		name: 'ast__StringLiteralKind'
+	}))
+	assert resolved is ast.Ident
+	assert (resolved as ast.Ident).name == 'ast__StringLiteralKind__v'
+}
+
+fn test_transform_init_expr_resolves_imported_enum_shorthand() {
+	env := &types.Environment{}
+	mut ast_scope := types.new_scope(unsafe { nil })
+	enum_typ := types.Type(types.Enum{
+		name: 'ast__StringLiteralKind'
+	})
+	ast_scope.insert('StringLiteralKind', enum_typ)
+	ast_scope.insert('StringLiteral', types.Type(types.Struct{
+		name:   'ast__StringLiteral'
+		fields: [
+			types.Field{
+				name: 'kind'
+				typ:  enum_typ
+			},
+			types.Field{
+				name: 'value'
+				typ:  types.string_
+			},
+		]
+	}))
+	lock env.scopes {
+		env.scopes['ast'] = ast_scope
+	}
+	mut t := &Transformer{
+		pref:                        &vpref.Preferences{}
+		env:                         unsafe { env }
+		cur_module:                  'main'
+		cached_scopes:               {
+			'ast': ast_scope
+		}
+		needed_array_contains_fns:   map[string]ArrayMethodInfo{}
+		needed_array_index_fns:      map[string]ArrayMethodInfo{}
+		needed_array_last_index_fns: map[string]ArrayMethodInfo{}
+	}
+	result := t.transform_init_expr(ast.InitExpr{
+		typ:    ast.Expr(ast.SelectorExpr{
+			lhs: ast.Expr(ast.Ident{
+				name: 'ast'
+			})
+			rhs: ast.Ident{
+				name: 'StringLiteral'
+			}
+		})
+		fields: [
+			ast.FieldInit{
+				name:  'kind'
+				value: ast.Expr(ast.SelectorExpr{
+					lhs: ast.empty_expr
+					rhs: ast.Ident{
+						name: 'v'
+					}
+				})
+			},
+		]
+	})
+	assert result is ast.InitExpr
+	init := result as ast.InitExpr
+	mut found_kind := false
+	for field in init.fields {
+		if field.name == 'kind' {
+			found_kind = true
+			assert field.value is ast.Ident
+			assert (field.value as ast.Ident).name == 'ast__StringLiteralKind__v'
+			break
+		}
+	}
+	assert found_kind
 }
 
 fn test_transform_map_init_expr_non_empty_lowers_to_runtime_ctor() {

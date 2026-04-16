@@ -561,6 +561,11 @@ pub:
 	pos    token.Pos
 }
 
+// name_str returns the parameter name.
+pub fn (p Parameter) name_str() string {
+	return p.name
+}
+
 pub struct ParenExpr {
 pub:
 	expr Expr
@@ -920,6 +925,7 @@ pub:
 	attributes     []Attribute
 	is_public      bool
 	is_union       bool
+	implements     []Expr
 	embedded       []Expr
 	language       Language = .v
 	name           string

@@ -74,8 +74,10 @@ fn builtin_init() {
 	C.SetConsoleOutputCP(cp_utf8)
 	at_exit(restore_codepage) or {}
 	if is_terminal(1) > 0 {
-		C.SetConsoleMode(C.GetStdHandle(std_output_handle), enable_processed_output | enable_wrap_at_eol_output | evable_virtual_terminal_processing)
-		C.SetConsoleMode(C.GetStdHandle(std_error_handle), enable_processed_output | enable_wrap_at_eol_output | evable_virtual_terminal_processing)
+		C.SetConsoleMode(C.GetStdHandle(std_output_handle),
+			enable_processed_output | enable_wrap_at_eol_output | evable_virtual_terminal_processing)
+		C.SetConsoleMode(C.GetStdHandle(std_error_handle),
+			enable_processed_output | enable_wrap_at_eol_output | evable_virtual_terminal_processing)
 		unsafe {
 			C.setbuf(C.stdout, 0)
 			C.setbuf(C.stderr, 0)
@@ -112,13 +114,10 @@ pub:
 	context_record   &ContextRecord   = unsafe { nil }
 }
 
+@[callconv: stdcall]
 type VectoredExceptionHandler = fn (&ExceptionPointers) int
 
-fn C.AddVectoredExceptionHandler(i32, voidptr)
-
-fn add_vectored_exception_handler(handler VectoredExceptionHandler) {
-	C.AddVectoredExceptionHandler(1, voidptr(handler))
-}
+fn C.AddVectoredExceptionHandler(i32, VectoredExceptionHandler) voidptr
 
 @[callconv: stdcall]
 fn unhandled_exception_handler(e &ExceptionPointers) int {
@@ -138,7 +137,7 @@ fn unhandled_exception_handler(e &ExceptionPointers) int {
 }
 
 fn add_unhandled_exception_handler() {
-	add_vectored_exception_handler(VectoredExceptionHandler(voidptr(unhandled_exception_handler)))
+	C.AddVectoredExceptionHandler(1, unhandled_exception_handler)
 }
 
 fn C.IsDebuggerPresent() bool

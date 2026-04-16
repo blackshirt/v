@@ -5,6 +5,7 @@
 module transformer
 
 import v2.ast
+import v2.token
 import v2.types
 
 // try_expand_if_guard_assign_stmts expands an if-guard assignment to multiple statements.
@@ -55,12 +56,8 @@ fn (mut t Transformer) try_expand_if_guard_assign_stmts(stmt ast.AssignStmt) ?[]
 		if _ := t.get_map_type_for_expr(guard_rhs.lhs) {
 			// This is a map access - transform using "key in map" check
 			// x := if key in map { map[key] } else { default }
-			key_in_map := ast.InfixExpr{
-				op:  .key_in
-				lhs: guard_rhs.expr // the key expression
-				rhs: guard_rhs.lhs  // the map expression
-				pos: guard_rhs.pos
-			}
+			key_in_map := t.make_infix_expr_at(.key_in, guard_rhs.expr, guard_rhs.lhs,
+				guard_rhs.pos)
 
 			// Build new stmts for the then-branch: guard_var := map[key]; <original stmts>
 			mut new_then_stmts := []ast.Stmt{cap: if_expr.stmts.len + 1}
@@ -169,112 +166,6 @@ fn (mut t Transformer) try_expand_if_guard_stmt(stmt ast.ExprStmt) ?[]ast.Stmt {
 		is_option = fn_name != '' && t.fn_returns_option(fn_name)
 	}
 
-	// Native backends (arm64/x64) don't use Option/Result structs -
-	// functions return raw values (0 for none). Skip struct-based
-	// expansion and fall through to simple truthiness check.
-	if t.pref != unsafe { nil } && (t.pref.backend == .arm64 || t.pref.backend == .x64) {
-		// For ?SumType returns: use _data field check instead of raw truthiness.
-		// Sumtypes are {_tag, _data} structs - the first variant has _tag=0,
-		// which would be indistinguishable from none (all zeros) when checking
-		// the first word. Check _data (the pointer field) instead.
-		if is_option || is_result {
-			mut base_type := t.get_expr_base_type(rhs)
-			if base_type == '' {
-				fn_name := t.get_call_fn_name(rhs)
-				if fn_name != '' {
-					base_type = t.get_fn_return_base_type(fn_name)
-				}
-			}
-			if base_type != '' && t.is_sum_type(base_type) {
-				temp_name := t.gen_temp_name()
-				temp_ident := ast.Ident{
-					name: temp_name
-					pos:  synth_pos
-				}
-				mut stmts := []ast.Stmt{}
-				// 1. _tmp := call()
-				stmts << ast.AssignStmt{
-					op:  .decl_assign
-					lhs: [ast.Expr(temp_ident)]
-					rhs: [t.transform_expr(rhs)]
-					pos: synth_pos
-				}
-				// 2. Condition: _tmp._data (second field of sumtype struct)
-				data_check := t.synth_selector(temp_ident, '_data', types.Type(types.voidptr_))
-				// 3. Build if body: guard_var := _tmp; original_body
-				mut if_stmts := []ast.Stmt{}
-				if_stmts << ast.AssignStmt{
-					op:  .decl_assign
-					lhs: guard.stmt.lhs
-					rhs: [ast.Expr(temp_ident)]
-					pos: guard.stmt.pos
-				}
-				for s in if_expr.stmts {
-					if_stmts << s
-				}
-				modified_if := ast.IfExpr{
-					cond:      data_check
-					stmts:     t.transform_stmts(if_stmts)
-					else_expr: t.transform_expr(if_expr.else_expr)
-					pos:       synth_pos
-				}
-				if orig_type := t.get_expr_type(ast.Expr(if_expr)) {
-					t.register_synth_type(synth_pos, orig_type)
-				}
-				stmts << ast.ExprStmt{
-					expr: modified_if
-				}
-				return stmts
-			} else {
-				// Non-sum-type option/result return (e.g., ?StructType).
-				// Use temp variable + simple truthiness check.
-				// Without this, the function call would be used as the condition
-				// AND called again inside the if-body, causing double evaluation
-				// and incorrect behavior for struct return types.
-				temp_name := t.gen_temp_name()
-				temp_ident := ast.Ident{
-					name: temp_name
-					pos:  synth_pos
-				}
-				mut stmts := []ast.Stmt{}
-				// 1. _tmp := call()
-				stmts << ast.AssignStmt{
-					op:  .decl_assign
-					lhs: [ast.Expr(temp_ident)]
-					rhs: [t.transform_expr(rhs)]
-					pos: synth_pos
-				}
-				// 2. Build if body: guard_var := _tmp; original_body
-				mut if_stmts := []ast.Stmt{}
-				if_stmts << ast.AssignStmt{
-					op:  .decl_assign
-					lhs: guard.stmt.lhs
-					rhs: [ast.Expr(temp_ident)]
-					pos: guard.stmt.pos
-				}
-				for s in if_expr.stmts {
-					if_stmts << s
-				}
-				// 3. Condition: truthiness of _tmp (0 = none for native backends)
-				modified_if := ast.IfExpr{
-					cond:      temp_ident
-					stmts:     t.transform_stmts(if_stmts)
-					else_expr: t.transform_expr(if_expr.else_expr)
-					pos:       synth_pos
-				}
-				if orig_type := t.get_expr_type(ast.Expr(if_expr)) {
-					t.register_synth_type(synth_pos, orig_type)
-				}
-				stmts << ast.ExprStmt{
-					expr: modified_if
-				}
-				return stmts
-			}
-		}
-		is_result = false
-		is_option = false
-	}
-
 	if is_result || is_option {
 		// Handle Result/Option if-guard
 		// Generate: { _tmp := call(); if (!_tmp.is_error) { attr := extractValue(_tmp); body } else { else } }
@@ -306,14 +197,8 @@ fn (mut t Transformer) try_expand_if_guard_stmt(stmt ast.ExprStmt) ?[]ast.Stmt {
 				expr: t.synth_selector(temp_ident, 'is_error', types.Type(types.bool_))
 			})
 		} else {
-			ast.Expr(ast.InfixExpr{
-				op:  .eq
-				lhs: t.synth_selector(temp_ident, 'state', types.Type(types.int_))
-				rhs: ast.BasicLiteral{
-					kind:  .number
-					value: '0'
-				}
-			})
+			t.make_infix_expr(.eq, t.synth_selector(temp_ident, 'state', types.Type(types.int_)),
+				t.make_number_expr('0'))
 		}
 
 		// 3. Build if-body: attr := _tmp.data; original_body
@@ -407,13 +292,9 @@ fn (mut t Transformer) try_expand_if_guard_stmt(stmt ast.ExprStmt) ?[]ast.Stmt {
 				}
 
 				// Build condition: _tmp != nil
-				null_check := ast.InfixExpr{
-					op:  .ne
-					lhs: temp_ident
-					rhs: ast.Ident{
-						name: 'nil'
-					}
-				}
+				null_check := t.make_infix_expr(.ne, ast.Expr(temp_ident), ast.Expr(ast.Ident{
+					name: 'nil'
+				}))
 
 				// Build the if expression
 				modified_if := ast.IfExpr{
@@ -437,12 +318,8 @@ fn (mut t Transformer) try_expand_if_guard_stmt(stmt ast.ExprStmt) ?[]ast.Stmt {
 		}
 
 		// This is an array lookup - generate bounds check: index < array.len
-		bounds_check := ast.InfixExpr{
-			op:  .lt
-			lhs: t.transform_expr(rhs.expr) // the index
-			rhs: t.synth_selector(t.transform_expr(rhs.lhs), 'len', types.Type(types.int_))
-			pos: rhs.pos
-		}
+		bounds_check := t.make_infix_expr_at(.lt, t.transform_expr(rhs.expr), t.synth_selector(t.transform_expr(rhs.lhs),
+			'len', types.Type(types.int_)), rhs.pos)
 
 		// Build if body: guard_var := arr[i]; original_body
 		mut if_stmts := []ast.Stmt{}
@@ -803,6 +680,202 @@ fn (t &Transformer) if_expr_is_value(ie ast.IfExpr) bool {
 	return true
 }
 
+// try_expand_tuple_if_assign_stmts expands `x, y, w, h := if cond { a, b, c, d } else { e, f, g, h }`
+// into individual declarations + if-statement with assignments:
+//   x := 0; y := 0; w := 0; h := 0;
+//   if cond { x = a; y = b; w = c; h = d } else { x = e; y = f; w = g; h = h2 }
+fn (mut t Transformer) try_expand_tuple_if_assign_stmts(stmt ast.AssignStmt) ?[]ast.Stmt {
+	if stmt.op != .decl_assign {
+		return none
+	}
+	// Must have tuple LHS
+	is_tuple_lhs := stmt.lhs.len > 1 || (stmt.lhs.len == 1 && stmt.lhs[0] is ast.Tuple)
+	if !is_tuple_lhs {
+		return none
+	}
+	// Must have single IfExpr RHS
+	if stmt.rhs.len != 1 {
+		return none
+	}
+	if stmt.rhs[0] !is ast.IfExpr {
+		// Check if RHS might be Tuple containing an IfExpr
+		return none
+	}
+	tuple_lhs := if stmt.lhs.len > 1 {
+		stmt.lhs
+	} else if stmt.lhs[0] is ast.Tuple {
+		(stmt.lhs[0] as ast.Tuple).exprs
+	} else {
+		stmt.lhs
+	}
+	n := tuple_lhs.len
+	if n == 0 {
+		return none
+	}
+	if_expr := stmt.rhs[0] as ast.IfExpr
+	// Extract tuple values from then branch
+	then_stmts := t.build_tuple_branch_assigns(if_expr.stmts, tuple_lhs, n, stmt.pos) or {
+		return none
+	}
+	// Process else branch
+	mut else_expr := ast.Expr(ast.empty_expr)
+	if if_expr.else_expr is ast.IfExpr {
+		else_if := if_expr.else_expr as ast.IfExpr
+		if else_if.cond is ast.EmptyExpr {
+			// Plain else block
+			else_stmts := t.build_tuple_branch_assigns(else_if.stmts, tuple_lhs, n, stmt.pos) or {
+				return none
+			}
+			else_expr = ast.IfExpr{
+				stmts: else_stmts
+				pos:   else_if.pos
+			}
+		} else {
+			// else-if chain
+			else_if_stmts := t.build_tuple_branch_assigns(else_if.stmts, tuple_lhs, n, stmt.pos) or {
+				return none
+			}
+			else_expr = ast.IfExpr{
+				cond:      else_if.cond
+				stmts:     else_if_stmts
+				else_expr: else_if.else_expr
+				pos:       else_if.pos
+			}
+		}
+	}
+	// Build result: declarations for each variable, then the if-statement
+	mut result := []ast.Stmt{cap: n + 1}
+	for lhs_expr in tuple_lhs {
+		result << ast.Stmt(ast.AssignStmt{
+			op:  .decl_assign
+			lhs: [lhs_expr]
+			rhs: [ast.Expr(ast.BasicLiteral{
+				kind:  .number
+				value: '0'
+			})]
+			pos: stmt.pos
+		})
+	}
+	result << ast.Stmt(ast.ExprStmt{
+		expr: ast.IfExpr{
+			cond:      if_expr.cond
+			stmts:     then_stmts
+			else_expr: else_expr
+			pos:       if_expr.pos
+		}
+	})
+	return result
+}
+
+// extract_branch_tuple_values extracts N values from a branch's last statement.
+// The last statement should be an ExprStmt containing either a Tuple or a single expression.
+fn (t &Transformer) extract_branch_tuple_values(stmts []ast.Stmt, n int) ?[]ast.Expr {
+	if stmts.len == 0 {
+		return none
+	}
+	// Find last non-empty statement (skip trailing EmptyStmt)
+	mut last_idx := stmts.len - 1
+	for last_idx >= 0 && stmts[last_idx] is ast.EmptyStmt {
+		last_idx--
+	}
+	if last_idx < 0 {
+		return none
+	}
+	last := stmts[last_idx]
+	if last !is ast.ExprStmt {
+		return none
+	}
+	last_expr := (last as ast.ExprStmt).expr
+	if last_expr is ast.Tuple {
+		if last_expr.exprs.len == n {
+			return last_expr.exprs
+		}
+		return none
+	}
+	// Single expression, only valid for n == 1
+	if n == 1 {
+		return [last_expr]
+	}
+	return none
+}
+
+// build_tuple_branch_assigns builds assignment statements for a tuple if-expression branch.
+// If the branch ends with a Tuple literal (a, b, c), it assigns each element directly.
+// If the branch ends with a single call expression returning a tuple, it assigns the call
+// to a temp variable and extracts .arg0, .arg1, etc.
+fn (mut t Transformer) build_tuple_branch_assigns(stmts []ast.Stmt, tuple_lhs []ast.Expr, n int, pos token.Pos) ?[]ast.Stmt {
+	if tuple_values := t.extract_branch_tuple_values(stmts, n) {
+		// Branch has explicit tuple values — assign each one directly
+		mut result := []ast.Stmt{cap: n}
+		for i in 0 .. n {
+			result << ast.Stmt(ast.AssignStmt{
+				op:  .assign
+				lhs: [tuple_lhs[i]]
+				rhs: [tuple_values[i]]
+				pos: pos
+			})
+		}
+		return result
+	}
+	// Branch has a single non-tuple expression (e.g. a function call returning a tuple).
+	// Extract it and assign via temp: _tuple_tN = call(); x = _tuple_tN.arg0; y = _tuple_tN.arg1
+	if stmts.len == 0 {
+		return none
+	}
+	mut last_idx := stmts.len - 1
+	for last_idx >= 0 && stmts[last_idx] is ast.EmptyStmt {
+		last_idx--
+	}
+	if last_idx < 0 {
+		return none
+	}
+	last := stmts[last_idx]
+	if last !is ast.ExprStmt {
+		return none
+	}
+	last_expr := (last as ast.ExprStmt).expr
+	if last_expr is ast.Tuple {
+		return none // Tuple case was already handled above
+	}
+	// Single expression returning a tuple (e.g. function call)
+	t.temp_counter++
+	tmp_name := '_tuple_t${t.temp_counter}'
+	tmp_ident := ast.Ident{
+		name: tmp_name
+	}
+	mut result := []ast.Stmt{cap: n + 1}
+	// Include any preceding statements from the branch
+	for i in 0 .. last_idx {
+		if stmts[i] !is ast.EmptyStmt {
+			result << stmts[i]
+		}
+	}
+	// Assign call result to temp
+	result << ast.Stmt(ast.AssignStmt{
+		op:  .decl_assign
+		lhs: [ast.Expr(tmp_ident)]
+		rhs: [last_expr]
+		pos: pos
+	})
+	// Extract .arg0, .arg1, etc.
+	for i in 0 .. n {
+		result << ast.Stmt(ast.AssignStmt{
+			op:  .assign
+			lhs: [tuple_lhs[i]]
+			rhs: [
+				ast.Expr(ast.SelectorExpr{
+					lhs: tmp_ident
+					rhs: ast.Ident{
+						name: 'arg${i}'
+					}
+				}),
+			]
+			pos: pos
+		})
+	}
+	return result
+}
+
 // lower_if_expr_value lowers a value-position IfExpr into a temp variable + statement-form if.
 // Generates: _if_t<N> := if cond { a } else { b }
 // Hoists the decl_assign via pending_stmts and returns the temp ident as replacement.
@@ -993,6 +1066,53 @@ fn (mut t Transformer) resolve_comptime_if_stmts(node ast.IfExpr) []ast.Stmt {
 	return []
 }
 
+// can_eval_comptime_cond returns true if the transformer can evaluate this
+// comptime condition. Returns false for conditions involving generic type
+// checks (key_is/not_is) that need to be resolved by the backend.
+fn (t &Transformer) can_eval_comptime_cond(cond ast.Expr) bool {
+	match cond {
+		ast.Ident {
+			return true
+		}
+		ast.PrefixExpr {
+			return t.can_eval_comptime_cond(cond.expr)
+		}
+		ast.InfixExpr {
+			if cond.op == .key_is || cond.op == .not_is {
+				return false
+			}
+			return t.can_eval_comptime_cond(cond.lhs) && t.can_eval_comptime_cond(cond.rhs)
+		}
+		ast.PostfixExpr {
+			return true
+		}
+		ast.ParenExpr {
+			return t.can_eval_comptime_cond(cond.expr)
+		}
+		else {
+			return false
+		}
+	}
+}
+
+// transform_comptime_if_bodies recursively transforms the body stmts of each
+// branch in a comptime $if, without evaluating the condition. This is used when
+// the condition can't be evaluated at transform time (e.g., generic type checks).
+fn (mut t Transformer) transform_comptime_if_bodies(node ast.IfExpr) ast.IfExpr {
+	transformed_stmts := t.transform_stmts(node.stmts)
+	mut transformed_else := node.else_expr
+	if node.else_expr is ast.IfExpr {
+		else_if := node.else_expr as ast.IfExpr
+		transformed_else_if := t.transform_comptime_if_bodies(else_if)
+		transformed_else = ast.Expr(transformed_else_if)
+	}
+	return ast.IfExpr{
+		cond:      node.cond
+		stmts:     transformed_stmts
+		else_expr: transformed_else
+	}
+}
+
 // eval_comptime_cond evaluates a compile-time condition expression
 fn (t &Transformer) eval_comptime_cond(cond ast.Expr) bool {
 	match cond {
@@ -1100,8 +1220,11 @@ fn (t &Transformer) eval_comptime_flag(name string) bool {
 			// guards select the software fallback path instead of inline asm.
 			return t.pref != unsafe { nil } && (t.pref.backend == .arm64 || t.pref.backend == .x64)
 		}
+		'prealloc' {
+			return t.pref != unsafe { nil } && t.pref.prealloc
+		}
 		// Feature flags that are typically false
-		'new_int', 'gcboehm', 'prealloc', 'autofree' {
+		'new_int', 'gcboehm', 'autofree', 'ppc64' {
 			return false
 		}
 		else {

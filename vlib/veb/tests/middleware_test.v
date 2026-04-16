@@ -14,14 +14,17 @@ const exit_after = time.second * 10
 pub struct Context {
 	veb.Context
 pub mut:
-	counter int
+	counter              int
+	bound_middleware_tag string
 }
 
 @[heap]
 pub struct App {
 	veb.Middleware[Context]
 mut:
-	started chan bool
+	started                chan bool
+	bound_middleware_hits  int
+	bound_middleware_value string
 }
 
 pub fn (mut app App) before_accept_loop() {
@@ -48,6 +51,16 @@ pub fn (app &App) nested(mut ctx Context) veb.Result {
 
 pub fn (app &App) after(mut ctx Context) veb.Result {
 	return ctx.text('from after, ${ctx.counter}')
+}
+
+@['/admin/auth'; get]
+pub fn (app &App) admin_auth_get(mut ctx Context) veb.Result {
+	return ctx.text('protected get route')
+}
+
+@['/admin/auth'; post]
+pub fn (app &App) admin_auth_post(mut ctx Context) veb.Result {
+	return ctx.text('public post route')
 }
 
 @['/gzip']
@@ -81,8 +94,22 @@ pub fn (app &App) double_after(mut ctx Context) veb.Result {
 	return ctx.text('handler response')
 }
 
+// bound verifies that route middleware can read app state before the handler runs.
+@['/bound']
+pub fn (app &App) bound(mut ctx Context) veb.Result {
+	return ctx.text('${app.bound_middleware_value}, ${app.bound_middleware_hits}, ${ctx.bound_middleware_tag}, ${ctx.counter}')
+}
+
 pub fn (app &App) app_middleware(mut ctx Context) bool {
 	ctx.counter++
+	return true
+}
+
+// route_bound_middleware reads and mutates the bound app to exercise stateful middleware.
+pub fn (mut app App) route_bound_middleware(mut ctx Context) bool {
+	app.bound_middleware_hits++
+	ctx.bound_middleware_tag = app.bound_middleware_value
+	ctx.counter += 10
 	return true
 }
 
@@ -100,6 +127,12 @@ fn after_middleware(mut ctx Context) bool {
 	ctx.counter++
 	ctx.res.header.add_custom('X-AFTER', ctx.counter.str()) or { panic('bad') }
 	return true
+}
+
+fn auth_required_middleware(mut ctx Context) bool {
+	ctx.res.set_status(.unauthorized)
+	ctx.text('auth required')
+	return false
 }
 
 // Global after-middleware that sends a response (for double-send regression test)
@@ -122,7 +155,9 @@ fn route_after_sends_response(mut ctx Context) bool {
 fn testsuite_begin() {
 	os.chdir(os.dir(@FILE))!
 
-	mut app := &App{}
+	mut app := &App{
+		bound_middleware_value: 'from app middleware'
+	}
 	// even though `route_use` is called first, global middleware is still executed first
 	app.Middleware.route_use('/unreachable', handler: middleware_unreachable)
 
@@ -134,8 +169,15 @@ fn testsuite_begin() {
 	app.Middleware.route_use('/bar/:foo', handler: middleware_handler)
 	// should match multiple slashes
 	app.Middleware.route_use('/nested/:path...', handler: middleware_handler)
+	app.Middleware.route_use('/bound', handler: app.route_bound_middleware)
 
 	app.Middleware.route_use('/after', handler: after_middleware, after: true)
+	app.Middleware.route_use('/admin/auth',
+		handler: auth_required_middleware
+		methods: [
+			.get,
+		]
+	)
 
 	// Gzip middleware tests
 	app.Middleware.use(veb.decode_gzip[Context]())
@@ -183,6 +225,26 @@ fn test_nested() {
 	assert x.body == 'from nested, 3'
 }
 
+fn test_route_middleware_bound_method_can_access_app_state() {
+	x := http.get('${localserver}/bound')!
+	assert x.body == 'from app middleware, 1, from app middleware, 12'
+}
+
+fn test_route_middleware_method_filter_get() {
+	x := http.get('${localserver}/admin/auth')!
+	assert x.status() == .unauthorized
+	assert x.body == 'auth required'
+}
+
+fn test_route_middleware_method_filter_post() {
+	x := http.fetch(http.FetchConfig{
+		url:    '${localserver}/admin/auth'
+		method: .post
+	})!
+	assert x.status() == .ok
+	assert x.body == 'public post route'
+}
+
 fn test_after_middleware() {
 	x := http.get('${localserver}/after')!
 	assert x.body == 'from after, 2'
@@ -198,8 +260,8 @@ fn test_encode_gzip_middleware() {
 	encoding := x.header.get(.content_encoding) or { '' }
 	assert encoding == 'gzip', 'Expected gzip encoding, got: ${encoding}'
 
-	decompressed := gzip.decompress(x.body.bytes())!
-	assert decompressed.bytestr() == 'gzip response, 2'
+	// HTTP client auto-decompresses gzip content
+	assert x.body == 'gzip response, 2'
 }
 
 // Verifies that decode_gzip middleware decompresses request bodies
@@ -259,8 +321,8 @@ fn test_encode_auto_gzip_fallback() {
 	encoding := x.header.get(.content_encoding) or { '' }
 	assert encoding == 'gzip', 'Expected gzip encoding when zstd is not in Accept-Encoding, got: ${encoding}'
 
-	decompressed := gzip.decompress(x.body.bytes())!
-	assert decompressed.bytestr() == 'content response, 2'
+	// HTTP client auto-decompresses gzip content
+	assert x.body == 'content response, 2'
 }
 
 // Verifies that encode_auto sends uncompressed when no encoding is supported

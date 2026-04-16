@@ -14,6 +14,9 @@ import v.pref
 // TODO: turn this to a Doc method, so that the new_vdoc_preferences call here can
 // be removed.
 fn get_parent_mod(input_dir string) !string {
+	if input_dir == '' {
+		return error('no input folder')
+	}
 	// windows root path is C: or D:
 	if input_dir.len == 2 && input_dir[1] == `:` {
 		return error('root folder reached')
@@ -22,14 +25,11 @@ fn get_parent_mod(input_dir string) !string {
 	if input_dir == '/' {
 		return error('root folder reached')
 	}
-	if input_dir == '' {
-		return error('no input folder')
-	}
 	base_dir := os.dir(input_dir)
 	input_dir_name := os.file_name(base_dir)
 	prefs := new_vdoc_preferences()
 	fentries := os.ls(base_dir) or { []string{} }
-	files := fentries.filter(!os.is_dir(it))
+	files := fentries.filter(!os.is_dir(os.join_path(base_dir, it)))
 	if 'v.mod' in files {
 		// the top level is reached, no point in climbing up further
 		return ''
@@ -44,14 +44,14 @@ fn get_parent_mod(input_dir string) !string {
 	}
 	mut tbl := ast.new_table()
 	file_ast := parser.parse_file(v_files[0], mut tbl, .skip_comments, prefs)
-	if file_ast.mod.name == 'main' {
+	if file_ast.mod.short_name == 'main' {
 		return ''
 	}
 	parent_mod := get_parent_mod(base_dir) or { return input_dir_name }
 	if parent_mod.len > 0 {
-		return '${parent_mod}.${file_ast.mod.name}'
+		return '${parent_mod}.${file_ast.mod.short_name}'
 	}
-	return file_ast.mod.name
+	return file_ast.mod.short_name
 }
 
 // lookup_module_with_path looks up the path of a given module name.

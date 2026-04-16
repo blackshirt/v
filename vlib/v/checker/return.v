@@ -52,17 +52,19 @@ fn (mut c Checker) return_stmt(mut node ast.Return) {
 	}
 	expected_type_sym := c.table.sym(expected_type)
 	if expected_type_sym.info is ast.ArrayFixed {
-		c.table.find_or_register_array_fixed(expected_type_sym.info.elem_type, expected_type_sym.info.size,
-			expected_type_sym.info.size_expr, true)
+		c.table.find_or_register_array_fixed(expected_type_sym.info.elem_type,
+			expected_type_sym.info.size, expected_type_sym.info.size_expr, true)
 	}
 	if node.exprs.len > 0 && c.table.cur_fn.return_type == ast.void_type {
-		c.error('unexpected argument, current function does not return anything', node.exprs[0].pos())
+		c.error('unexpected argument, current function does not return anything',
+			node.exprs[0].pos())
 		return
 	} else if node.exprs.len > 1 && c.table.cur_fn.return_type == ast.void_type.set_flag(.option) {
 		c.error('can only return `none` from an Option-only return function', node.exprs[0].pos())
 		return
 	} else if node.exprs.len > 1 && c.table.cur_fn.return_type == ast.void_type.set_flag(.result) {
-		c.error('functions with Result-only return types can only return an error', node.exprs[0].pos())
+		c.error('functions with Result-only return types can only return an error',
+			node.exprs[0].pos())
 		return
 	} else if node.exprs.len == 0 && !(c.expected_type == ast.void_type
 		|| expected_type_sym.kind == .void) {
@@ -112,7 +114,8 @@ fn (mut c Checker) return_stmt(mut node ast.Return) {
 		} else {
 			if mut expr is ast.Ident && expr.obj is ast.Var {
 				if expr.obj.smartcasts.len > 0 {
-					typ = c.unwrap_generic(expr.obj.smartcasts.last())
+					typ = c.unwrap_generic(c.exposed_smartcast_type(expr.obj.orig_type,
+						expr.obj.smartcasts.last(), expr.obj.is_mut))
 				}
 				if expr.obj.ct_type_var != .no_comptime {
 					typ = c.type_resolver.get_type_or_default(expr, typ)
@@ -147,8 +150,7 @@ fn (mut c Checker) return_stmt(mut node ast.Return) {
 	result_type_idx := c.table.type_idxs['_result']
 	got_types_0_idx := got_types[0].idx()
 	if exp_is_option && got_types_0_idx == ast.error_type_idx {
-		c.error('Option and Result types have been split, use `!Foo` to return errors',
-			node.pos)
+		c.error('Option and Result types have been split, use `!Foo` to return errors', node.pos)
 	} else if exp_is_result && got_types_0_idx == ast.none_type_idx {
 		c.error('Option and Result types have been split, use `?` to return none', node.pos)
 	}
@@ -200,8 +202,7 @@ fn (mut c Checker) return_stmt(mut node ast.Return) {
 		exprv := node.exprs[expr_idxs[i]]
 		if exprv is ast.Ident && exprv.or_expr.kind == .propagate_option {
 			if exp_type.has_flag(.option) {
-				c.warn('unwrapping option is redundant as the function returns option',
-					node.pos)
+				c.warn('unwrapping option is redundant as the function returns option', node.pos)
 			} else {
 				c.error('should not unwrap option var on return, it could be none', node.pos)
 			}
@@ -239,7 +240,9 @@ fn (mut c Checker) return_stmt(mut node ast.Return) {
 				if c.pref.skip_unused && got_types[i].has_flag(.generic) {
 					c.table.used_features.comptime_syms[got_type] = true
 				}
-				if exp_type_sym.kind == .interface {
+				if exp_type_sym.kind == .interface
+					|| (exp_type_sym.kind == .generic_inst && exp_type_sym.info is ast.GenericInst
+					&& c.table.type_symbols[exp_type_sym.info.parent_idx].kind == .interface) {
 					if c.type_implements(got_type, exp_type, node.pos) {
 						if !got_type.is_any_kind_of_pointer() && got_type_sym.kind != .interface
 							&& !c.inside_unsafe {
@@ -282,9 +285,24 @@ fn (mut c Checker) return_stmt(mut node ast.Return) {
 					&& c.array_fixed_has_unresolved_size(exp_final_sym.info) {
 					continue
 				}
+				// In generic functions, scope variable types can be stale from a
+				// different instantiation pass. Skip the error if the original
+				// return type is generic — the cgen resolves types per-instantiation.
+				if c.table.cur_fn != unsafe { nil } && c.table.cur_fn.return_type.has_flag(.generic)
+					&& c.table.cur_concrete_types.len > 0 {
+					continue
+				}
 
 				c.error('cannot use `${got_type_name}` as ${c.error_type_name(exp_type)} in return argument',
 					exprv.pos())
+			}
+		}
+		if exprv is ast.Ident {
+			if exprv.obj is ast.Var && exprv.obj.smartcasts.len > 0 {
+				orig_sym := c.table.final_sym(exprv.obj.orig_type)
+				if orig_sym.kind == .interface {
+					continue
+				}
 			}
 		}
 		if got_type.is_any_kind_of_pointer() && !exp_type.is_any_kind_of_pointer()

@@ -8,7 +8,11 @@ features.
 - **Very fast** performance of C on the web.
 - **Templates are precompiled** all errors are visible at compilation time, not at runtime.
 - **Middleware** functionality similar to other big frameworks.
+- **HTTPS support** directly from `veb` via `mbedtls`.
+- **Method-aware route middleware** for protecting only selected HTTP verbs.
+- **Static compression** with gzip/zstd, including manual pre-compression support.
 - **Controllers** to split up your apps logic.
+- **Graceful shutdown** support in the `new_veb` backend.
 - **Easy to deploy** just one binary file that also includes all templates. No need to install any
   dependencies.
 
@@ -85,6 +89,68 @@ or for data that you want to share between different routes.
 
 A new `Context` struct is created every time a request is received,
 so it can contain different data for each request.
+
+## HTTPS
+
+To serve HTTPS directly from `veb`, pass an `mbedtls.SSLConnectConfig` in `RunParams`:
+
+```v
+module main
+
+import net.mbedtls
+import veb
+
+pub struct Context {
+	veb.Context
+}
+
+pub struct App {}
+
+pub fn (app &App) index(mut ctx Context) veb.Result {
+	return ctx.text('Hello over HTTPS')
+}
+
+fn main() {
+	mut app := &App{}
+	veb.run_at[App, Context](mut app,
+		host:       '0.0.0.0'
+		port:       8443
+		ssl_config: mbedtls.SSLConnectConfig{
+			cert:     'certs/server.crt'
+			cert_key: 'certs/server.key'
+		}
+	) or { panic(err) }
+}
+```
+
+## Graceful shutdown
+
+When running with `-d new_veb`, the underlying server supports graceful
+shutdown. Once shutdown begins, it stops accepting new requests, waits for
+in-flight requests to finish, and only then exits. This is useful for deploys,
+tests, and management endpoints that trigger a stop after sending a response.
+
+You can store the server handle in your app by adding an optional
+`init_server(server &veb.Server)` method:
+
+```v
+module main
+
+import veb
+
+pub struct App {
+pub mut:
+	server &veb.Server = unsafe { nil }
+}
+
+pub fn (mut app App) init_server(server &veb.Server) {
+	app.server = server
+}
+```
+
+`veb.Server` forwards `wait_till_running()` and `shutdown(timeout: ...)`
+to the `new_veb` backend. These lifecycle controls are available only when
+running with `-d new_veb` without SSL.
 
 ## Defining endpoints
 
@@ -434,10 +500,10 @@ over gzip when the client supports both.
 **How it works:**
 
 1. **Manual pre-compression**: If you create `.zst` or `.gz` files manually, veb will serve
-   them in zero-copy streaming mode for maximum performance.
+   them in zero-copy streaming mode for maximum performance when the MIME type is allowed.
 2. **Lazy compression cache**: Files smaller than the threshold are automatically compressed
-   on first request and cached as `.zst` or `.gz` files on disk (zstd preferred when client
-   supports it).
+   on first request and cached under `os.cache_dir()/veb/static_compression/`
+   (zstd preferred when the client supports it). The source directory stays unchanged.
 3. **Cache validation**: If the original file is modified, the compressed cache is
    automatically regenerated on the next request.
 4. **Streaming for large files**: Files larger than the threshold are served uncompressed in
@@ -471,7 +537,9 @@ fn main() {
 	// Enable static file compression (zstd/gzip, disabled by default)
 	// Use enable_static_zstd and enable_static_gzip for specific compression
 	app.enable_static_compression = true
-	app.static_compression_max_size = 524288 // Maximum file size for auto-compression is 512 KB (default: 1MB)
+	// Maximum file size for auto-compression is 512 KB (default: 1MB)
+	app.static_compression_max_size = 524288
+	app.static_compression_mime_types = [veb.mime_types['.css'], veb.mime_types['.js']]
 
 	// Serve files from the 'static' directory
 	app.handle_static('static', true)!
@@ -484,6 +552,10 @@ fn main() {
 	veb.run[App, Context](mut app, 8080)
 }
 ```
+
+Set `app.static_compression_mime_types` when you only want to compress specific static MIME
+types. Leave it empty to keep the current behavior and allow compression for any static file
+type.
 
 **Setup and testing:**
 
@@ -522,8 +594,8 @@ curl -H "Accept-Encoding: zstd, gzip" --compressed http://localhost:8080/app.js
 # Request without encoding - should return uncompressed content
 curl -i http://localhost:8080/app.js
 
-# Verify that compressed cache file was created
-ls -lh static/app.js.zst static/app.js.gz 2>/dev/null
+# Auto-generated cache files are stored under:
+# os.cache_dir()/veb/static_compression/
 
 # Test manual pre-compression - style.css.zst is served directly (zero-copy)
 curl -H "Accept-Encoding: zstd" -i http://localhost:8080/style.css
@@ -540,6 +612,8 @@ serve `.zst` if the client supports zstd, otherwise `.gz` if gzip is supported.
 
 - The lazy cache is created on first request, so the first visitor pays a small
   compression cost, but all subsequent requests are served at zero-copy speed.
+- Auto-generated cache files live in the OS cache directory, so read-only static
+  folders still work and your source tree stays clean.
 - Large files (> threshold) are always streamed, ensuring low memory usage even for large assets.
 - The `encode_auto` middleware automatically chooses zstd or gzip based on client support. You can
   also use `encode_zstd` or `encode_gzip` for specific compression.
@@ -662,6 +736,10 @@ pub mut:
 In veb middleware functions take a `mut` parameter with the type of your context struct
 and must return `bool`. We have full access to modify our Context struct!
 
+Middleware handlers can also be bound methods, such as `app.session_middleware`.
+That lets middleware read or update fields on your app struct and reuse resources that
+live on it.
+
 The return value indicates to veb whether it can continue or has to stop. If we send a
 response to the client in a middleware function veb has to stop, so we return `false`.
 
@@ -713,6 +791,31 @@ fn main() {
 }
 ```
 
+If your middleware needs access to app state or shared resources, register a bound
+method instead of a free function:
+
+```v ignore
+@[heap]
+pub struct App {
+	veb.Middleware[Context]
+mut:
+	request_count int
+}
+
+pub fn (mut app App) session_middleware(mut ctx Context) bool {
+	app.request_count++
+	ctx.res.header.add_custom('X-Request-Count', app.request_count.str()) or { return false }
+	return true
+}
+
+fn main() {
+	mut app := &App{}
+	app.use(handler: app.session_middleware)
+	app.route_use('/admin/:path...', handler: app.session_middleware)
+	veb.run[App, Context](mut app, 8080)
+}
+```
+
 ### Types of middleware
 
 In the previous example we used so called "global" middleware. This type of middleware
@@ -730,7 +833,11 @@ app.route_use('/documents/:id')
 // register middleware with a parameter array. The middleware will be registered
 // for all routes that start with '/user/' e.g. '/user/profile/update'
 app.route_use('/user/:path...')
+// register middleware only for selected HTTP methods on a route
+app.route_use('/admin/auth', handler: auth_middleware, methods: [.get, .delete])
 ```
+
+If `methods` is omitted, route middleware applies to all HTTP methods on that route.
 
 ### Evaluation moment
 

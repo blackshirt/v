@@ -95,7 +95,7 @@ pub fn (a Ip) str() string {
 		return '<Unknown>'
 	}
 
-	saddr := unsafe { cstring_to_vstring(&buf[0]) }
+	saddr := unsafe { cstring_to_vstring(res) }
 	port := conv.ntoh16(a.port)
 	return '${saddr}:${port}'
 }
@@ -110,7 +110,7 @@ pub fn (a Ip6) str() string {
 		return '<Unknown>'
 	}
 
-	saddr := unsafe { cstring_to_vstring(&buf[0]) }
+	saddr := unsafe { cstring_to_vstring(res) }
 	port := conv.ntoh16(a.port)
 	return '[${saddr}]:${port}'
 }
@@ -118,7 +118,7 @@ pub fn (a Ip6) str() string {
 const aoffset = __offsetof(Addr, addr)
 
 // len returns the length in bytes of the address `a`, depending on its family
-pub fn (a Addr) len() u32 {
+pub fn (a &Addr) len() u32 {
 	match a.family() {
 		.ip {
 			return sizeof(Ip) + aoffset
@@ -306,6 +306,7 @@ pub fn peer_addr_from_socket_handle(handle int) !Addr {
 		}
 	}
 	mut size := sizeof(Addr)
-	socket_error_message(C.getpeername(handle, voidptr(&addr), &size), 'peer_addr_from_socket_handle failed')!
+	socket_error_message(C.getpeername(handle, voidptr(&addr), &size),
+		'peer_addr_from_socket_handle failed')!
 	return addr
 }

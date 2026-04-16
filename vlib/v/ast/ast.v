@@ -250,6 +250,7 @@ pub:
 	pos token.Pos
 }
 
+@[minify]
 pub struct StringLiteral {
 pub:
 	val      string
@@ -269,10 +270,12 @@ pub:
 	fmt_poss   []token.Pos
 	pos        token.Pos
 pub mut:
-	exprs      []Expr
-	expr_types []Type
-	fmts       []u8
-	need_fmts  []bool // an explicit non-default fmt required, e.g. `x`
+	exprs           []Expr
+	expr_types      []Type
+	fwidth_exprs    []Expr
+	precision_exprs []Expr
+	fmts            []u8
+	need_fmts       []bool // an explicit non-default fmt required, e.g. `x`
 }
 
 pub struct CharLiteral {
@@ -301,6 +304,7 @@ pub enum GenericKindField {
 }
 
 // `foo.bar`
+@[minify]
 pub struct SelectorExpr {
 pub:
 	pos        token.Pos
@@ -351,6 +355,7 @@ pub:
 	pos token.Pos
 }
 
+@[minify]
 pub struct StructField {
 pub:
 	pos              token.Pos
@@ -413,6 +418,7 @@ pub mut:
 }
 
 // const declaration
+@[minify]
 pub struct ConstDecl {
 pub:
 	is_pub bool
@@ -424,6 +430,7 @@ pub mut:
 	is_block     bool         // const() block
 }
 
+@[minify]
 pub struct StructDecl {
 pub:
 	pos           token.Pos
@@ -467,6 +474,7 @@ pub:
 	comments []Comment
 }
 
+@[minify]
 pub struct InterfaceDecl {
 pub:
 	name          string
@@ -510,6 +518,7 @@ pub mut:
 //    ...a
 //    field1: 'hello'
 // }`
+@[minify]
 pub struct StructInit {
 pub:
 	pos             token.Pos
@@ -522,6 +531,7 @@ pub mut:
 	pre_comments         []Comment
 	typ_str              string // 'Foo'
 	typ                  Type   // the type of this struct
+	generic_typ          Type   // original generic struct type; reused for later concrete instantiations
 	update_expr          Expr   // `a` in `...a`
 	update_expr_type     Type
 	update_expr_pos      token.Pos
@@ -574,6 +584,7 @@ pub mut:
 }
 
 // function or method declaration
+@[minify]
 pub struct FnDecl {
 pub:
 	name                  string // 'math.bits.normalize'
@@ -667,6 +678,7 @@ pub fn (f &FnDecl) new_method_with_receiver_type(new_type_ Type) FnDecl {
 	}
 }
 
+@[minify]
 pub struct FnTrace {
 pub mut:
 	name string
@@ -678,6 +690,7 @@ pub:
 	is_fn_var   bool
 }
 
+@[minify]
 pub struct Fn {
 pub:
 	is_variadic           bool
@@ -729,6 +742,7 @@ fn (f &Fn) method_equals(o &Fn) bool {
 		&& f.name == o.name
 }
 
+@[minify]
 pub struct Param {
 pub:
 	pos        token.Pos
@@ -740,7 +754,8 @@ pub:
 	is_hidden  bool // interface first arg
 	on_newline bool // whether the argument starts on a new line
 pub mut:
-	typ Type
+	typ      Type
+	orig_typ Type // source type before mut lowering
 }
 
 pub fn (p &Param) specifier() string {
@@ -794,6 +809,7 @@ fn (p []Param) equals(o []Param) bool {
 }
 
 // break, continue
+@[minify]
 pub struct BranchStmt {
 pub:
 	kind  token.Kind
@@ -869,6 +885,7 @@ pub enum CallKind {
 }
 
 // function or method call expr
+@[minify]
 pub struct CallExpr {
 pub:
 	pos      token.Pos
@@ -926,6 +943,7 @@ pub struct AutofreeArgVar {
 */
 
 // function call argument: `f(callarg)`
+@[minify]
 pub struct CallArg {
 pub:
 	is_mut   bool
@@ -963,6 +981,7 @@ pub enum ComptimeVarKind {
 	aggregate     // aggregate var
 }
 
+@[minify]
 pub struct Var {
 pub:
 	name            string
@@ -980,6 +999,7 @@ pub mut:
 	is_index_var  bool // index loop var
 	expr          Expr
 	typ           Type
+	generic_typ   Type   // original generic declaration type; reused for later concrete instantiations
 	orig_type     Type   // original sumtype type; 0 if it's not a sumtype
 	smartcasts    []Type // nested sum types require nested smart casting, for that a list of types is needed
 	// TODO: move this to a real docs site later
@@ -1001,10 +1021,12 @@ pub mut:
 
 // used for smartcasting only
 // struct fields change type in scopes
+@[minify]
 pub struct ScopeStructField {
 pub:
 	struct_type Type // type of struct
 	name        string
+	is_mut      bool
 	pos         token.Pos
 	typ         Type
 	orig_type   Type   // original sumtype type; 0 if it's not a sumtype
@@ -1015,6 +1037,7 @@ pub:
 	//        12 <- the current casted type (typ)
 }
 
+@[minify]
 pub struct GlobalField {
 pub:
 	name        string
@@ -1049,6 +1072,7 @@ pub mut:
 	end_comments []Comment
 }
 
+@[minify]
 pub struct EmbeddedFile {
 pub:
 	compression_type string
@@ -1136,6 +1160,7 @@ pub mut:
 
 // TODO: (joe) remove completely, use ident.obj
 // instead which points to the scope object
+@[minify]
 pub struct IdentVar {
 pub mut:
 	typ         Type
@@ -1158,6 +1183,7 @@ pub enum IdentKind {
 }
 
 // A single identifier
+@[minify]
 pub struct Ident {
 pub:
 	language Language
@@ -1202,6 +1228,14 @@ pub fn (i &Ident) is_auto_heap() bool {
 }
 
 @[inline]
+pub fn (i &Ident) is_stack_obj() bool {
+	return match i.obj {
+		Var { i.obj.is_stack_obj }
+		else { false }
+	}
+}
+
+@[inline]
 pub fn (i &Ident) is_mut() bool {
 	match i.obj {
 		Var { return i.obj.is_mut }
@@ -1219,6 +1253,7 @@ pub fn (i &Ident) var_info() IdentVar {
 
 // left op right
 // See: token.Kind.is_infix
+@[minify]
 pub struct InfixExpr {
 pub:
 	op      token.Kind
@@ -1257,6 +1292,7 @@ pub mut:
 }
 
 // See: token.Kind.is_prefix
+@[minify]
 pub struct PrefixExpr {
 pub:
 	op  token.Kind
@@ -1268,6 +1304,7 @@ pub mut:
 	is_option  bool // IfGuard
 }
 
+@[minify]
 pub struct IndexExpr {
 pub:
 	pos token.Pos
@@ -1286,6 +1323,7 @@ pub mut:
 	typ       Type
 }
 
+@[minify]
 pub struct IfExpr {
 pub:
 	is_comptime   bool
@@ -1333,6 +1371,7 @@ pub mut:
 	scope    &Scope = unsafe { nil }
 }
 
+@[minify]
 pub struct MatchExpr {
 pub:
 	is_comptime bool
@@ -1374,6 +1413,7 @@ pub mut:
 	expected_type Type // for debugging only
 }
 
+@[minify]
 pub struct SelectBranch {
 pub:
 	pos           token.Pos
@@ -1421,6 +1461,7 @@ pub mut:
 	scope &Scope = unsafe { nil }
 }
 
+@[minify]
 pub struct ForInStmt {
 pub:
 	key_var    string
@@ -1482,6 +1523,7 @@ pub mut:
 }
 
 // variable assign statement
+@[minify]
 pub struct AssignStmt {
 pub:
 	op           token.Kind // include: =,:=,+=,-=,*=,/= and so on; for a list of all the assign operators, see vlib/token/token.v
@@ -1538,6 +1580,7 @@ pub mut:
 }
 
 // enum declaration
+@[minify]
 pub struct EnumDecl {
 pub:
 	name             string
@@ -1607,6 +1650,7 @@ pub enum DeferMode {
 // TODO: handle this differently
 // v1 excludes non current os ifdefs so
 // the defer's never get added in the first place
+@[minify]
 pub struct DeferStmt {
 pub:
 	pos   token.Pos
@@ -1628,6 +1672,7 @@ pub mut:
 	comments []Comment
 }
 
+@[minify]
 pub struct GoExpr {
 pub:
 	pos token.Pos
@@ -1636,6 +1681,7 @@ pub mut:
 	is_expr   bool
 }
 
+@[minify]
 pub struct SpawnExpr {
 pub:
 	pos token.Pos
@@ -1658,31 +1704,35 @@ pub:
 	pos  token.Pos
 }
 
+@[minify]
 pub struct ArrayInit {
 pub:
-	pos           token.Pos   // `[]` in []Type{} position
-	elem_type_pos token.Pos   // `Type` in []Type{} position
-	ecmnts        [][]Comment // optional iembed comments after each expr
-	pre_cmnts     []Comment
-	is_fixed      bool
-	is_option     bool // true if it was declared as ?[2]Type or ?[]Type
-	has_val       bool // fixed size literal `[expr, expr]!`
-	mod           string
-	has_len       bool
-	has_cap       bool
-	has_init      bool
-	has_index     bool // true if temp variable index is used
+	pos                token.Pos   // `[]` in []Type{} position
+	elem_type_pos      token.Pos   // `Type` in []Type{} position
+	ecmnts             [][]Comment // optional iembed comments after each expr
+	pre_cmnts          []Comment
+	is_fixed           bool
+	is_option          bool // true if it was declared as ?[2]Type or ?[]Type
+	has_val            bool // fixed size literal `[expr, expr]!`
+	from_to_fixed_size bool // lowered from `[expr, expr].to_fixed_size()`
+	mod                string
+	has_len            bool
+	has_cap            bool
+	has_init           bool
+	has_index          bool // true if temp variable index is used
 pub mut:
-	exprs        []Expr // `[expr, expr]` or `[expr]Type{}` for fixed array
-	len_expr     Expr   // len: expr
-	cap_expr     Expr   // cap: expr
-	init_expr    Expr   // init: expr
-	expr_types   []Type // [Dog, Cat] // also used for interface_types
-	elem_type    Type   // element type
-	init_type    Type   // init: value type
-	typ          Type   // array type
-	alias_type   Type   // alias type
-	has_callexpr bool   // has expr which needs tmp var to initialize it
+	exprs             []Expr // `[expr, expr]` or `[expr]Type{}` for fixed array
+	len_expr          Expr   // len: expr
+	cap_expr          Expr   // cap: expr
+	init_expr         Expr   // init: expr
+	expr_types        []Type // [Dog, Cat] // also used for interface_types
+	elem_type         Type   // element type
+	generic_elem_type Type   // original generic element type; reused for later concrete instantiations
+	init_type         Type   // init: value type
+	typ               Type   // array type
+	generic_typ       Type   // original generic array type; reused for later concrete instantiations
+	alias_type        Type   // alias type
+	has_callexpr      bool   // has expr which needs tmp var to initialize it
 }
 
 pub struct ArrayDecompose {
@@ -1705,6 +1755,7 @@ pub mut:
 	elem_type Type
 }
 
+@[minify]
 pub struct MapInit {
 pub:
 	pos       token.Pos
@@ -1724,6 +1775,7 @@ pub mut:
 }
 
 // s[10..20]
+@[minify]
 pub struct RangeExpr {
 pub:
 	has_high bool
@@ -1736,6 +1788,7 @@ pub mut:
 	typ  Type // filled in by checker; the type of `0...1` is `int` for example, while `a`...`z` is `rune` etc
 }
 
+@[minify]
 pub struct CastExpr {
 pub mut:
 	arg       Expr   // `n` in `string(buf, n)`
@@ -1747,6 +1800,7 @@ pub mut:
 	pos       token.Pos
 }
 
+@[minify]
 pub struct AsmStmt {
 pub:
 	arch        pref.Arch
@@ -1764,6 +1818,7 @@ pub mut:
 	local_labels  []string // local to the assembly block
 }
 
+@[minify]
 pub struct AsmTemplate {
 pub mut:
 	name         string
@@ -1951,6 +2006,7 @@ pub:
 }
 
 // `assert a == 0, 'a is zero'`
+@[minify]
 pub struct AssertStmt {
 pub:
 	pos       token.Pos
@@ -2007,6 +2063,7 @@ pub:
 */
 
 // deprecated
+@[minify]
 pub struct Assoc {
 pub:
 	var_name string
@@ -2038,6 +2095,7 @@ pub mut:
 	typ  Type
 }
 
+@[minify]
 pub struct OffsetOf {
 pub:
 	struct_type Type
@@ -2068,6 +2126,7 @@ pub mut:
 	expr Expr
 }
 
+@[minify]
 pub struct TypeOf {
 pub:
 	is_type bool
@@ -2077,6 +2136,7 @@ pub mut:
 	typ  Type
 }
 
+@[minify]
 pub struct DumpExpr {
 pub:
 	pos token.Pos
@@ -2111,6 +2171,7 @@ pub mut:
 	val string
 }
 
+@[minify]
 pub struct ComptimeSelector {
 pub:
 	has_parens bool // if $() is used, for vfmt
@@ -2122,6 +2183,7 @@ pub mut:
 	field_expr Expr
 	typ        Type
 	is_name    bool   // true if f.$(field.name)
+	is_method  bool   // true if f.$(method)
 	typ_key    string // `f.typ` cached key for type resolver
 }
 
@@ -2139,6 +2201,7 @@ pub enum ComptimeCallKind {
 	compile_error
 }
 
+@[minify]
 pub struct ComptimeCall {
 pub:
 	pos         token.Pos
@@ -2270,11 +2333,21 @@ pub mut:
 	on_expr    Expr     // The ON condition (e.g., `User.dept_id == Department.id`)
 }
 
+pub enum SqlAggregateKind {
+	none
+	count
+	sum
+	avg
+	min
+	max
+}
+
 pub struct SqlExpr {
 pub:
-	is_count     bool
-	is_insert    bool // for insert expressions
-	inserted_var string
+	aggregate_kind  SqlAggregateKind
+	aggregate_field string
+	is_insert       bool // for insert expressions
+	inserted_var    string
 
 	has_where    bool
 	has_order    bool
@@ -2287,17 +2360,18 @@ pub:
 	is_generated bool
 	pos          token.Pos
 pub mut:
-	typ         Type
-	db_expr     Expr // `db` in `sql db {`
-	where_expr  Expr
-	order_expr  Expr
-	limit_expr  Expr
-	offset_expr Expr
-	table_expr  TypeNode
-	fields      []StructField
-	sub_structs map[int]SqlExpr
-	or_expr     OrExpr
-	joins       []JoinClause // JOIN clauses for this query
+	typ                  Type
+	db_expr              Expr // `db` in `sql db {`
+	where_expr           Expr
+	order_expr           Expr
+	limit_expr           Expr
+	offset_expr          Expr
+	table_expr           TypeNode
+	fields               []StructField
+	sub_structs          map[int]SqlExpr
+	or_expr              OrExpr
+	joins                []JoinClause // JOIN clauses for this query
+	aggregate_field_type Type
 }
 
 pub struct NodeError {
@@ -2509,10 +2583,59 @@ pub fn (expr Expr) is_auto_deref_var() bool {
 	}
 }
 
-// returns if an expression can be used in `lock x, y.z {`
+pub fn (expr Expr) is_auto_deref_arg() bool {
+	return match expr {
+		Ident {
+			if expr.obj is Var {
+				expr.obj.is_auto_deref && expr.obj.is_arg
+			} else {
+				false
+			}
+		}
+		else {
+			false
+		}
+	}
+}
+
+// returns if an expression can be used as an index in `lock arr[i] {`
+pub fn (e &Expr) is_lockable_index() bool {
+	return match e {
+		BoolLiteral, CharLiteral, EnumVal, FloatLiteral, IntegerLiteral, StringLiteral {
+			true
+		}
+		CastExpr {
+			e.expr.is_lockable_index()
+		}
+		ComptimeSelector {
+			true
+		}
+		Ident {
+			true
+		}
+		InfixExpr {
+			e.left.is_lockable_index() && e.right.is_lockable_index()
+		}
+		ParExpr {
+			e.expr.is_lockable_index()
+		}
+		PrefixExpr {
+			e.right.is_lockable_index()
+		}
+		SelectorExpr {
+			e.expr.is_lockable_index()
+		}
+		else {
+			false
+		}
+	}
+}
+
+// returns if an expression can be used in `lock x, y.z, arr[i] {`
 pub fn (e &Expr) is_lockable() bool {
 	return match e {
 		Ident { true }
+		IndexExpr { e.left.is_lockable() && e.index !is RangeExpr && e.index.is_lockable_index() }
 		SelectorExpr { e.expr.is_lockable() }
 		ComptimeSelector { true }
 		else { false }
@@ -2620,116 +2743,231 @@ pub fn (node Node) children() []Node {
 	mut children := []Node{}
 	if node is Expr {
 		match node {
-			StringInterLiteral, Assoc, ArrayInit {
-				return node.exprs.map(Node(it))
+			Assoc {
+				assoc := node
+				return assoc.exprs.map(Node(it))
 			}
-			SelectorExpr, PostfixExpr, UnsafeExpr, AsCast, ParExpr, IfGuardExpr, SizeOf, Likely,
-			TypeOf, ArrayDecompose {
-				children << node.expr
+			ArrayInit {
+				array_init := node
+				return array_init.exprs.map(Node(it))
+			}
+			StringInterLiteral {
+				string_inter_literal := node
+				children << string_inter_literal.exprs.map(Node(it))
+				for expr in string_inter_literal.fwidth_exprs {
+					if expr !is EmptyExpr {
+						children << expr
+					}
+				}
+				for expr in string_inter_literal.precision_exprs {
+					if expr !is EmptyExpr {
+						children << expr
+					}
+				}
+				return children
+			}
+			SelectorExpr {
+				selector_expr := node
+				children << selector_expr.expr
+			}
+			PostfixExpr {
+				postfix_expr := node
+				children << postfix_expr.expr
+			}
+			UnsafeExpr {
+				unsafe_expr := node
+				children << unsafe_expr.expr
+			}
+			AsCast {
+				as_cast := node
+				children << as_cast.expr
+			}
+			ParExpr {
+				par_expr := node
+				children << par_expr.expr
+			}
+			IfGuardExpr {
+				if_guard_expr := node
+				children << if_guard_expr.expr
+			}
+			SizeOf {
+				size_of := node
+				children << size_of.expr
+			}
+			Likely {
+				likely_expr := node
+				children << likely_expr.expr
+			}
+			TypeOf {
+				type_of := node
+				children << type_of.expr
+			}
+			ArrayDecompose {
+				array_decompose := node
+				children << array_decompose.expr
 			}
 			LambdaExpr {
-				for p in node.params {
+				lambda_expr := node
+				for p in lambda_expr.params {
 					children << Node(Expr(p))
 				}
-				children << node.expr
+				children << lambda_expr.expr
 			}
-			LockExpr, OrExpr {
-				return node.stmts.map(Node(it))
+			LockExpr {
+				lock_expr := node
+				return lock_expr.stmts.map(Node(it))
+			}
+			OrExpr {
+				or_expr := node
+				return or_expr.stmts.map(Node(it))
 			}
 			StructInit {
-				return node.init_fields.map(Node(it))
+				struct_init := node
+				return struct_init.init_fields.map(Node(it))
 			}
 			AnonFn {
-				children << Stmt(node.decl)
+				anon_fn := node
+				children << Stmt(anon_fn.decl)
 			}
 			CallExpr {
-				children << node.left
-				children << node.args.map(Node(it))
-				children << Expr(node.or_block)
+				call_expr := node
+				children << call_expr.left
+				children << call_expr.args.map(Node(it))
+				children << Expr(call_expr.or_block)
 			}
 			InfixExpr {
-				children << node.left
-				children << node.right
+				infix_expr := node
+				children << infix_expr.left
+				children << infix_expr.right
 			}
 			PrefixExpr {
-				children << node.right
+				prefix_expr := node
+				children << prefix_expr.right
 			}
 			IndexExpr {
-				children << node.left
-				children << node.index
+				index_expr := node
+				children << index_expr.left
+				children << index_expr.index
 			}
 			IfExpr {
-				children << node.left
-				children << node.branches.map(Node(it))
+				if_expr := node
+				children << if_expr.left
+				children << if_expr.branches.map(Node(it))
 			}
 			MatchExpr {
-				children << node.cond
-				children << node.branches.map(Node(it))
+				match_expr := node
+				children << match_expr.cond
+				children << match_expr.branches.map(Node(it))
 			}
 			SelectExpr {
-				return node.branches.map(Node(it))
+				select_expr := node
+				return select_expr.branches.map(Node(it))
 			}
 			ChanInit {
-				children << node.cap_expr
+				chan_init := node
+				children << chan_init.cap_expr
 			}
 			MapInit {
-				children << node.keys.map(Node(it))
-				children << node.vals.map(Node(it))
+				map_init := node
+				children << map_init.keys.map(Node(it))
+				children << map_init.vals.map(Node(it))
 			}
 			RangeExpr {
-				children << node.low
-				children << node.high
+				range_expr := node
+				children << range_expr.low
+				children << range_expr.high
 			}
 			CastExpr {
-				children << node.expr
-				children << node.arg
+				cast_expr := node
+				children << cast_expr.expr
+				children << cast_expr.arg
 			}
 			ConcatExpr {
-				return node.vals.map(Node(it))
+				concat_expr := node
+				return concat_expr.vals.map(Node(it))
 			}
-			ComptimeCall, ComptimeSelector {
-				children << node.left
+			ComptimeCall {
+				comptime_call := node
+				children << comptime_call.left
+			}
+			ComptimeSelector {
+				comptime_selector := node
+				children << comptime_selector.left
 			}
 			else {}
 		}
 	} else if node is Stmt {
 		match node {
-			Block, DeferStmt, ForCStmt, ForInStmt, ForStmt, ComptimeFor {
-				return node.stmts.map(Node(it))
+			Block {
+				block := node
+				return block.stmts.map(Node(it))
 			}
-			ExprStmt, AssertStmt {
-				children << node.expr
+			DeferStmt {
+				defer_stmt := node
+				return defer_stmt.stmts.map(Node(it))
+			}
+			ForCStmt {
+				for_c_stmt := node
+				return for_c_stmt.stmts.map(Node(it))
+			}
+			ForInStmt {
+				for_in_stmt := node
+				return for_in_stmt.stmts.map(Node(it))
+			}
+			ForStmt {
+				for_stmt := node
+				return for_stmt.stmts.map(Node(it))
+			}
+			ComptimeFor {
+				comptime_for := node
+				return comptime_for.stmts.map(Node(it))
+			}
+			ExprStmt {
+				expr_stmt := node
+				children << expr_stmt.expr
+			}
+			AssertStmt {
+				assert_stmt := node
+				children << assert_stmt.expr
 			}
 			InterfaceDecl {
-				children << node.methods.map(Node(Stmt(it)))
-				children << node.fields.map(Node(it))
+				interface_decl := node
+				children << interface_decl.methods.map(Node(Stmt(it)))
+				children << interface_decl.fields.map(Node(it))
 			}
 			AssignStmt {
-				children << node.left.map(Node(it))
-				children << node.right.map(Node(it))
+				assign_stmt := node
+				children << assign_stmt.left.map(Node(it))
+				children << assign_stmt.right.map(Node(it))
 			}
 			Return {
-				return node.exprs.map(Node(it))
+				return_stmt := node
+				return return_stmt.exprs.map(Node(it))
 			}
 			// Note: these four decl nodes cannot be merged as one branch
 			StructDecl {
-				return node.fields.map(Node(it))
+				struct_decl := node
+				return struct_decl.fields.map(Node(it))
 			}
 			GlobalDecl {
-				return node.fields.map(Node(it))
+				global_decl := node
+				return global_decl.fields.map(Node(it))
 			}
 			ConstDecl {
-				return node.fields.map(Node(it))
+				const_decl := node
+				return const_decl.fields.map(Node(it))
 			}
 			EnumDecl {
-				return node.fields.map(Node(it))
+				enum_decl := node
+				return enum_decl.fields.map(Node(it))
 			}
 			FnDecl {
-				if node.is_method {
-					children << Node(node.receiver)
+				fn_decl := node
+				if fn_decl.is_method {
+					children << Node(fn_decl.receiver)
 				}
-				children << node.params.map(Node(it))
-				children << node.stmts.map(Node(it))
+				children << fn_decl.params.map(Node(it))
+				children << fn_decl.stmts.map(Node(it))
 			}
 			TypeDecl {
 				if node is SumTypeDecl {
@@ -2740,24 +2978,59 @@ pub fn (node Node) children() []Node {
 		}
 	} else if node is ScopeObject {
 		match node {
-			GlobalField, ConstField, Var { children << node.expr }
+			GlobalField {
+				global_field := node
+				children << global_field.expr
+			}
+			ConstField {
+				const_field := node
+				children << const_field.expr
+			}
+			Var {
+				var_ := node
+				children << var_.expr
+			}
 			AsmRegister, EmptyScopeObject {}
 		}
 	} else {
 		match node {
-			GlobalField, ConstField, EnumField, StructInitField, CallArg {
-				children << node.expr
+			GlobalField {
+				global_field := node
+				children << global_field.expr
+			}
+			ConstField {
+				const_field := node
+				children << const_field.expr
+			}
+			EnumField {
+				enum_field := node
+				children << enum_field.expr
+			}
+			StructInitField {
+				struct_init_field := node
+				children << struct_init_field.expr
+			}
+			CallArg {
+				call_arg := node
+				children << call_arg.expr
 			}
 			SelectBranch {
-				children << node.stmt
-				children << node.stmts.map(Node(it))
+				select_branch := node
+				children << select_branch.stmt
+				children << select_branch.stmts.map(Node(it))
 			}
-			IfBranch, File {
-				return node.stmts.map(Node(it))
+			IfBranch {
+				if_branch := node
+				return if_branch.stmts.map(Node(it))
+			}
+			File {
+				file := node
+				return file.stmts.map(Node(it))
 			}
 			MatchBranch {
-				children << node.stmts.map(Node(it))
-				children << node.exprs.map(Node(it))
+				match_branch := node
+				children << match_branch.stmts.map(Node(it))
+				children << match_branch.exprs.map(Node(it))
 			}
 			else {}
 		}
@@ -2816,43 +3089,43 @@ pub fn all_registers(mut t Table, arch pref.Arch) map[string]ScopeObject {
 			}
 		}
 		.arm32 {
-			arm32 := gen_all_registers(mut t, arm_no_number_register_list, arm_with_number_register_list,
-				32)
+			arm32 := gen_all_registers(mut t, arm_no_number_register_list,
+				arm_with_number_register_list, 32)
 			for k, v in arm32 {
 				res[k] = v
 			}
 		}
 		.arm64 {
-			arm64 := gen_all_registers(mut t, arm_no_number_register_list, arm_with_number_register_list,
-				64)
+			arm64 := gen_all_registers(mut t, arm_no_number_register_list,
+				arm_with_number_register_list, 64)
 			for k, v in arm64 {
 				res[k] = v
 			}
 		}
 		.rv32 {
-			rv32 := gen_all_registers(mut t, riscv_no_number_register_list, riscv_with_number_register_list,
-				32)
+			rv32 := gen_all_registers(mut t, riscv_no_number_register_list,
+				riscv_with_number_register_list, 32)
 			for k, v in rv32 {
 				res[k] = v
 			}
 		}
 		.rv64 {
-			rv64 := gen_all_registers(mut t, riscv_no_number_register_list, riscv_with_number_register_list,
-				64)
+			rv64 := gen_all_registers(mut t, riscv_no_number_register_list,
+				riscv_with_number_register_list, 64)
 			for k, v in rv64 {
 				res[k] = v
 			}
 		}
 		.s390x {
-			s390x := gen_all_registers(mut t, s390x_no_number_register_list, s390x_with_number_register_list,
-				64)
+			s390x := gen_all_registers(mut t, s390x_no_number_register_list,
+				s390x_with_number_register_list, 64)
 			for k, v in s390x {
 				res[k] = v
 			}
 		}
 		.ppc64le {
-			ppc64le := gen_all_registers(mut t, ppc64le_no_number_register_list, ppc64le_with_number_register_list,
-				64)
+			ppc64le := gen_all_registers(mut t, ppc64le_no_number_register_list,
+				ppc64le_with_number_register_list, 64)
 			for k, v in ppc64le {
 				res[k] = v
 			}

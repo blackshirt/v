@@ -46,7 +46,7 @@ fn main() {
 		Flag{
 			flag:        .bool
 			name:        'web'
-			description: 'Use the template for a vweb project.'
+			description: 'Use the template for a veb project.'
 		},
 	]
 	mut cmd := Command{
@@ -303,7 +303,7 @@ bin/
 # ENV
 .env
 
-# vweb and database
+# Web assets and local databases
 *.db
 *.js
 

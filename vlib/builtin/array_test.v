@@ -78,6 +78,16 @@ fn test_slice_delete() {
 	assert c == [3.75, 4.25, -1.5]
 }
 
+fn test_delete_last_uses_in_place_fast_path() {
+	mut a := [1, 2, 3, 4]
+	b := unsafe { a[..a.len] }
+	old_data := a.data
+	a.delete(a.len - 1)
+	assert a == [1, 2, 3]
+	assert b == [1, 2, 3, 4]
+	assert a.data == old_data
+}
+
 fn test_delete_many() {
 	mut a := [1, 2, 3, 4, 5, 6, 7, 8, 9]
 	b := unsafe { a[2..6] }
@@ -351,6 +361,14 @@ fn test_push_many() {
 	assert a[0] == 1
 	assert a[3] == 4
 	assert a[5] == 6
+}
+
+fn test_push_many_self_append_with_growth() {
+	mut a := [u8(`a`), `b`, `c`]
+	a << a
+	assert a.bytestr() == 'abcabc'
+	a << a
+	assert a.bytestr() == 'abcabcabcabc'
 }
 
 fn test_reverse() {
@@ -1767,4 +1785,24 @@ fn test_sorted_with_compare() {
 	})
 	assert aa == ['hi', '1', '5', '3'], 'aa should stay unmodified'
 	assert bb == ['1', '3', '5', 'hi'], 'bb should be sorted, according to the custom comparison callback fn'
+}
+
+fn cmp_2d_int_arrays_by_first_item(a &[]int, b &[]int) int {
+	if a[0] < b[0] {
+		return -1
+	}
+	if a[0] > b[0] {
+		return 1
+	}
+	return 0
+}
+
+fn test_sorted_with_compare_2d_array() {
+	aa := [[2], [1]]
+	bb := aa.sorted_with_compare(cmp_2d_int_arrays_by_first_item)
+	assert aa == [[2], [1]]
+	assert bb == [[1], [2]]
+	mut cc := aa.clone()
+	cc.sort_with_compare(cmp_2d_int_arrays_by_first_item)
+	assert cc == [[1], [2]]
 }

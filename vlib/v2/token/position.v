@@ -14,6 +14,11 @@ pub:
 	id     int
 }
 
+// str returns a readable summary of the position key fields.
+pub fn (p Pos) str() string {
+	return '{ offset: ${p.offset}, id: ${p.id} }'
+}
+
 pub fn (p Pos) is_valid() bool {
 	return p.id > 0
 }
@@ -170,12 +175,18 @@ pub fn (mut f File) pos(offset int) Pos {
 	if offset > f.size {
 		panic('invalid offset')
 	}
+	mut current_id := 0
+	mut next_id := 0
 	unsafe {
-		*f.id_counter = *f.id_counter + 1
+		current_id = *f.id_counter
+	}
+	next_id = current_id + 1
+	unsafe {
+		*f.id_counter = next_id
 	}
 	return Pos{
 		offset: f.base + offset
-		id:     unsafe { *f.id_counter }
+		id:     next_id
 	}
 }
 

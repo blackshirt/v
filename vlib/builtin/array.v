@@ -28,14 +28,24 @@ pub enum ArrayFlags {
 	nofree   // `.data` will never be freed
 }
 
+@[inline]
+fn v_ni_index(i int, len int) int {
+	return if i < 0 { len + i } else { i }
+}
+
 // Internal function, used by V (`nums := []int`)
 fn __new_array(mylen int, cap int, elm_size int) array {
 	panic_on_negative_len(mylen)
 	panic_on_negative_cap(cap)
 	cap_ := if cap < mylen { mylen } else { cap }
+	total_size := u64(cap_) * u64(elm_size)
 	arr := array{
 		element_size: elm_size
-		data:         vcalloc(u64(cap_) * u64(elm_size))
+		data:         if cap_ > 0 && mylen == 0 {
+			unsafe { malloc_uninit(__at_least_one(total_size)) }
+		} else {
+			vcalloc(total_size)
+		}
 		len:          mylen
 		cap:          cap_
 	}
@@ -161,7 +171,10 @@ fn __new_array_with_map_default(mylen int, cap int, elm_size int, val map) array
 fn new_array_from_c_array(len int, cap int, elm_size int, c_array voidptr) array {
 	panic_on_negative_len(len)
 	panic_on_negative_cap(cap)
-	cap_ := if cap < len { len } else { cap }
+	mut cap_ := cap
+	if cap < len {
+		cap_ = len
+	}
 	arr := array{
 		element_size: elm_size
 		data:         vcalloc(u64(cap_) * u64(elm_size))
@@ -206,12 +219,11 @@ pub fn (mut a array) ensure_cap(required int) {
 			// limit the capacity, since bigger values, will overflow the 32bit integer used to store it
 			cap = max_int
 		} else {
-			panic_n('array.ensure_cap: array needs to grow to cap (which is > 2^31):',
-				cap)
+			panic_n('array.ensure_cap: array needs to grow to cap (which is > 2^31):', cap)
 		}
 	}
 	new_size := u64(cap) * u64(a.element_size)
-	new_data := unsafe { malloc(__at_least_one(new_size)) }
+	new_data := unsafe { malloc_uninit(__at_least_one(new_size)) }
 	if a.data != unsafe { nil } {
 		unsafe { vmemcpy(new_data, a.data, u64(a.len) * u64(a.element_size)) }
 		// TODO: the old data may be leaked when no GC is used (ref-counting?)
@@ -263,9 +275,9 @@ pub fn (a array) repeat_to_depth(count int, depth int) array {
 				for _ in 0 .. count {
 					if depth > 0 {
 						ary_clone := a.clone_to_depth(depth)
-						vmemcpy(eptr, &u8(ary_clone.data), a_total_size)
+						vmemcpy(eptr, ary_clone.data, a_total_size)
 					} else {
-						vmemcpy(eptr, &u8(a.data), a_total_size)
+						vmemcpy(eptr, a.data, a_total_size)
 					}
 					eptr += arr_step_size
 				}
@@ -346,10 +358,11 @@ fn (mut a array) prepend_many(val voidptr, size int) {
 }
 
 // delete deletes array element at index `i`.
-// This is exactly the same as calling `.delete_many(i, 1)`.
-// NOTE: This function does NOT operate in-place. Internally, it
-// creates a copy of the array, skipping over the element at `i`,
-// and then points the original variable to the new memory location.
+// Deleting the last element uses the same in-place fast path as `.delete_last()`.
+// NOTE: When deleting the last element, this operates in-place.
+// Other positions create a copy of the array, skipping over the
+// element at `i`, and then point the original variable to the new
+// memory location.
 //
 // Example:
 // ```v
@@ -357,6 +370,13 @@ fn (mut a array) prepend_many(val voidptr, size int) {
 // a.delete(1) // a is now ['0', '2', '3', '4', '5']
 // ```
 pub fn (mut a array) delete(i int) {
+	if i < 0 || i >= a.len {
+		panic_n2('array.delete: index out of range (i,a.len):', i, a.len)
+	}
+	if i == a.len - 1 {
+		a.len--
+		return
+	}
 	a.delete_many(i, 1)
 }
 
@@ -377,8 +397,7 @@ pub fn (mut a array) delete(i int) {
 pub fn (mut a array) delete_many(i int, size int) {
 	if i < 0 || i64(i) + i64(size) > i64(a.len) {
 		if size > 1 {
-			panic_n3('array.delete: index out of range (i,i+size,a.len):', i, i + size,
-				a.len)
+			panic_n3('array.delete: index out of range (i,i+size,a.len):', i, i + size, a.len)
 		} else {
 			panic_n2('array.delete: index out of range (i,a.len):', i, a.len)
 		}
@@ -479,6 +498,11 @@ fn (a array) get(i int) voidptr {
 	}
 }
 
+@[markused]
+fn (a array) get_ni(i int) voidptr {
+	return a.get(v_ni_index(i, a.len))
+}
+
 // Private function. Used to implement x = a[i] or { ... }
 fn (a array) get_with_check(i int) voidptr {
 	if i < 0 || i >= a.len {
@@ -487,6 +511,11 @@ fn (a array) get_with_check(i int) voidptr {
 	unsafe {
 		return &u8(a.data) + u64(i) * u64(a.element_size)
 	}
+}
+
+@[markused]
+fn (a array) get_with_check_ni(i int) voidptr {
+	return a.get_with_check(v_ni_index(i, a.len))
 }
 
 // first returns the first element of the `array`.
@@ -611,7 +640,8 @@ fn (a array) slice(start int, _end int) array {
 	end := if _end == max_i64 || _end == max_i32 { a.len } else { _end } // max_int
 	$if !no_bounds_checking {
 		if start > end {
-			panic('array.slice: invalid slice index (start>end):' + impl_i64_to_string(i64(start)) +
+			panic(
+				'array.slice: invalid slice index (start>end):' + impl_i64_to_string(i64(start)) +
 				', ' + impl_i64_to_string(end))
 		}
 		if end > a.len {
@@ -733,7 +763,7 @@ pub fn (a &array) clone_to_depth(depth int) array {
 		return arr
 	} else {
 		if a.data != 0 && source_capacity_in_bytes > 0 {
-			unsafe { vmemcpy(&u8(arr.data), a.data, source_capacity_in_bytes) }
+			unsafe { vmemcpy(arr.data, a.data, source_capacity_in_bytes) }
 		}
 		return arr
 	}
@@ -753,6 +783,11 @@ fn (mut a array) set(i int, val voidptr) {
 		}
 	}
 	unsafe { vmemcpy(&u8(a.data) + u64(a.element_size) * u64(i), val, a.element_size) }
+}
+
+@[markused]
+fn (mut a array) set_ni(i int, val voidptr) {
+	a.set(v_ni_index(i, a.len), val)
 }
 
 fn (mut a array) push(val voidptr) {
@@ -781,18 +816,23 @@ pub fn (mut a array) push_many(val voidptr, size int) {
 		// string interpolation also uses <<; avoid it, use a fixed string for the panic
 		panic('array.push_many: new len exceeds max_int')
 	}
+	is_self_append := a.data == val && a.data != 0
 	if new_len >= a.cap {
 		a.ensure_cap(int(new_len))
 	}
-	if a.data == val && a.data != 0 {
+	if is_self_append {
 		// handle `arr << arr`
 		copy := a.clone()
 		unsafe {
-			vmemcpy(&u8(a.data) + u64(a.element_size) * u64(a.len), copy.data, u64(a.element_size) * u64(size))
+			vmemcpy(&u8(a.data) + u64(a.element_size) * u64(a.len), copy.data,
+				u64(a.element_size) * u64(size))
 		}
 	} else {
 		if a.data != 0 && val != 0 {
-			unsafe { vmemcpy(&u8(a.data) + u64(a.element_size) * u64(a.len), val, u64(a.element_size) * u64(size)) }
+			unsafe {
+				vmemcpy(&u8(a.data) + u64(a.element_size) * u64(a.len), val,
+					u64(a.element_size) * u64(size))
+			}
 		}
 	}
 	a.len = int(new_len)
@@ -807,8 +847,8 @@ pub fn (mut a array) reverse_in_place() {
 		mut tmp_value := malloc(a.element_size)
 		for i in 0 .. a.len / 2 {
 			vmemcpy(tmp_value, &u8(a.data) + u64(i) * u64(a.element_size), a.element_size)
-			vmemcpy(&u8(a.data) + u64(i) * u64(a.element_size), &u8(a.data) +
-				u64(a.len - 1 - i) * u64(a.element_size), a.element_size)
+			vmemcpy(&u8(a.data) + u64(i) * u64(a.element_size), &u8(a.data) + u64(a.len - 1 -
+				i) * u64(a.element_size), a.element_size)
 			vmemcpy(&u8(a.data) + u64(a.len - 1 - i) * u64(a.element_size), tmp_value,
 				a.element_size)
 		}
@@ -964,7 +1004,7 @@ pub fn (a &array) sorted(callback fn (voidptr, voidptr) int) array
 // })
 // assert a == ['1', '3', '5', 'hi']
 // ```
-pub fn (mut a array) sort_with_compare(callback fn (voidptr, voidptr) int) {
+pub fn (mut a array) sort_with_compare(callback FnSortCB) {
 	$if freestanding {
 		panic('sort_with_compare does not work with -freestanding')
 	} $else {
@@ -975,15 +1015,10 @@ pub fn (mut a array) sort_with_compare(callback fn (voidptr, voidptr) int) {
 // sorted_with_compare sorts a clone of the array. The original array is not modified.
 // It uses the results of the given function to determine sort order.
 // See also .sort_with_compare()
-pub fn (a &array) sorted_with_compare(callback fn (voidptr, voidptr) int) array {
-	$if freestanding {
-		panic('sorted_with_compare does not work with -freestanding')
-	} $else {
-		mut r := a.clone()
-		unsafe { vqsort(r.data, usize(r.len), usize(r.element_size), callback) }
-		return r
-	}
-	return array{}
+pub fn (a &array) sorted_with_compare(callback FnSortCB) array {
+	mut r := a.clone()
+	unsafe { vqsort(r.data, usize(r.len), usize(r.element_size), callback) }
+	return r
 }
 
 // contains determines whether an array includes a certain value among its elements.
@@ -1046,7 +1081,7 @@ pub fn (b []u8) hex() string {
 	if b.len == 0 {
 		return ''
 	}
-	return unsafe { data_to_hex_string(&u8(b.data), b.len) }
+	return unsafe { data_to_hex_string(b.data, b.len) }
 }
 
 // copy copies the `src` byte array elements to the `dst` byte array.
@@ -1057,7 +1092,7 @@ pub fn (b []u8) hex() string {
 pub fn copy(mut dst []u8, src []u8) int {
 	min := if dst.len < src.len { dst.len } else { src.len }
 	if min > 0 {
-		unsafe { vmemmove(&u8(dst.data), src.data, min) }
+		unsafe { vmemmove(dst.data, src.data, min) }
 	}
 	return min
 }

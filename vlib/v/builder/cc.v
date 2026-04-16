@@ -4,6 +4,7 @@
 module builder
 
 import os
+import v.ast
 import v.cflag
 import v.pref
 import v.util
@@ -18,6 +19,165 @@ const c_verror_message_marker = 'VERROR_MESSAGE '
 const current_os = os.user_os()
 
 const c_compilation_error_title = 'C compilation error'
+const missing_libatomic_markers = [
+	"library 'atomic' not found",
+	'cannot find -latomic',
+	'unable to find library -latomic',
+	'library not found for -latomic',
+	'cannot find libatomic',
+]!
+
+fn extract_c_struct_name(line string) string {
+	start := line.index('struct ') or { return '' } + 'struct '.len
+	mut end := start
+	for end < line.len {
+		ch := line[end]
+		if !ch.is_letter() && !ch.is_digit() && ch != `_` {
+			break
+		}
+		end++
+	}
+	return if end > start { line[start..end] } else { '' }
+}
+
+fn extract_quoted_identifier(line string) string {
+	for quote in [u8(`'`), u8(96)] {
+		start := line.index_u8(quote)
+		if start == -1 {
+			continue
+		}
+		end := line[start + 1..].index_u8(quote)
+		if end == -1 {
+			continue
+		}
+		return line[start + 1..start + 1 + end]
+	}
+	return ''
+}
+
+fn c_output_suggests_missing_typedef_for_c_struct(c_output string, known_non_typedef_c_structs map[string]bool) string {
+	if known_non_typedef_c_structs.len == 0 {
+		return ''
+	}
+	mut forward_declared := map[string]bool{}
+	mut incomplete := map[string]bool{}
+	for line in c_output.split_into_lines() {
+		name := extract_c_struct_name(line)
+		if name == '' || name !in known_non_typedef_c_structs {
+			continue
+		}
+		lower_line := line.to_lower()
+		if lower_line.contains('forward declaration of') {
+			if name in incomplete {
+				return name
+			}
+			forward_declared[name] = true
+			continue
+		}
+		if lower_line.contains('incomplete result type')
+			|| lower_line.contains('has incomplete type') || lower_line.contains('incomplete type')
+			|| lower_line.contains('return type is an incomplete type') {
+			if name in forward_declared {
+				return name
+			}
+			incomplete[name] = true
+		}
+	}
+	return ''
+}
+
+fn c_output_suggests_missing_sokol_shader_symbol(c_output string) string {
+	for line in c_output.split_into_lines() {
+		lower_line := line.to_lower()
+		if !lower_line.contains('undeclared identifier')
+			&& !lower_line.contains('undeclared (first use in this function)') {
+			continue
+		}
+		name := extract_quoted_identifier(line)
+		if name.starts_with('ATTR_') || name.starts_with('SLOT_') {
+			return name
+		}
+	}
+	return ''
+}
+
+fn (v &Builder) known_non_typedef_c_structs() map[string]bool {
+	mut names := map[string]bool{}
+	for sym in v.table.type_symbols {
+		if sym.language != .c || sym.kind != .struct || !sym.cname.starts_with('C__') {
+			continue
+		}
+		info := sym.info as ast.Struct
+		if info.is_typedef {
+			continue
+		}
+		names[sym.cname[3..]] = true
+	}
+	return names
+}
+
+fn c_error_looks_like_cpp_header(c_output string) bool {
+	lower_output := c_output.to_lower()
+	for marker in [
+		"unknown type name 'namespace'",
+		'unknown type name `namespace`',
+		'error: namespace',
+		'namespace does not name a type',
+	] {
+		if lower_output.contains(marker) {
+			return true
+		}
+	}
+	for line in lower_output.split_into_lines() {
+		trimmed_line := line.trim_space()
+		if trimmed_line.starts_with('namespace ') || trimmed_line.contains('| namespace ') {
+			return true
+		}
+	}
+	return false
+}
+
+fn (v &Builder) ensure_imported_coroutines_runtime() ! {
+	if 'coroutines' !in v.table.imports {
+		return
+	}
+	pref.ensure_coroutines_runtime()!
+}
+
+fn c_error_missing_libatomic_marker(c_output string) string {
+	for line in c_output.split_into_lines() {
+		lower_line := line.to_lower()
+		for marker in missing_libatomic_markers {
+			if start := lower_line.index(marker) {
+				return line[start..start + marker.len]
+			}
+		}
+	}
+	return ''
+}
+
+fn c_error_looks_like_missing_libatomic(c_output string) bool {
+	return c_error_missing_libatomic_marker(c_output) != ''
+}
+
+fn c_error_missing_library_name(c_output string) string {
+	for line in c_output.split_into_lines() {
+		if line.contains("library '") && line.contains("' not found") {
+			return line.all_after("library '").all_before("' not found")
+		}
+		for marker in [
+			'cannot find -l',
+			'unable to find library -l',
+			'library not found for -l',
+		] {
+			if line.contains(marker) {
+				lib_name := line.all_after(marker).trim_space()
+				return lib_name.all_before('`').all_before("'").all_before('"').all_before(' ')
+			}
+		}
+	}
+	return ''
+}
 
 fn (mut v Builder) show_c_compiler_output(ccompiler string, res os.Result) {
 	header := '======== Output of the C Compiler (${ccompiler}) ========'
@@ -46,9 +206,16 @@ fn (mut v Builder) post_process_c_compiler_output(ccompiler string, res os.Resul
 		}
 		return
 	}
+	libatomic_marker := c_error_missing_libatomic_marker(res.output)
+	missing_library_name := if libatomic_marker == '' {
+		c_error_missing_library_name(res.output)
+	} else {
+		''
+	}
 	for emsg_marker in [c_verror_message_marker, 'error: include file '] {
 		if res.output.contains(emsg_marker) {
-			emessage := res.output.all_after(emsg_marker).all_before('\n').all_before('\r').trim_right('\r\n')
+			emessage :=
+				res.output.all_after(emsg_marker).all_before('\n').all_before('\r').trim_right('\r\n')
 			verror(emessage)
 		}
 	}
@@ -64,7 +231,14 @@ fn (mut v Builder) post_process_c_compiler_output(ccompiler string, res os.Resul
 			original_elines := trimmed_output.split_into_lines()
 			mlines := 12
 			cut_off_limit := if original_elines.len > mlines + 3 { mlines } else { mlines + 3 }
-			elines := error_context_lines(trimmed_output, 'error:', 1, cut_off_limit)
+			mut error_keyword := 'error:'
+			mut error_context_before := 1
+			if libatomic_marker != '' && trimmed_output.contains(libatomic_marker) {
+				error_keyword = libatomic_marker
+				error_context_before = 0
+			}
+			elines := error_context_lines(trimmed_output, error_keyword, error_context_before,
+				cut_off_limit)
 			header := '================== ${c_compilation_error_title} (from ${ccompiler}): =============='
 			println(header)
 			for eline in elines {
@@ -96,10 +270,41 @@ fn (mut v Builder) post_process_c_compiler_output(ccompiler string, res os.Resul
 		|| res.output.contains('.o: file not recognized') {
 		more_suggestions += '\n${highlight_word('Suggestion')}: try `v wipe-cache`, then repeat your compilation.'
 	}
+	missing_typedef_name := c_output_suggests_missing_typedef_for_c_struct(res.output,
+		v.known_non_typedef_c_structs())
+	if missing_typedef_name != '' {
+		more_suggestions += '\n${highlight_word('Suggestion')}: if `${missing_typedef_name}` is declared in the C header with `typedef struct ... ${missing_typedef_name};`, add `@[typedef]` to the V redeclaration: `@[typedef] struct C.${missing_typedef_name} { ... }`.'
+	}
+	missing_shader_symbol := c_output_suggests_missing_sokol_shader_symbol(res.output)
+	if missing_shader_symbol != '' {
+		more_suggestions += '\n${highlight_word('Suggestion')}: `${missing_shader_symbol}` looks like a sokol shader symbol generated by `v shader`/`sokol-shdc`. If you renamed `C.${missing_shader_symbol}` in V, make the same change in the matching `.glsl` file and regenerate the header with `v shader .`.'
+	}
+	if c_error_looks_like_cpp_header(res.output) {
+		verror('
+==================
+C error found while compiling generated C code.
+It looks like a C++ header was included with `#include` (for example one that contains `namespace`).
+Use a C-compatible header (for HDF5 use `hdf5.h` instead of `H5File.h`), or compile/link the C++ code separately.${more_suggestions}')
+	}
+	if libatomic_marker != '' {
+		verror('
+==================
+C error found while compiling generated C code.
+The C toolchain could not find `libatomic`, which V needs for `sync.stdatomic` with this compiler on this platform.
+Install the system package that provides `libatomic` and retry.
+On CentOS/RHEL, that is usually `libatomic` or `libatomic-devel`.${more_suggestions}')
+	}
+	if missing_library_name != '' {
+		verror('
+==================
+C library `${missing_library_name}` was not found while linking the generated program.
+Please install the corresponding development package/libraries and make sure the linker can find it.${more_suggestions}')
+	}
 	verror('
 ==================
-C error found. It should never happen, when compiling pure V code.
-This is a V compiler bug, please report it using `v bug file.v`,
+C error found while compiling generated C code.
+This can be caused by invalid C interop code, C compiler flags, or a V compiler bug.
+If your code is pure V and this still happens, please report it using `v bug file.v`,
 or goto https://github.com/vlang/v/issues/new/choose .
 You can also use #help on Discord: https://discord.gg/vlang .${more_suggestions}')
 }
@@ -170,16 +375,9 @@ fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 		'-Wno-enum-conversion', // silences `.dst_factor_rgb = sokol__gfx__BlendFactor__one_minus_src_alpha`
 		'-Wno-enum-compare', // silences `if (ev->mouse_button == sokol__sapp__MouseButton__left) {`
 		// enable additional warnings:
-		'-Wno-unknown-warning', // if a C compiler does not understand a certain flag, it should just ignore it
-		'-Wno-unknown-warning-option', // clang equivalent of the above
-		'-Wno-excess-initializers', // vlib/v/tests/struct_init_with_complex_fields_test.v fails without that on macos clang 13
 		'-Wdate-time',
-		'-Wduplicated-branches',
-		'-Wduplicated-cond',
 		'-Winit-self',
 		'-Winvalid-pch',
-		'-Wjump-misses-init',
-		'-Wlogical-op',
 		'-Wmultichar',
 		'-Wnested-externs',
 		'-Wnull-dereference',
@@ -223,7 +421,7 @@ fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 			cc_file_name.contains('tcc') || ccoptions.guessed_compiler == 'tcc' { .tcc }
 			cc_file_name.contains('gcc') || cc_file_name.contains('g++') || ccoptions.guessed_compiler == 'gcc' { .gcc }
 			cc_file_name.contains('clang') || ccoptions.guessed_compiler == 'clang' { .clang }
-			cc_file_name.contains('msvc') || ccoptions.guessed_compiler == 'msvc' { .msvc }
+			cc_file_name == 'cl' || cc_file_name == 'cl.exe' || cc_file_name.contains('msvc') || ccoptions.guessed_compiler == 'msvc' || v.pref.ccompiler_type == .msvc { .msvc }
 			cc_file_name.contains('icc') || ccoptions.guessed_compiler == 'icc' { .icc }
 			cc_file_name.contains('emcc') || ccoptions.guessed_compiler == 'emcc' { .emcc }
 			else { .unknown }
@@ -256,6 +454,10 @@ fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 		if v.pref.parallel_cc {
 			have_flto = false
 		}
+		if v.pref.is_shared || v.disable_flto {
+			// Keep shared libraries away from LTO to avoid runtime loader regressions.
+			have_flto = false
+		}
 		if have_flto {
 			optimization_options << '-flto'
 		}
@@ -264,7 +466,15 @@ fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 			'-Wno-enum-conversion', // used in vlib/sokol, where C enums in C structs are typed as V structs instead
 			'-Wno-sometimes-uninitialized', // produced after exhaustive matches
 			'-Wno-int-to-void-pointer-cast',
+			'-Wno-excess-initializers', // vlib/v/tests/struct_init_with_complex_fields_test.v fails without that on macos clang 13
+			'-Wno-unknown-warning', // if a C compiler does not understand a certain flag, it should just ignore it
+			'-Wno-unknown-warning-option', // clang equivalent of the above
 		]
+		// Apple clang >= 17 treats -Wincompatible-function-pointer-types as an error by default.
+		// V generates code with enum types (e.g. os.Signal) in callbacks where C expects int,
+		// and specific struct* returns where C expects void* (e.g. sync.pool.ThreadCB).
+		ccoptions.args << '-Wno-incompatible-function-pointer-types'
+		ccoptions.args << '-Wno-typedef-redefinition' // V re-typedefs bool after includes to undo stdbool.h
 	}
 	if ccoptions.cc == .gcc {
 		if ccoptions.debug_mode {
@@ -278,12 +488,27 @@ fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 		if v.pref.parallel_cc {
 			have_flto = false
 		}
+		if v.pref.is_shared || v.disable_flto {
+			// Keep shared libraries away from LTO to avoid runtime loader regressions.
+			have_flto = false
+		}
 		if have_flto {
 			optimization_options << '-flto'
 		}
 		// gcc versions newer than 10.2, produce buggy programs, usually triggered by optimising inlined small functions, when both -flto and -O3 are used.
 		// Using -fno-strict-aliasing prevents that. See https://github.com/vlang/v/issues/26512 .
 		optimization_options << '-fno-strict-aliasing'
+		ccoptions.wargs << [
+			'-Wduplicated-branches',
+			'-Wduplicated-cond',
+			'-Wjump-misses-init',
+			'-Wlogical-op',
+			'-Wno-incompatible-pointer-types', // V uses enum types (e.g. os.Signal) in callbacks where C expects int
+			'-Wno-missing-field-initializers', // @[typedef] C structs may have fields not present in V binding
+		]
+		// On macOS, `gcc` is actually Apple clang, which splits -Wincompatible-pointer-types
+		// and -Wincompatible-function-pointer-types into separate warnings.
+		ccoptions.args << '-Wno-incompatible-function-pointer-types'
 	}
 	if ccoptions.cc == .icc {
 		if ccoptions.debug_mode {
@@ -335,6 +560,12 @@ fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 		ccoptions.linker_flags << '-shared'
 		$if !windows {
 			ccoptions.args << '-fPIC' // -Wl,-z,defs'
+		}
+		if v.pref.os == .linux && 'gcboehm' in v.pref.compile_defines_all {
+			// Keep shared-library GC symbols bound to the shared object itself.
+			// This avoids cross-DSO symbol interposition between multiple V binaries
+			// in one process (for example, host executable + loaded V plugin).
+			ccoptions.linker_flags << '-Wl,-Bsymbolic'
 		}
 	}
 	if v.pref.is_bare && v.pref.os != .wasm32 {
@@ -391,6 +622,11 @@ fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 		}
 		if v.pref.os == .macos {
 			ccoptions.args << '-flat_namespace'
+			if v.pref.is_liveshared {
+				// Resolve sapp_* and similar host symbols when the live-reload dylib is loaded.
+				ccoptions.args << '-undefined'
+				ccoptions.args << 'dynamic_lookup'
+			}
 		}
 	}
 
@@ -451,8 +687,8 @@ fn (mut v Builder) setup_ccompiler_options(ccompiler string) {
 			ccoptions.linker_flags << '-lelf'
 		}
 	}
-	ccoptions.env_cflags = os.getenv('CFLAGS')
-	ccoptions.env_ldflags = os.getenv('LDFLAGS')
+	ccoptions.env_cflags = os.getenv('CFLAGS').replace('\n', ' ')
+	ccoptions.env_ldflags = os.getenv('LDFLAGS').replace('\n', ' ')
 	if v.pref.os == .macos {
 		if v.pref.use_cache {
 			ccoptions.source_args << '-x none'
@@ -513,14 +749,14 @@ fn (v &Builder) only_compile_args(ccoptions CcompilerOptions) []string {
 	$if windows {
 		// Adding default options for tcc, gcc and clang as done in msvc.v.
 		// This is done before pre_args is added so that it can be overwritten if needed.
-		// -Wl,-stack=16777216 == /F 16777216
+		// -Wl,-stack=33554432 == /F33554432
 		// -Werror=implicit-function-declaration == /we4013
 		// /volatile:ms - there seems to be no equivalent,
 		// normally msvc should use /volatile:iso
 		// but it could have an impact on vinix if it is created with msvc.
 		if ccoptions.cc != .msvc {
 			if v.pref.os != .wasm32_emscripten {
-				all << '-Wl,-stack=16777216'
+				all << '-Wl,-stack=33554432'
 			}
 			if !v.pref.is_cstrict {
 				all << '-Werror=implicit-function-declaration'
@@ -539,9 +775,9 @@ pub fn (v &Builder) get_linker_args() []string {
 
 fn (v &Builder) only_linker_args(ccoptions CcompilerOptions) []string {
 	mut all := []string{}
-	// in `build-mode`, we do not need -lxyz flags, since we are
-	// building an (.o) object file, that will be linked later.
-	if v.pref.build_mode != .build_module {
+	// in `build-mode` or when producing a .o file, we do not need -lxyz flags,
+	// since we are building an (.o) object file, that will be linked later.
+	if v.pref.build_mode != .build_module && !v.pref.is_o {
 		all << ccoptions.linker_flags
 		all << ccoptions.env_ldflags
 		all << ccoptions.ldflags
@@ -604,8 +840,8 @@ fn (mut v Builder) setup_output_name() {
 		}
 	}
 	if v.pref.build_mode == .build_module {
-		v.pref.out_name = v.pref.cache_manager.mod_postfix_with_key2cpath(v.pref.path,
-			'.o', v.pref.path) // v.out_name
+		v.pref.out_name = v.pref.cache_manager.mod_postfix_with_key2cpath(v.pref.path, '.o',
+			v.pref.path) // v.out_name
 		if v.pref.is_verbose {
 			println('Building ${v.pref.path} to ${v.pref.out_name} ...')
 		}
@@ -631,6 +867,142 @@ pub fn (mut v Builder) tcc_quoted_path(p string) string {
 	return os.quoted_path(p)
 }
 
+fn (v &Builder) rsp_safe_arg(arg string) string {
+	if arg.starts_with('-B') && arg.len > 2 {
+		path := arg[2..]
+		if path.contains(' ') && !path.starts_with('"') {
+			return '-B"${path}"'
+		}
+	}
+	return arg
+}
+
+fn (v &Builder) c_project_source_name() string {
+	mut output_name := os.file_name(v.pref.out_name)
+	if output_name == '' {
+		output_name = 'main'
+	}
+	base_name := output_name.all_before_last('.')
+	return if base_name == '' { '${output_name}.c' } else { '${base_name}.c' }
+}
+
+fn (mut v Builder) c_project_output_name() string {
+	mut output_name := os.file_name(v.pref.out_name)
+	if output_name == '' {
+		output_name = 'main'
+	}
+	if output_name.ends_with('.c') {
+		output_name = output_name.trim_string_right('.c')
+	}
+	if output_name == '' {
+		output_name = 'main'
+	}
+	if !v.pref.is_shared && v.pref.build_mode != .build_module && v.pref.os == .windows
+		&& !v.pref.is_o && !output_name.ends_with('.exe') {
+		output_name += '.exe'
+	}
+	if v.pref.is_shared && !output_name.ends_with(v.ccoptions.shared_postfix) {
+		output_name += v.ccoptions.shared_postfix
+	}
+	return output_name
+}
+
+fn (mut v Builder) c_project_dependency_replacements() map[string]string {
+	mut replacements := map[string]string{}
+	for flag in v.get_os_cflags() {
+		if !flag.value.ends_with('.o') && !flag.value.ends_with('.obj') {
+			continue
+		}
+		cached_value := if flag.cached == '' { os.real_path(flag.value) } else { flag.cached }
+		obj_path := os.real_path(flag.value)
+		replacement_value := if source_path := c_project_source_from_object_path(obj_path) {
+			os.quoted_path(source_path)
+		} else if os.exists(obj_path) {
+			os.quoted_path(obj_path)
+		} else {
+			os.quoted_path(cached_value)
+		}
+		for key in [
+			cached_value,
+			os.quoted_path(cached_value),
+			'"${cached_value}"',
+			flag.format() or { '' },
+		] {
+			if key == '' {
+				continue
+			}
+			replacements[key] = replacement_value
+		}
+	}
+	return replacements
+}
+
+fn (mut v Builder) generate_c_project() {
+	if v.pref.backend != .c {
+		verror('`-generate-c-project` is currently supported only for the C backend.')
+	}
+	mut project_dir := v.pref.generate_c_project
+	if !os.is_abs_path(project_dir) {
+		project_dir = os.real_path(project_dir)
+	}
+	if os.exists(project_dir) && !os.is_dir(project_dir) {
+		verror('`-generate-c-project` expects a directory path, got file: ${os.quoted_path(project_dir)}')
+	}
+	os.mkdir_all(project_dir) or {
+		verror('Cannot create `-generate-c-project` directory ${os.quoted_path(project_dir)}: ${err}')
+	}
+	c_source_path := os.join_path(project_dir, v.c_project_source_name())
+	os.mv_by_cp(v.out_name_c, c_source_path) or {
+		verror('Cannot write generated C source to ${os.quoted_path(c_source_path)}: ${err}')
+	}
+
+	mut ccompiler := v.pref.ccompiler
+	if v.pref.os == .wasm32 {
+		ccompiler = 'clang'
+	}
+	v.setup_ccompiler_options(ccompiler)
+	if v.pref.build_mode == .build_module {
+		v.ccoptions.pre_args << '-c'
+	}
+	mut project_o_args := v.ccoptions.o_args.filter(!it.starts_with('-o '))
+	project_o_args << [
+		'-o ${v.tcc_quoted_path(os.join_path(project_dir, v.c_project_output_name()))}',
+	]
+	v.ccoptions.o_args = project_o_args
+	for idx, source_arg in v.ccoptions.source_args {
+		if source_arg.contains(v.out_name_c) || source_arg.ends_with('.tmp.c')
+			|| source_arg.contains(".tmp.c'") || source_arg.contains('.tmp.c"') {
+			v.ccoptions.source_args[idx] = v.tcc_quoted_path(c_source_path)
+		}
+	}
+
+	mut all_args := v.all_args(v.ccoptions)
+	replacements := v.c_project_dependency_replacements()
+	for idx, arg in all_args {
+		if replacement := replacements[arg] {
+			all_args[idx] = replacement
+		}
+	}
+	v.dump_c_options(all_args)
+	cc_cmd := '${v.quote_compiler_name(ccompiler)} ${all_args.join(' ')}'
+	os.write_file(os.join_path(project_dir, 'build_command.txt'), cc_cmd + '\n') or {
+		verror('Cannot write ${os.quoted_path(os.join_path(project_dir, 'build_command.txt'))}: ${err}')
+	}
+	os.write_file(os.join_path(project_dir, 'Makefile'), 'all:\n\t${cc_cmd}\n') or {
+		verror('Cannot write ${os.quoted_path(os.join_path(project_dir, 'Makefile'))}: ${err}')
+	}
+	os.write_file(os.join_path(project_dir, 'build.sh'), '#!/bin/sh\nset -eu\n${cc_cmd}\n') or {
+		verror('Cannot write ${os.quoted_path(os.join_path(project_dir, 'build.sh'))}: ${err}')
+	}
+	os.write_file(os.join_path(project_dir, 'build.bat'), '@echo off\r\n${cc_cmd}\r\n') or {
+		verror('Cannot write ${os.quoted_path(os.join_path(project_dir, 'build.bat'))}: ${err}')
+	}
+	$if !windows {
+		os.chmod(os.join_path(project_dir, 'build.sh'), 0o755) or {}
+	}
+	println('Generated C project in ${os.quoted_path(project_dir)}')
+}
+
 pub fn (mut v Builder) cc() {
 	if os.executable().contains('vfmt') {
 		return
@@ -650,11 +1022,17 @@ pub fn (mut v Builder) cc() {
 		}
 		return
 	}
+	v.ensure_windows_icon_flag_is_valid()
 	if v.pref.should_output_to_stdout() {
 		// output to stdout
 		content := os.read_file(v.out_name_c) or { panic(err) }
 		println(content)
 		os.rm(v.out_name_c) or {}
+		return
+	}
+	if v.pref.generate_c_project != '' {
+		v.pref.skip_running = true
+		v.generate_c_project()
 		return
 	}
 	// whether to just create a .c or .js file and exit, for example: `v -o v.c cmd.v`
@@ -669,6 +1047,7 @@ pub fn (mut v Builder) cc() {
 		util.timing_measure(msg_mv)
 		return
 	}
+	v.ensure_imported_coroutines_runtime() or { verror(err.msg()) }
 	// Cross compiling for Windows
 	if v.pref.os == .windows && v.pref.ccompiler != 'msvc' {
 		$if !windows {
@@ -727,7 +1106,7 @@ pub fn (mut v Builder) cc() {
 		}
 		v.handle_usecache(vexe)
 		$if windows {
-			if ccompiler == 'msvc' {
+			if v.ccoptions.cc == .msvc || v.pref.ccompiler_type == .msvc {
 				v.cc_msvc()
 				return
 			}
@@ -735,10 +1114,11 @@ pub fn (mut v Builder) cc() {
 		//
 		all_args := v.all_args(v.ccoptions)
 		v.dump_c_options(all_args)
+		rsp_args := all_args.map(v.rsp_safe_arg(it))
 		str_args := if v.pref.no_rsp {
-			all_args.join(' ').replace('\n', ' ')
+			rsp_args.join(' ').replace('\n', ' ')
 		} else {
-			all_args.join(' ')
+			rsp_args.join(' ')
 		}
 		mut cmd := '${v.quote_compiler_name(ccompiler)} ${str_args}'
 		if v.pref.parallel_cc {
@@ -781,12 +1161,25 @@ pub fn (mut v Builder) cc() {
 			v.show_c_compiler_output(ccompiler, res)
 		}
 		os.chdir(original_pwd) or {}
-		vcache.dlog('| Builder.' + @FN, '>       v.pref.use_cache: ${v.pref.use_cache} | v.pref.retry_compilation: ${v.pref.retry_compilation}')
+		vcache.dlog('| Builder.' + @FN,
+			'>       v.pref.use_cache: ${v.pref.use_cache} | v.pref.retry_compilation: ${v.pref.retry_compilation}')
 		vcache.dlog('| Builder.' + @FN, '>      cmd res.exit_code: ${res.exit_code} | cmd: ${cmd}')
 		vcache.dlog('| Builder.' + @FN, '>  response_file_content:\n${response_file_content}')
 		if res.exit_code != 0 {
-			if ccompiler.contains('tcc.exe') {
-				// a TCC problem? Retry with the system cc:
+			// Some GCC+linker setups fail bootstrapping with `-flto` and then report a missing `main` symbol.
+			// Retry once without `-flto`, while still keeping the remaining -prod options.
+			if v.pref.building_v && v.pref.is_prod && !v.pref.no_prod_options && !v.disable_flto
+				&& v.ccoptions.cc == .gcc && response_file_content.contains('-flto')
+				&& (res.output.contains('undefined symbol: main')
+				|| res.output.contains('undefined reference to `main')) {
+				v.disable_flto = true
+				if !v.pref.is_quiet {
+					eprintln('Retrying compiler build without `-flto` after a linker failure with missing `main`.')
+				}
+				continue
+			}
+			if is_tcc_compilation_failure(ccompiler, v.ccoptions.cc, res.output) {
+				// A TCC problem? Retry with a non-tcc system compiler:
 				if tried_compilation_commands.len > 1 {
 					eprintln('Recompilation loop detected (ccompiler: ${ccompiler}):')
 					for recompile_command in tried_compilation_commands {
@@ -796,11 +1189,19 @@ pub fn (mut v Builder) cc() {
 				}
 				if v.pref.retry_compilation {
 					tcc_output = res
+					old_ccompiler := v.pref.ccompiler
 					v.pref.default_c_compiler()
-					if v.pref.is_verbose {
-						eprintln('Compilation with tcc failed. Retrying with ${v.pref.ccompiler} ...')
+					if v.pref.ccompiler == ccompiler || is_tcc_compiler_name(v.pref.ccompiler)
+						|| is_tcc_alias_compiler(v.pref.ccompiler) {
+						v.pref.ccompiler = first_available_ccompiler([old_ccompiler, ccompiler,
+							v.pref.ccompiler])
 					}
-					continue
+					if v.pref.ccompiler != '' && v.pref.ccompiler != ccompiler {
+						if v.pref.is_verbose {
+							eprintln('Compilation with tcc failed. Retrying with ${v.pref.ccompiler} ...')
+						}
+						continue
+					}
 				}
 			}
 			if res.exit_code == 127 {
@@ -829,6 +1230,7 @@ pub fn (mut v Builder) cc() {
 		}
 		break
 	}
+	v.apply_windows_icon_to_executable() or { verror(err.msg()) }
 	if v.pref.compress {
 		ret := os.system('strip ${os.quoted_path(v.pref.out_name)}')
 		if ret != 0 {
@@ -927,10 +1329,9 @@ fn (mut b Builder) cc_linux_cross() {
 	cc_args << '-c ${os.quoted_path(b.out_name_c)}'
 	cc_args << libs
 	b.dump_c_options(cc_args)
-	mut cc_name := 'cc'
+	mut cc_name := b.pref.ccompiler
 	mut out_name := b.pref.out_name
 	$if windows {
-		cc_name = 'clang.exe'
 		out_name = out_name.trim_string_right('.exe')
 	}
 	cc_cmd := '${b.quote_compiler_name(cc_name)} ' + cc_args.join(' ')
@@ -942,6 +1343,18 @@ fn (mut b Builder) cc_linux_cross() {
 		println('Cross compilation for Linux failed (first step, cc). Make sure you have clang installed.')
 		verror(cc_res.output)
 		return
+	}
+	// Compile compiler runtime builtins (provides __udivti3 etc. for 128-bit integer
+	// operations used by thirdparty code like mbedtls bignum.c, since the linuxroot
+	// sysroot doesn't include libgcc or compiler-rt).
+	builtins_src := os.join_path(@VEXEROOT, 'thirdparty', 'builtins', 'compiler_builtins.c')
+	builtins_obj := os.join_path(os.vtmp_dir(), 'compiler_builtins.o')
+	if os.exists(builtins_src) {
+		builtins_cmd := '${b.quote_compiler_name(cc_name)} -w -fPIC -target x86_64-linux-gnu -o ${os.quoted_path(builtins_obj)} -c ${os.quoted_path(builtins_src)}'
+		builtins_res := os.execute(builtins_cmd)
+		if builtins_res.exit_code != 0 {
+			println('Warning: failed to compile compiler builtins for cross compilation.')
+		}
 	}
 	mut linker_args := [
 		'-L',
@@ -967,6 +1380,9 @@ fn (mut b Builder) cc_linux_cross() {
 		'-ldl',
 	]
 	linker_args << cflags.c_options_only_object_files()
+	if os.exists(builtins_obj) {
+		linker_args << os.quoted_path(builtins_obj)
+	}
 	// -ldl
 	b.dump_c_options(linker_args)
 	mut ldlld := '${sysroot}/ld.lld'
@@ -1015,10 +1431,9 @@ fn (mut b Builder) cc_freebsd_cross() {
 	cc_args << os.quoted_path(b.out_name_c)
 	cc_args << libs
 	b.dump_c_options(cc_args)
-	mut cc_name := b.pref.vcross_compiler_name()
+	mut cc_name := b.pref.ccompiler
 	mut out_name := b.pref.out_name
 	$if windows {
-		cc_name = 'clang.exe'
 		out_name = out_name.trim_string_right('.exe')
 	}
 	cc_cmd := '${b.quote_compiler_name(cc_name)} ' + cc_args.join(' ')
@@ -1070,16 +1485,23 @@ fn (mut b Builder) cc_freebsd_cross() {
 
 fn (mut c Builder) cc_windows_cross() {
 	println('Cross compiling for Windows...')
-	cross_compiler_name := c.pref.vcross_compiler_name()
-	cross_compiler_name_path := os.find_abs_path_of_executable(cross_compiler_name) or {
-		eprintln('Could not find `${cross_compiler_name}` in your PATH.')
-		eprintln('See https://github.com/vlang/v/blob/master/doc/docs.md#cross-compilation for instructions on how to fix that.')
-		exit(1)
+	cross_compiler_name := c.pref.ccompiler
+	cross_compiler_name_path := if cross_compiler_name.contains('/')
+		|| cross_compiler_name.contains('\\') {
+		cross_compiler_name
+	} else {
+		os.find_abs_path_of_executable(cross_compiler_name) or {
+			eprintln('Could not find `${cross_compiler_name}` in your PATH.')
+			eprintln('Set `-cc` or `VCROSS_COMPILER_NAME` to a working cross compiler.')
+			eprintln('See https://github.com/vlang/v/blob/master/doc/docs.md#cross-compilation for instructions on how to fix that.')
+			exit(1)
+		}
 	}
 
 	c.setup_ccompiler_options(c.pref.ccompiler)
 	c.build_thirdparty_obj_files()
 	c.setup_output_name()
+	icon_object := c.prepare_cross_windows_icon_resource() or { verror(err.msg()) }
 	mut args := []string{}
 	args << '${c.pref.cflags}'
 	args << '-o ${os.quoted_path(c.pref.out_name)}'
@@ -1099,6 +1521,10 @@ fn (mut c Builder) cc_windows_cross() {
 			optimization_options = ['-O3']
 			mut have_flto := true
 			if c.pref.parallel_cc {
+				have_flto = false
+			}
+			if c.pref.is_shared {
+				// Keep shared libraries away from LTO to avoid runtime loader regressions.
 				have_flto = false
 			}
 			if have_flto {
@@ -1125,6 +1551,9 @@ fn (mut c Builder) cc_windows_cross() {
 	// add the thirdparty .o files, produced by all the #flag directives:
 	args << cflags.c_options_only_object_files()
 	args << os.quoted_path(c.out_name_c)
+	if icon_object != '' {
+		args << os.quoted_path(icon_object)
+	}
 
 	mut c_options_after_target := []string{}
 	if c.pref.ccompiler == 'msvc' {
@@ -1181,7 +1610,8 @@ fn (mut b Builder) build_thirdparty_obj_files() {
 			rest_of_module_flags := b.get_rest_of_module_cflags(flag)
 			$if windows {
 				if b.pref.ccompiler == 'msvc' {
-					b.build_thirdparty_obj_file_with_msvc(flag.mod, flag.value, rest_of_module_flags)
+					b.build_thirdparty_obj_file_with_msvc(flag.mod, flag.value,
+						rest_of_module_flags)
 					continue
 				}
 			}
@@ -1197,6 +1627,20 @@ enum SourceKind {
 	unknown
 }
 
+fn c_project_source_from_object_path(obj_path string) ?string {
+	if !obj_path.ends_with('.o') && !obj_path.ends_with('.obj') {
+		return none
+	}
+	base := obj_path.all_before_last('.')
+	for ext in ['.c', '.cpp', '.S'] {
+		source_file := base + ext
+		if os.exists(source_file) {
+			return source_file
+		}
+	}
+	return none
+}
+
 fn (mut v Builder) build_thirdparty_obj_file(mod string, path string, moduleflags []cflag.CFlag) {
 	trace_thirdparty_obj_files := 'trace_thirdparty_obj_files' in v.pref.compile_defines
 	obj_path := os.real_path(path)
@@ -1209,18 +1653,18 @@ fn (mut v Builder) build_thirdparty_obj_file(mod string, path string, moduleflag
 		os.cp(obj_path, opath) or { panic(err) }
 		return
 	}
-	base := obj_path[..obj_path.len - 2]
-
-	source_kind, source_file := if os.exists(base + '.c') {
-		SourceKind.c, base + '.c'
-	} else if os.exists(base + '.cpp') {
-		SourceKind.cpp, base + '.cpp'
-	} else if os.exists(base + '.S') {
-		SourceKind.asm, base + '.S'
+	mut source_file := c_project_source_from_object_path(obj_path) or { '' }
+	source_kind := if source_file.ends_with('.c') {
+		SourceKind.c
+	} else if source_file.ends_with('.cpp') {
+		SourceKind.cpp
+	} else if source_file.ends_with('.S') {
+		SourceKind.asm
 	} else {
-		SourceKind.unknown, ''
+		SourceKind.unknown
 	}
 	if source_kind == .unknown {
+		base := obj_path.all_before_last('.')
 		eprintln('> File not found: ${base}{.c,.cpp,.S}')
 		verror('build_thirdparty_obj_file only support .c, .cpp, and .S source file.')
 	}
@@ -1276,9 +1720,8 @@ fn (mut v Builder) build_thirdparty_obj_file(mod string, path string, moduleflag
 		verror(res.output)
 		return
 	}
-	v.pref.cache_manager.mod_save(mod, '.thirdparty.description.txt', obj_path, get_dsc_content('OBJ_PATH: ${obj_path}\nCMD: ${cmd}\n')) or {
-		panic(err)
-	}
+	v.pref.cache_manager.mod_save(mod, '.thirdparty.description.txt', obj_path,
+		get_dsc_content('OBJ_PATH: ${obj_path}\nCMD: ${cmd}\n')) or { panic(err) }
 	if v.pref.show_cc {
 		println('>> OBJECT FILE compilation cmd: ${cmd}')
 	}
@@ -1301,6 +1744,53 @@ fn missing_compiler_info() string {
 		return 'Install command line XCode tools with `xcode-select --install`'
 	}
 	return 'Install a C compiler, like gcc or clang'
+}
+
+fn is_tcc_compilation_failure(ccompiler string, cc_kind CC, output string) bool {
+	return cc_kind == .tcc || is_tcc_compiler_name(ccompiler) || is_tcc_error_output(output)
+}
+
+fn is_tcc_compiler_name(ccompiler string) bool {
+	name := os.file_name(ccompiler).to_lower()
+	return name.starts_with('tcc') || name.starts_with('tinyc')
+}
+
+fn is_tcc_error_output(output string) bool {
+	trimmed_output := output.trim_space()
+	return trimmed_output.starts_with('tcc: error:') || trimmed_output.contains('\ntcc: error:')
+}
+
+fn is_tcc_alias_compiler(ccompiler string) bool {
+	if ccompiler != 'cc' {
+		return false
+	}
+	cc_version := os.execute('cc --version')
+	if cc_version.exit_code != 0 {
+		return false
+	}
+	lcc_version := cc_version.output.to_lower()
+	return lcc_version.contains('tiny c compiler') || lcc_version.contains('tinycc')
+		|| lcc_version.contains('\ntcc') || lcc_version.starts_with('tcc')
+}
+
+fn ccompiler_is_available(ccompiler string) bool {
+	if ccompiler.contains('/') || ccompiler.contains('\\') {
+		return os.is_file(ccompiler) && os.is_executable(ccompiler)
+	}
+	os.find_abs_path_of_executable(ccompiler) or { return false }
+	return true
+}
+
+fn first_available_ccompiler(excluded []string) string {
+	for candidate in ['cc', 'clang', 'gcc'] {
+		if candidate in excluded {
+			continue
+		}
+		if os.find_abs_path_of_executable(candidate) or { '' } != '' {
+			return candidate
+		}
+	}
+	return ''
 }
 
 fn highlight_word(keyword string) string {
@@ -1340,7 +1830,8 @@ pub fn (mut v Builder) quote_compiler_name(name string) string {
 
 fn write_response_file(response_file string, response_file_content string) {
 	$if windows {
-		os.write_file_array(response_file, string_to_ansi_not_null_terminated(response_file_content)) or {
+		os.write_file_array(response_file,
+			string_to_ansi_not_null_terminated(response_file_content)) or {
 			write_response_file_error(response_file_content, err)
 		}
 	} $else {

@@ -6,6 +6,10 @@ module ssa
 
 pub type ValueID = int
 
+pub fn (id ValueID) str() string {
+	return int(id).str()
+}
+
 pub enum ValueKind {
 	unknown
 	constant
@@ -16,6 +20,21 @@ pub enum ValueKind {
 	string_literal   // V string struct literal (by value)
 	c_string_literal // C string literal (raw char pointer)
 	func_ref         // Function pointer reference (for map hash/eq/clone/free functions)
+}
+
+// str returns the symbolic name for an SSA value kind.
+pub fn (k ValueKind) str() string {
+	return match k {
+		.unknown { 'unknown' }
+		.constant { 'constant' }
+		.argument { 'argument' }
+		.global { 'global' }
+		.instruction { 'instruction' }
+		.basic_block { 'basic_block' }
+		.string_literal { 'string_literal' }
+		.c_string_literal { 'c_string_literal' }
+		.func_ref { 'func_ref' }
+	}
 }
 
 pub struct Value {
@@ -38,7 +57,7 @@ pub:
 }
 
 pub struct GlobalVar {
-pub:
+pub mut:
 	name          string
 	typ           TypeID
 	linkage       Linkage

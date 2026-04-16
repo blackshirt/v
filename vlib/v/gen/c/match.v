@@ -6,16 +6,26 @@ module c
 import v.ast
 import v.util
 
+fn (g &Gen) match_cond_can_use_directly(cond ast.Expr) bool {
+	return (cond in [ast.Ident, ast.IntegerLiteral, ast.StringLiteral, ast.FloatLiteral]
+		&& (cond !is ast.Ident || (cond is ast.Ident && cond.or_expr.kind == .absent)))
+		|| (cond is ast.SelectorExpr && cond.or_block.kind == .absent && (cond.expr !is ast.CallExpr
+		|| (cond.expr as ast.CallExpr).or_block.kind == .absent))
+}
+
 fn (mut g Gen) need_tmp_var_in_match(node ast.MatchExpr) bool {
 	if node.is_expr && node.return_type != ast.void_type && node.return_type != 0 {
 		if g.inside_struct_init {
 			return true
 		}
-		if g.table.sym(node.return_type).kind in [.sum_type, .multi_return]
+		if g.table.sym(node.return_type).kind in [.sum_type, .interface, .multi_return]
 			|| node.return_type.has_option_or_result() {
 			return true
 		}
 		if g.table.final_sym(node.cond_type).kind == .enum && node.branches.len > 5 {
+			return true
+		}
+		if !g.match_cond_can_use_directly(node.cond) {
 			return true
 		}
 		if g.need_tmp_var_in_expr(node.cond) {
@@ -74,11 +84,7 @@ fn (mut g Gen) match_expr(node ast.MatchExpr) {
 			g.inside_match_result = true
 		}
 	}
-	if (node.cond in [ast.Ident, ast.IntegerLiteral, ast.StringLiteral, ast.FloatLiteral]
-		&& (node.cond !is ast.Ident || (node.cond is ast.Ident
-		&& node.cond.or_expr.kind == .absent))) || (node.cond is ast.SelectorExpr
-		&& node.cond.or_block.kind == .absent && (node.cond.expr !is ast.CallExpr
-		|| (node.cond.expr as ast.CallExpr).or_block.kind == .absent)) {
+	if g.match_cond_can_use_directly(node.cond) {
 		cond_var = g.expr_string(node.cond)
 	} else {
 		line := if is_expr {
@@ -127,6 +133,7 @@ fn (mut g Gen) match_expr(node ast.MatchExpr) {
 		g.match_expr_sumtype(node, is_expr, cond_var, tmp_var)
 	} else {
 		cond_fsym := g.table.final_sym(node.cond_type)
+		enum_is_multi_allowed := cond_fsym.info is ast.Enum && cond_fsym.info.is_multi_allowed
 		mut can_be_a_switch := true
 		all_branches: for branch in node.branches {
 			for expr in branch.exprs {
@@ -145,10 +152,10 @@ fn (mut g Gen) match_expr(node ast.MatchExpr) {
 		}
 		// eprintln('> can_be_a_switch: ${can_be_a_switch}')
 		if can_be_a_switch && !is_expr && g.loop_depth == 0 && g.fn_decl != unsafe { nil }
-			&& cond_fsym.is_int() {
+			&& cond_fsym.is_int() && !enum_is_multi_allowed {
 			g.match_expr_switch(node, is_expr, cond_var, tmp_var, cond_fsym)
 		} else if cond_fsym.kind == .enum && g.loop_depth == 0 && node.branches.len > 5
-			&& g.fn_decl != unsafe { nil } {
+			&& g.fn_decl != unsafe { nil } && !enum_is_multi_allowed {
 			// do not optimize while in top-level
 			g.match_expr_switch(node, is_expr, cond_var, tmp_var, cond_fsym)
 		} else {
@@ -177,7 +184,7 @@ fn (mut g Gen) match_expr(node ast.MatchExpr) {
 fn (mut g Gen) match_expr_sumtype(node ast.MatchExpr, is_expr bool, cond_var string, tmp_var string) {
 	dot_or_ptr := g.dot_or_ptr(node.cond_type)
 	use_ternary := is_expr && tmp_var == ''
-	cond_sym := g.table.sym(node.cond_type)
+	cond_sym := g.table.final_sym(node.cond_type)
 	for j, branch in node.branches {
 		mut sumtype_index := 0
 		// iterates through all types in sumtype branches
@@ -244,7 +251,8 @@ fn (mut g Gen) match_expr_sumtype(node ast.MatchExpr, is_expr bool, cond_var str
 					g.writeln(') {')
 				}
 			}
-			if is_expr && tmp_var.len > 0 && g.table.sym(node.return_type).kind == .sum_type {
+			if is_expr && tmp_var.len > 0
+				&& g.table.sym(node.return_type).kind in [.sum_type, .interface] {
 				g.expected_cast_type = node.return_type
 			}
 			inside_interface_deref_old := g.inside_interface_deref
@@ -353,7 +361,8 @@ fn (mut g Gen) match_expr_switch(node ast.MatchExpr, is_expr bool, cond_var stri
 			}
 		}
 		g.writeln('{')
-		if is_expr && tmp_var.len > 0 && g.table.sym(node.return_type).kind == .sum_type {
+		if is_expr && tmp_var.len > 0
+			&& g.table.sym(node.return_type).kind in [.sum_type, .interface] {
 			g.expected_cast_type = node.return_type
 		}
 		ends_with_return := g.stmts_with_tmp_var(branch.stmts, tmp_var)
@@ -562,7 +571,8 @@ fn (mut g Gen) match_expr_classic(node ast.MatchExpr, is_expr bool, cond_var str
 				g.writeln(') {')
 			}
 		}
-		if is_expr && tmp_var.len > 0 && g.table.sym(node.return_type).kind == .sum_type {
+		if is_expr && tmp_var.len > 0
+			&& g.table.sym(node.return_type).kind in [.sum_type, .interface] {
 			g.expected_cast_type = node.return_type
 		}
 		g.stmts_with_tmp_var(branch.stmts, tmp_var)

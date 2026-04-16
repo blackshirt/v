@@ -4,10 +4,18 @@
 module transformer
 
 import os
+import strings
 import v2.ast
 import v2.pref
 import v2.token
 import v2.types
+
+const embed_file_helper_type_name = '__V2EmbedFileData'
+const c_keywords = ['auto', 'break', 'case', 'char', 'const', 'continue', 'default', 'do', 'double',
+	'else', 'enum', 'extern', 'float', 'for', 'goto', 'if', 'inline', 'int', 'long', 'register',
+	'restrict', 'return', 'short', 'signed', 'sizeof', 'static', 'struct', 'switch', 'typedef',
+	'union', 'unsigned', 'void', 'volatile', 'while', '_Bool', '_Complex', '_Imaginary', 'unix',
+	'linux']
 
 // Transformer performs AST-level transformations to simplify
 // and normalize code before codegen. This avoids duplicating
@@ -29,12 +37,18 @@ mut:
 	synth_pos_counter int = -1
 	// Track needed auto-generated str functions (type_name -> elem_type for arrays)
 	needed_str_fns map[string]string
+	// Track needed auto-generated clone functions (fn_name -> struct_name)
+	needed_clone_fns map[string]string
 	// Track needed auto-generated array helper functions
 	needed_array_contains_fns   map[string]ArrayMethodInfo
 	needed_array_index_fns      map[string]ArrayMethodInfo
 	needed_array_last_index_fns map[string]ArrayMethodInfo
 	// Current function's return type name (for sum type wrapping in returns)
 	cur_fn_ret_type_name string
+	// Tracks whether the current function returns Option/Result.
+	// Some transformations use this to avoid wrapping plain sumtype returns.
+	cur_fn_returns_option bool
+	cur_fn_returns_result bool
 	// When set, match branch values should be wrapped in this sum type
 	// (used when a match expression is returned from a function with sum type return)
 	sumtype_return_wrap string
@@ -59,15 +73,58 @@ mut:
 	// Used to rewrite interface method calls to direct concrete calls.
 	interface_concrete_types map[string]string
 	// Track needed auto-generated sort comparator functions
-	needed_sort_fns map[string]SortComparatorInfo
+	needed_sort_fns     map[string]SortComparatorInfo
+	needed_enum_str_fns map[string]types.Enum
+	// Track needed go wrapper functions (go call -> goroutine_create lowering)
+	needed_go_wrappers map[string]GoWrapperInfo
+	// Track whether post-pass should inject the synthetic embed_file helper type.
+	needed_embed_file_helper bool
 	// Override array element types for variables whose checker-inferred type is wrong
 	// (e.g. .map(fn_name) typed as []voidptr instead of []ReturnType)
 	array_elem_type_overrides map[string]string
 	// File set for resolving positions to line numbers (for assert messages)
 	file_set &token.FileSet = unsafe { nil }
 	// Current file and function name (for assert messages)
-	cur_file_name   string
-	cur_fn_name_str string
+	cur_file_name      string
+	cur_fn_name_str    string
+	cur_fn_recv_prefix string // C prefix for current method's receiver type (e.g., "ui__Window")
+	cur_fn_recv_param  string // Receiver parameter name (e.g., "w")
+	// @[live] hot code reloading: function names and source file
+	live_fns         []LiveFn
+	live_source_file string
+	// Cached scope/method/fn_scope snapshots for lock-free parallel access.
+	// Populated once in pre_pass from the shared Environment fields.
+	cached_scopes    map[string]&types.Scope
+	cached_methods   map[string][]&types.Fn
+	cached_fn_scopes map[string]&types.Scope
+	// Accumulated synth types for deferred application (thread-safe).
+	// Instead of writing directly to env.set_expr_type during parallel transform,
+	// store here and apply after merge.
+	synth_types map[int]types.Type
+}
+
+fn escape_c_keyword(name string) string {
+	n := if name.len > 0 && name[0] == `@` { name[1..] } else { name }
+	if n in c_keywords {
+		return '_${n}'
+	}
+	return n
+}
+
+fn enum_member_ident(enum_type string, field_name string) string {
+	escaped := if field_name.len > 0 && field_name[0] == `@` {
+		'at_${field_name[1..]}'
+	} else {
+		escape_c_keyword(field_name)
+	}
+	return '${enum_type}__${escaped}'
+}
+
+struct LiveFn {
+	decl_name    string // e.g., 'frame' or 'update_model'
+	mangled_name string // e.g., 'frame' or 'Game__update_model'
+	is_method    bool
+	recv_type    string // e.g., 'Game' (empty for non-methods)
 }
 
 // SmartcastContext holds info about a single smartcast
@@ -83,6 +140,27 @@ struct ArrayMethodInfo {
 	elem_type  string
 	is_fixed   bool
 	fixed_len  int
+}
+
+// GoWrapperInfo tracks information needed to synthesize a go-wrapper function.
+// For `go foo(a, b)`, we generate a wrapper that packs args and calls
+// goroutines__goroutine_create, and a trampoline that unpacks args and calls foo.
+struct GoWrapperInfo {
+	fn_name      string   // C-mangled function name (e.g. "main__foo")
+	wrapper_name string   // Wrapper function name (e.g. "__go_wrap_main__foo")
+	param_names  []string // Parameter names
+	param_types  []string // Parameter C type names
+}
+
+fn builder_write_string_stmt(sb_ref ast.Expr, s ast.Expr) ast.Stmt {
+	return ast.Stmt(ast.ExprStmt{
+		expr: ast.Expr(ast.CallExpr{
+			lhs:  ast.Expr(ast.Ident{
+				name: 'strings__Builder__write_string'
+			})
+			args: [sb_ref, s]
+		})
+	})
 }
 
 struct RuntimeConstInit {
@@ -110,10 +188,12 @@ pub fn Transformer.new_with_pref(files []ast.File, env &types.Environment, p &pr
 		pref:                        unsafe { p }
 		env:                         unsafe { env }
 		needed_str_fns:              map[string]string{}
+		needed_clone_fns:            map[string]string{}
 		needed_array_contains_fns:   map[string]ArrayMethodInfo{}
 		needed_array_index_fns:      map[string]ArrayMethodInfo{}
 		needed_array_last_index_fns: map[string]ArrayMethodInfo{}
 		needed_sort_fns:             map[string]SortComparatorInfo{}
+		needed_go_wrappers:          map[string]GoWrapperInfo{}
 		runtime_const_inits_by_mod:  map[string][]RuntimeConstInit{}
 		runtime_const_init_fn_name:  map[string]string{}
 	}
@@ -123,6 +203,87 @@ pub fn Transformer.new_with_pref(files []ast.File, env &types.Environment, p &pr
 
 pub fn (mut t Transformer) set_file_set(fs &token.FileSet) {
 	t.file_set = unsafe { fs }
+}
+
+// new_worker_clone creates a lightweight Transformer that shares read-only state
+// (env, pref, elided_fns, comptime_vmodroot, file_set) but has its own
+// accumulator maps for thread-safe per-file transformation.
+// worker_idx offsets synth_pos_counter so workers don't generate conflicting IDs.
+pub fn (t &Transformer) new_worker_clone(worker_idx int) &Transformer {
+	return &Transformer{
+		pref:                        unsafe { t.pref }
+		env:                         unsafe { t.env }
+		elided_fns:                  t.elided_fns
+		comptime_vmodroot:           t.comptime_vmodroot
+		file_set:                    unsafe { t.file_set }
+		cached_scopes:               t.cached_scopes
+		cached_methods:              t.cached_methods
+		cached_fn_scopes:            t.cached_fn_scopes
+		synth_pos_counter:           -(worker_idx * 100_000)
+		needed_str_fns:              map[string]string{}
+		needed_clone_fns:            map[string]string{}
+		needed_array_contains_fns:   map[string]ArrayMethodInfo{}
+		needed_array_index_fns:      map[string]ArrayMethodInfo{}
+		needed_array_last_index_fns: map[string]ArrayMethodInfo{}
+		needed_sort_fns:             map[string]SortComparatorInfo{}
+		needed_go_wrappers:          map[string]GoWrapperInfo{}
+		runtime_const_inits_by_mod:  map[string][]RuntimeConstInit{}
+		runtime_const_init_fn_name:  map[string]string{}
+	}
+}
+
+// merge_worker merges accumulated state from a worker transformer into this one.
+pub fn (mut t Transformer) merge_worker(w &Transformer) {
+	for k, v in w.needed_str_fns {
+		t.needed_str_fns[k] = v
+	}
+	for k, v in w.needed_clone_fns {
+		t.needed_clone_fns[k] = v
+	}
+	for k, v in w.needed_array_contains_fns {
+		t.needed_array_contains_fns[k] = v
+	}
+	for k, v in w.needed_array_index_fns {
+		t.needed_array_index_fns[k] = v
+	}
+	for k, v in w.needed_array_last_index_fns {
+		t.needed_array_last_index_fns[k] = v
+	}
+	for k, v in w.needed_sort_fns {
+		t.needed_sort_fns[k] = v
+	}
+	for k, v in w.needed_enum_str_fns {
+		t.needed_enum_str_fns[k] = v
+	}
+	for k, v in w.needed_go_wrappers {
+		t.needed_go_wrappers[k] = v
+	}
+	if w.needed_embed_file_helper {
+		t.needed_embed_file_helper = true
+	}
+	for k, v in w.interface_concrete_types {
+		t.interface_concrete_types[k] = v
+	}
+	for k, v in w.array_elem_type_overrides {
+		t.array_elem_type_overrides[k] = v
+	}
+	for lf in w.live_fns {
+		t.live_fns << lf
+	}
+	if w.live_source_file.len > 0 {
+		t.live_source_file = w.live_source_file
+	}
+	for k, v in w.cached_fn_scopes {
+		t.cached_fn_scopes[k] = v
+	}
+	for k, v in w.synth_types {
+		t.synth_types[k] = v
+	}
+}
+
+// transform_file_standalone transforms a single file, for use in parallel workers.
+pub fn (mut t Transformer) transform_file_pub(file ast.File) ast.File {
+	return t.transform_file(file)
 }
 
 fn resolve_comptime_vmodroot(files []ast.File, p &pref.Preferences) string {
@@ -168,10 +329,61 @@ fn detect_vmodroot_from_path(path string) ?string {
 	return none
 }
 
+fn (t &Transformer) is_eval_backend() bool {
+	return t.pref != unsafe { nil } && t.pref.backend == .eval
+}
+
 fn quote_v_string_literal(raw string) string {
 	mut escaped := raw.replace('\\', '\\\\')
 	escaped = escaped.replace("'", "\\'")
 	return "'${escaped}'"
+}
+
+fn quote_v_bytes_literal(raw []u8) string {
+	hex_digits := '0123456789abcdef'
+	mut sb := strings.new_builder(raw.len * 4 + 2)
+	sb.write_u8(`'`)
+	for b in raw {
+		if b >= ` ` && b <= `~` && b !in [`\\`, `'`] {
+			sb.write_u8(b)
+			continue
+		}
+		match b {
+			`\n` {
+				sb.write_string('\\n')
+			}
+			`\r` {
+				sb.write_string('\\r')
+			}
+			`\t` {
+				sb.write_string('\\t')
+			}
+			`\\` {
+				sb.write_string('\\\\')
+			}
+			`'` {
+				sb.write_string("\\'")
+			}
+			else {
+				sb.write_string('\\x')
+				sb.write_u8(hex_digits[b >> 4])
+				sb.write_u8(hex_digits[b & 0x0f])
+			}
+		}
+	}
+	sb.write_u8(`'`)
+	return sb.str()
+}
+
+fn embed_file_helper_type_expr(pos token.Pos) ast.Expr {
+	return ast.Expr(ast.Ident{
+		name: embed_file_helper_type_name
+		pos:  pos
+	})
+}
+
+fn is_embed_file_helper_type(typ types.Type) bool {
+	return typ.name() == embed_file_helper_type_name
 }
 
 fn (t &Transformer) vmodroot_string_literal(pos token.Pos) ast.StringLiteral {
@@ -182,23 +394,132 @@ fn (t &Transformer) vmodroot_string_literal(pos token.Pos) ast.StringLiteral {
 	}
 }
 
+fn embed_file_string_arg(expr ast.Expr) ?string {
+	match expr {
+		ast.StringLiteral {
+			if expr.value.len >= 2 {
+				return expr.value[1..expr.value.len - 1]
+			}
+			return ''
+		}
+		ast.BasicLiteral {
+			if expr.kind == .string {
+				if expr.value.len >= 2 {
+					return expr.value[1..expr.value.len - 1]
+				}
+				return ''
+			}
+			return none
+		}
+		else {
+			return none
+		}
+	}
+}
+
+fn (mut t Transformer) current_file_path(pos token.Pos) string {
+	if !pos.is_valid() || t.file_set == unsafe { nil } {
+		return t.cur_file_name
+	}
+	file := t.file_set.file(pos)
+	position := file.position(pos)
+	return position.filename
+}
+
+fn (mut t Transformer) resolve_embed_file_paths(raw_path string, pos token.Pos) (string, string) {
+	mut rel_path := raw_path
+	if rel_path.contains('@VMODROOT') {
+		rel_path = rel_path.replace('@VMODROOT', t.comptime_vmodroot)
+	}
+	if rel_path.contains('@VEXEROOT') {
+		mut vexeroot := ''
+		if os.args.len > 0 && os.args[0].len > 0 {
+			vexeroot = os.dir(os.real_path(os.args[0]))
+		}
+		if vexeroot == '' && t.pref != unsafe { nil } && t.pref.vroot.len > 0 {
+			vexeroot = os.join_path(t.pref.vroot, 'cmd', 'v2')
+		}
+		if vexeroot != '' {
+			rel_path = rel_path.replace('@VEXEROOT', vexeroot)
+		}
+	}
+	if os.is_abs_path(rel_path) {
+		return raw_path, os.real_path(rel_path)
+	}
+	source_path := t.current_file_path(pos)
+	base_dir := if source_path != '' { os.dir(source_path) } else { os.getwd() }
+	return raw_path, os.real_path(os.join_path_single(base_dir, rel_path))
+}
+
+fn (mut t Transformer) transform_embed_file_comptime_expr(expr ast.ComptimeExpr, args []ast.Expr) ast.Expr {
+	if args.len == 0 {
+		return expr
+	}
+	raw_path := embed_file_string_arg(args[0]) or { return expr }
+	rpath, apath := t.resolve_embed_file_paths(raw_path, expr.pos)
+	file_bytes := os.read_bytes(apath) or { panic('embed_file: failed to read `${apath}`: ${err}') }
+	t.needed_embed_file_helper = true
+	return ast.InitExpr{
+		typ:    embed_file_helper_type_expr(expr.pos)
+		fields: [
+			ast.FieldInit{
+				name:  '_data'
+				value: ast.Expr(ast.StringLiteral{
+					kind:  .v
+					value: quote_v_bytes_literal(file_bytes)
+					pos:   expr.pos
+				})
+			},
+			ast.FieldInit{
+				name:  'len'
+				value: ast.Expr(ast.BasicLiteral{
+					kind:  .number
+					value: file_bytes.len.str()
+					pos:   expr.pos
+				})
+			},
+			ast.FieldInit{
+				name:  'path'
+				value: ast.Expr(ast.StringLiteral{
+					kind:  .v
+					value: quote_v_string_literal(rpath)
+					pos:   expr.pos
+				})
+			},
+			ast.FieldInit{
+				name:  'apath'
+				value: ast.Expr(ast.StringLiteral{
+					kind:  .v
+					value: quote_v_string_literal(apath)
+					pos:   expr.pos
+				})
+			},
+		]
+		pos:    expr.pos
+	}
+}
+
 // push_smartcast adds a new smartcast context to the stack
 fn (mut t Transformer) push_smartcast(expr string, variant string, sumtype string) {
+	qualified_sumtype := t.qualify_type_name(sumtype)
 	t.smartcast_stack << SmartcastContext{
 		expr:         expr
 		variant:      variant
 		variant_full: variant // Default to same as variant
-		sumtype:      sumtype
+		sumtype:      qualified_sumtype
 	}
 }
 
 // push_smartcast_full adds a smartcast context with separate short and full variant names
 fn (mut t Transformer) push_smartcast_full(expr string, variant string, variant_full string, sumtype string) {
+	// Qualify the sumtype name so apply_smartcast_* can determine the module
+	// the sumtype lives in. e.g. 'Stmt' → 'ast__Stmt' when in builder module.
+	qualified_sumtype := t.qualify_type_name(sumtype)
 	t.smartcast_stack << SmartcastContext{
 		expr:         expr
 		variant:      variant
 		variant_full: variant_full
-		sumtype:      sumtype
+		sumtype:      qualified_sumtype
 	}
 }
 
@@ -353,6 +674,10 @@ fn (t &Transformer) cur_smartcast_variant() string {
 	return ''
 }
 
+pub fn (mut t Transformer) set_synth_pos_counter(val int) {
+	t.synth_pos_counter = val
+}
+
 // next_synth_pos returns a unique negative position for synthesized AST nodes
 fn (mut t Transformer) next_synth_pos() token.Pos {
 	id := t.synth_pos_counter
@@ -361,6 +686,33 @@ fn (mut t Transformer) next_synth_pos() token.Pos {
 		id:     id
 		offset: 0
 	}
+}
+
+fn (mut t Transformer) make_number_expr(value string) ast.Expr {
+	pos := t.next_synth_pos()
+	return ast.Expr(ast.BasicLiteral{
+		kind:  .number
+		value: value
+		pos:   pos
+	})
+}
+
+fn (mut t Transformer) make_infix_expr_at(op token.Token, lhs ast.Expr, rhs ast.Expr, pos token.Pos) ast.Expr {
+	infix_pos := if pos.id != 0 || pos.offset != 0 {
+		pos
+	} else {
+		t.next_synth_pos()
+	}
+	return ast.Expr(ast.InfixExpr{
+		op:  op
+		lhs: lhs
+		rhs: rhs
+		pos: infix_pos
+	})
+}
+
+fn (mut t Transformer) make_infix_expr(op token.Token, lhs ast.Expr, rhs ast.Expr) ast.Expr {
+	return t.make_infix_expr_at(op, lhs, rhs, token.Pos{})
 }
 
 // synth_selector creates a typed SelectorExpr with a unique synthesized position
@@ -385,8 +737,8 @@ fn (t &Transformer) is_var_enum(name string) ?string {
 	return none
 }
 
-// transform_files transforms all files and returns transformed copies
-pub fn (mut t Transformer) transform_files(files []ast.File) []ast.File {
+// pre_pass runs the sequential pre-pass: builds elided_fns and collects runtime const inits.
+pub fn (mut t Transformer) pre_pass(files []ast.File) {
 	// Pre-pass: scan all function declarations for conditional compilation attributes
 	// to build elided_fns set before transforming call sites
 	for file in files {
@@ -403,12 +755,30 @@ pub fn (mut t Transformer) transform_files(files []ast.File) []ast.File {
 		}
 	}
 	// Pre-pass: collect const declarations that require runtime initialization.
-	t.collect_runtime_const_inits(files)
-	mut result := []ast.File{cap: files.len}
-	for file in files {
-		result << t.transform_file(file)
+	if !t.is_eval_backend() {
+		t.collect_runtime_const_inits(files)
 	}
-	t.inject_runtime_const_init_fns(mut result)
+	// Cache scope and method maps for lock-free access during transform.
+	t.cache_env_maps()
+}
+
+// cache_env_maps snapshots the shared Environment maps into plain maps
+// for lock-free access during parallel file transformation.
+fn (mut t Transformer) cache_env_maps() {
+	t.cached_scopes = t.env.snapshot_scopes()
+	t.cached_methods = t.env.snapshot_methods()
+	t.cached_fn_scopes = t.env.snapshot_fn_scopes()
+}
+
+// post_pass runs the sequential post-pass: injects runtime const init fns, generated functions,
+// test main, live reload, and propagates types.
+pub fn (mut t Transformer) post_pass(mut result []ast.File) {
+	if !t.is_eval_backend() {
+		t.inject_runtime_const_init_fns(mut result)
+	}
+	if t.needed_embed_file_helper {
+		t.inject_embed_file_helper(mut result)
+	}
 	// Generate auto helper functions. Split into two groups:
 	// 1. Core functions (for standard types like string, int, etc.) go in the builtin
 	//    module file because cached builtin.o/vlib.o reference them. They must always
@@ -420,6 +790,9 @@ pub fn (mut t Transformer) transform_files(files []ast.File) []ast.File {
 	if t.needed_str_fns.len > 0 {
 		generated_fns << t.generate_str_functions()
 	}
+	if t.needed_clone_fns.len > 0 {
+		generated_fns << t.generate_clone_functions()
+	}
 	if t.needed_sort_fns.len > 0 {
 		generated_fns << t.generate_sort_comparator_functions()
 	}
@@ -427,17 +800,34 @@ pub fn (mut t Transformer) transform_files(files []ast.File) []ast.File {
 		|| t.needed_array_last_index_fns.len > 0 {
 		generated_fns << t.generate_array_method_functions()
 	}
+	if t.needed_go_wrappers.len > 0 {
+		generated_fns << t.generate_go_wrapper_functions()
+	}
 	if generated_fns.len > 0 {
-		// Split into core (builtin types) and user (custom types)
+		// Split into core (builtin types), module-specific, and user (main) functions
 		mut core_fns := []ast.Stmt{}
 		mut user_fns := []ast.Stmt{}
+		mut module_fns := map[string][]ast.Stmt{}
 		for gf in generated_fns {
 			mut is_core := false
+			mut fn_module := ''
 			if gf is ast.FnDecl {
 				is_core = is_core_generated_fn(gf.name)
+				if !is_core {
+					// Check if function name has a module prefix (e.g., time__FormatDate__str)
+					// Extract module name and route to correct module file.
+					fn_module = generated_fn_module(gf.name, result)
+				}
 			}
 			if is_core {
 				core_fns << gf
+			} else if fn_module != '' {
+				// Workaround for ARM64 chained-access bug:
+				// module_fns[fn_module] << gf would append to a copy, not the original.
+				// Read into local, append, write back.
+				mut arr := module_fns[fn_module]
+				arr << gf
+				module_fns[fn_module] = arr
 			} else {
 				user_fns << gf
 			}
@@ -470,6 +860,38 @@ pub fn (mut t Transformer) transform_files(files []ast.File) []ast.File {
 			} else {
 				// No builtin file: add to user_fns as fallback
 				user_fns << core_fns
+			}
+		}
+		// Place module-specific functions in their source module files
+		for mod_name, fns in module_fns {
+			mut mod_idx := -1
+			for i, file in result {
+				if file.mod == mod_name {
+					mod_idx = i
+					break
+				}
+			}
+			if mod_idx >= 0 {
+				file := result[mod_idx]
+				mut new_stmts := []ast.Stmt{cap: file.stmts.len + fns.len}
+				for stmt in file.stmts {
+					new_stmts << stmt
+				}
+				for fn_decl in fns {
+					new_stmts << fn_decl
+				}
+				result[mod_idx] = ast.File{
+					attributes: file.attributes
+					mod:        file.mod
+					name:       file.name
+					stmts:      new_stmts
+					imports:    file.imports
+				}
+			} else {
+				// Module file not found: fall back to user_fns
+				for fn_decl in fns {
+					user_fns << fn_decl
+				}
 			}
 		}
 		// Place user-type functions in the main module file
@@ -514,9 +936,190 @@ pub fn (mut t Transformer) transform_files(files []ast.File) []ast.File {
 			}
 		}
 	}
-	t.inject_test_main(mut result)
-	t.inject_main_runtime_const_init_calls(mut result)
+	if t.pref == unsafe { nil } || t.pref.backend != .cleanc {
+		t.inject_test_main(mut result)
+	}
+	if !t.is_eval_backend() {
+		t.inject_main_runtime_const_init_calls(mut result)
+	}
+	if t.pref != unsafe { nil } && (t.pref.backend == .arm64 || t.pref.backend == .x64) {
+		t.inject_live_reload(mut result)
+	}
+	// Apply accumulated synth types to the environment.
+	// Must happen after all generation steps since they also create synth types.
+	for id, typ in t.synth_types {
+		t.env.set_expr_type(id, typ)
+	}
+	// Push cached_fn_scopes back to the environment for prop_types.
+	lock t.env.fn_scopes {
+		fn_scope_keys := t.cached_fn_scopes.keys()
+		for k in fn_scope_keys {
+			v := t.cached_fn_scopes[k] or { continue }
+			t.env.fn_scopes[k] = v
+		}
+	}
 	t.propagate_types(result)
+}
+
+fn embed_file_helper_receiver() ast.Parameter {
+	return ast.Parameter{
+		name: 'ed'
+		typ:  embed_file_helper_type_expr(token.Pos{})
+	}
+}
+
+fn embed_file_helper_selector(field_name string) ast.Expr {
+	return ast.Expr(ast.SelectorExpr{
+		lhs: ast.Expr(ast.Ident{
+			name: 'ed'
+		})
+		rhs: ast.Ident{
+			name: field_name
+		}
+	})
+}
+
+fn embed_file_helper_method(name string, return_type ast.Expr, body []ast.Stmt) ast.Stmt {
+	return ast.Stmt(ast.FnDecl{
+		is_public: true
+		is_method: true
+		receiver:  embed_file_helper_receiver()
+		name:      name
+		typ:       ast.FnType{
+			return_type: return_type
+		}
+		stmts:     body
+	})
+}
+
+fn embed_file_helper_stmts() []ast.Stmt {
+	return [
+		ast.Stmt(ast.StructDecl{
+			is_public: true
+			name:      embed_file_helper_type_name
+			fields:    [
+				ast.FieldDecl{
+					name: '_data'
+					typ:  ast.Expr(ast.Ident{
+						name: 'string'
+					})
+				},
+				ast.FieldDecl{
+					name: 'len'
+					typ:  ast.Expr(ast.Ident{
+						name: 'int'
+					})
+				},
+				ast.FieldDecl{
+					name: 'path'
+					typ:  ast.Expr(ast.Ident{
+						name: 'string'
+					})
+				},
+				ast.FieldDecl{
+					name: 'apath'
+					typ:  ast.Expr(ast.Ident{
+						name: 'string'
+					})
+				},
+			]
+		}),
+		embed_file_helper_method('to_string', ast.Expr(ast.Ident{
+			name: 'string'
+		}), [
+			ast.Stmt(ast.ReturnStmt{
+				exprs: [embed_file_helper_selector('_data')]
+			}),
+		]),
+		embed_file_helper_method('to_bytes', ast.Expr(ast.Type(ast.ArrayType{
+			elem_type: ast.Expr(ast.Ident{
+				name: 'u8'
+			})
+		})), [
+			ast.Stmt(ast.ReturnStmt{
+				exprs: [
+					ast.Expr(ast.CallExpr{
+						lhs: ast.Expr(ast.SelectorExpr{
+							lhs: embed_file_helper_selector('_data')
+							rhs: ast.Ident{
+								name: 'bytes'
+							}
+						})
+					}),
+				]
+			}),
+		]),
+		embed_file_helper_method('data', ast.Expr(ast.PrefixExpr{
+			op:   .amp
+			expr: ast.Expr(ast.Ident{
+				name: 'u8'
+			})
+		}), [
+			ast.Stmt(ast.ReturnStmt{
+				exprs: [
+					ast.Expr(ast.SelectorExpr{
+						lhs: embed_file_helper_selector('_data')
+						rhs: ast.Ident{
+							name: 'str'
+						}
+					}),
+				]
+			}),
+		]),
+		embed_file_helper_method('free', ast.empty_expr, []ast.Stmt{}),
+		embed_file_helper_method('str', ast.Expr(ast.Ident{
+			name: 'string'
+		}), [
+			ast.Stmt(ast.ReturnStmt{
+				exprs: [
+					embed_file_helper_selector('path'),
+				]
+			}),
+		]),
+	]
+}
+
+fn (mut t Transformer) inject_embed_file_helper(mut result []ast.File) {
+	mut builtin_idx := -1
+	for i, file in result {
+		if file.mod == 'builtin' {
+			builtin_idx = i
+			break
+		}
+	}
+	if builtin_idx < 0 {
+		return
+	}
+	file := result[builtin_idx]
+	for stmt in file.stmts {
+		if stmt is ast.StructDecl && stmt.name == embed_file_helper_type_name {
+			return
+		}
+	}
+	mut new_stmts := []ast.Stmt{cap: file.stmts.len + 6}
+	for stmt in file.stmts {
+		new_stmts << stmt
+	}
+	for stmt in embed_file_helper_stmts() {
+		new_stmts << stmt
+	}
+	result[builtin_idx] = ast.File{
+		attributes: file.attributes
+		mod:        file.mod
+		name:       file.name
+		stmts:      new_stmts
+		imports:    file.imports
+	}
+}
+
+// transform_files transforms all files and returns transformed copies
+pub fn (mut t Transformer) transform_files(files []ast.File) []ast.File {
+	t.pre_pass(files)
+	mut result := []ast.File{cap: files.len}
+	for file in files {
+		result << t.transform_file(file)
+	}
+	t.post_pass(mut result)
 	return result
 }
 
@@ -533,9 +1136,147 @@ fn runtime_const_init_call_name(mod string, fn_name string) string {
 	return fn_name
 }
 
+fn (mut t Transformer) record_runtime_const_init(mod string, name string, expr ast.Expr, mut known map[string]map[string]bool) {
+	if name == '' {
+		return
+	}
+	mut mod_names := if mod in known {
+		known[mod].clone()
+	} else {
+		map[string]bool{}
+	}
+	if name in mod_names {
+		return
+	}
+	mod_names[name] = true
+	known[mod] = mod_names.clone()
+	if mod !in t.runtime_const_inits_by_mod {
+		t.runtime_const_modules << mod
+	}
+	mut inits := t.runtime_const_inits_by_mod[mod] or { []RuntimeConstInit{} }
+	inits << RuntimeConstInit{
+		name: name
+		expr: expr
+	}
+	t.runtime_const_inits_by_mod[mod] = inits
+}
+
+fn (t &Transformer) expr_depends_on_runtime_const(expr ast.Expr, mod string, known map[string]map[string]bool) bool {
+	match expr {
+		ast.Ident {
+			if mod_names := known[mod] {
+				return expr.name in mod_names
+			}
+			return false
+		}
+		ast.SelectorExpr {
+			if t.expr_depends_on_runtime_const(expr.lhs, mod, known) {
+				return true
+			}
+			if expr.lhs is ast.Ident {
+				if mod_names := known[expr.lhs.name] {
+					return expr.rhs.name in mod_names
+				}
+			}
+			return false
+		}
+		ast.CallExpr {
+			if t.expr_depends_on_runtime_const(expr.lhs, mod, known) {
+				return true
+			}
+			for arg in expr.args {
+				if t.expr_depends_on_runtime_const(arg, mod, known) {
+					return true
+				}
+			}
+			return false
+		}
+		ast.CallOrCastExpr {
+			return t.expr_depends_on_runtime_const(expr.lhs, mod, known)
+				|| t.expr_depends_on_runtime_const(expr.expr, mod, known)
+		}
+		ast.CastExpr {
+			return t.expr_depends_on_runtime_const(expr.expr, mod, known)
+		}
+		ast.ParenExpr {
+			return t.expr_depends_on_runtime_const(expr.expr, mod, known)
+		}
+		ast.PrefixExpr {
+			return t.expr_depends_on_runtime_const(expr.expr, mod, known)
+		}
+		ast.PostfixExpr {
+			return t.expr_depends_on_runtime_const(expr.expr, mod, known)
+		}
+		ast.ModifierExpr {
+			return t.expr_depends_on_runtime_const(expr.expr, mod, known)
+		}
+		ast.IndexExpr {
+			return t.expr_depends_on_runtime_const(expr.lhs, mod, known)
+				|| t.expr_depends_on_runtime_const(expr.expr, mod, known)
+		}
+		ast.InfixExpr {
+			return t.expr_depends_on_runtime_const(expr.lhs, mod, known)
+				|| t.expr_depends_on_runtime_const(expr.rhs, mod, known)
+		}
+		ast.IfExpr {
+			if t.expr_depends_on_runtime_const(expr.cond, mod, known)
+				|| t.expr_depends_on_runtime_const(expr.else_expr, mod, known) {
+				return true
+			}
+			for stmt in expr.stmts {
+				if stmt is ast.ExprStmt && t.expr_depends_on_runtime_const(stmt.expr, mod, known) {
+					return true
+				}
+			}
+			return false
+		}
+		ast.ArrayInitExpr {
+			for e in expr.exprs {
+				if t.expr_depends_on_runtime_const(e, mod, known) {
+					return true
+				}
+			}
+			return (expr.init !is ast.EmptyExpr
+				&& t.expr_depends_on_runtime_const(expr.init, mod, known))
+				|| (expr.len !is ast.EmptyExpr
+				&& t.expr_depends_on_runtime_const(expr.len, mod, known))
+				|| (expr.cap !is ast.EmptyExpr
+				&& t.expr_depends_on_runtime_const(expr.cap, mod, known))
+		}
+		ast.InitExpr {
+			for field in expr.fields {
+				if t.expr_depends_on_runtime_const(field.value, mod, known) {
+					return true
+				}
+			}
+			return false
+		}
+		ast.MapInitExpr {
+			for key in expr.keys {
+				if t.expr_depends_on_runtime_const(key, mod, known) {
+					return true
+				}
+			}
+			for val in expr.vals {
+				if t.expr_depends_on_runtime_const(val, mod, known) {
+					return true
+				}
+			}
+			return false
+		}
+		else {
+			return false
+		}
+	}
+}
+
 fn (mut t Transformer) collect_runtime_const_inits(files []ast.File) {
 	is_native := t.pref != unsafe { nil }
 		&& (t.pref.backend == .arm64 || t.pref.backend == .x64 || t.pref.backend == .c)
+	t.runtime_const_inits_by_mod.clear()
+	t.runtime_const_modules.clear()
+	t.runtime_const_init_fn_name.clear()
+	mut known := map[string]map[string]bool{}
 	for file in files {
 		for stmt in file.stmts {
 			if stmt is ast.ConstDecl {
@@ -543,15 +1284,29 @@ fn (mut t Transformer) collect_runtime_const_inits(files []ast.File) {
 					if !t.needs_runtime_const_init(field.value, is_native) {
 						continue
 					}
-					if file.mod !in t.runtime_const_inits_by_mod {
-						t.runtime_const_modules << file.mod
+					t.record_runtime_const_init(file.mod, field.name, field.value, mut known)
+				}
+			}
+		}
+	}
+	mut changed := true
+	for changed {
+		changed = false
+		for file in files {
+			for stmt in file.stmts {
+				if stmt is ast.ConstDecl {
+					for field in stmt.fields {
+						if mod_names := known[file.mod] {
+							if field.name in mod_names {
+								continue
+							}
+						}
+						if !t.expr_depends_on_runtime_const(field.value, file.mod, known) {
+							continue
+						}
+						t.record_runtime_const_init(file.mod, field.name, field.value, mut known)
+						changed = true
 					}
-					mut inits := t.runtime_const_inits_by_mod[file.mod] or { []RuntimeConstInit{} }
-					inits << RuntimeConstInit{
-						name: field.name
-						expr: field.value
-					}
-					t.runtime_const_inits_by_mod[file.mod] = inits
 				}
 			}
 		}
@@ -559,15 +1314,40 @@ fn (mut t Transformer) collect_runtime_const_inits(files []ast.File) {
 }
 
 // needs_runtime_const_init checks whether a const initializer requires runtime
-// initialization.  For C/cleanc backends only call-expressions need it (the C
-// compiler can handle static array/struct initializers).  For SSA-based backends
-// (arm64, x64, c) array and map literals also need runtime init because the SSA
-// builder cannot embed them in the data segment.
+// initialization. For C/cleanc backends, direct calls and value-position if
+// expressions need it because they cannot be emitted as C compile-time
+// constants. For SSA-based backends (arm64, x64, c), array and map literals
+// also need runtime init because the SSA builder cannot embed them in the data
+// segment.
 fn (t &Transformer) needs_runtime_const_init(expr ast.Expr, is_native bool) bool {
 	if t.contains_call_expr(expr) {
 		return true
 	}
+	if expr is ast.IfExpr {
+		return true
+	}
+	// CallOrCastExpr: distinguish function calls from type casts.
+	// Function calls (lowercase lhs, not a primitive type) need runtime init.
+	// Type casts (uppercase lhs like IError(...), or primitives like int(...)) are compile-time.
+	if expr is ast.CallOrCastExpr {
+		if is_native {
+			return true
+		}
+		if expr.lhs is ast.Ident {
+			name := expr.lhs.name
+			if name.len > 0 && name[0] >= `a` && name[0] <= `z`
+				&& name !in ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'f32', 'f64', 'bool', 'rune', 'isize', 'usize', 'byte', 'voidptr', 'charptr', 'byteptr', 'string'] {
+				return true
+			}
+		} else if expr.lhs is ast.SelectorExpr {
+			// Module-qualified call like module.func(...)
+			return true
+		}
+	}
 	if is_native {
+		if expr is ast.CastExpr {
+			return true
+		}
 		if expr is ast.ArrayInitExpr {
 			return true
 		}
@@ -596,12 +1376,23 @@ fn (mut t Transformer) transform_expr_in_module(mod string, expr ast.Expr) ast.E
 fn (mut t Transformer) runtime_const_init_fn_stmt(mod string, fn_name string, inits []RuntimeConstInit) ast.Stmt {
 	mut stmts := []ast.Stmt{cap: inits.len}
 	for item in inits {
+		saved_pending := t.pending_stmts.clone()
+		t.pending_stmts.clear()
+		old_skip_if := t.skip_if_value_lowering
+		t.skip_if_value_lowering = true
+		transformed_expr := t.transform_expr_in_module(mod, item.expr)
+		t.skip_if_value_lowering = old_skip_if
+		generated_pending := t.pending_stmts.clone()
+		t.pending_stmts = saved_pending
+		for pending_stmt in generated_pending {
+			stmts << pending_stmt
+		}
 		stmts << ast.AssignStmt{
 			op:  .assign
 			lhs: [ast.Expr(ast.Ident{
 				name: item.name
 			})]
-			rhs: [t.transform_expr_in_module(mod, item.expr)]
+			rhs: [transformed_expr]
 		}
 	}
 	return ast.Stmt(ast.FnDecl{
@@ -609,6 +1400,166 @@ fn (mut t Transformer) runtime_const_init_fn_stmt(mod string, fn_name string, in
 		typ:   ast.FnType{}
 		stmts: stmts
 	})
+}
+
+fn (t &Transformer) collect_ident_names_in_expr(expr ast.Expr, mut names map[string]bool) {
+	match expr {
+		ast.Ident {
+			if expr.name != '' {
+				names[expr.name] = true
+			}
+		}
+		ast.SelectorExpr {
+			t.collect_ident_names_in_expr(expr.lhs, mut names)
+		}
+		ast.InfixExpr {
+			t.collect_ident_names_in_expr(expr.lhs, mut names)
+			t.collect_ident_names_in_expr(expr.rhs, mut names)
+		}
+		ast.ParenExpr {
+			t.collect_ident_names_in_expr(expr.expr, mut names)
+		}
+		ast.PrefixExpr {
+			t.collect_ident_names_in_expr(expr.expr, mut names)
+		}
+		ast.PostfixExpr {
+			t.collect_ident_names_in_expr(expr.expr, mut names)
+		}
+		ast.ModifierExpr {
+			t.collect_ident_names_in_expr(expr.expr, mut names)
+		}
+		ast.CastExpr {
+			t.collect_ident_names_in_expr(expr.expr, mut names)
+		}
+		ast.CallExpr {
+			t.collect_ident_names_in_expr(expr.lhs, mut names)
+			for arg in expr.args {
+				t.collect_ident_names_in_expr(arg, mut names)
+			}
+		}
+		ast.CallOrCastExpr {
+			t.collect_ident_names_in_expr(expr.lhs, mut names)
+			t.collect_ident_names_in_expr(expr.expr, mut names)
+		}
+		ast.IfExpr {
+			t.collect_ident_names_in_expr(expr.cond, mut names)
+			t.collect_ident_names_in_expr(expr.else_expr, mut names)
+			for stmt in expr.stmts {
+				if stmt is ast.ExprStmt {
+					t.collect_ident_names_in_expr(stmt.expr, mut names)
+				}
+			}
+		}
+		ast.IndexExpr {
+			t.collect_ident_names_in_expr(expr.lhs, mut names)
+			t.collect_ident_names_in_expr(expr.expr, mut names)
+		}
+		ast.ArrayInitExpr {
+			for e in expr.exprs {
+				t.collect_ident_names_in_expr(e, mut names)
+			}
+			if expr.init !is ast.EmptyExpr {
+				t.collect_ident_names_in_expr(expr.init, mut names)
+			}
+			if expr.len !is ast.EmptyExpr {
+				t.collect_ident_names_in_expr(expr.len, mut names)
+			}
+			if expr.cap !is ast.EmptyExpr {
+				t.collect_ident_names_in_expr(expr.cap, mut names)
+			}
+		}
+		ast.InitExpr {
+			for field in expr.fields {
+				t.collect_ident_names_in_expr(field.value, mut names)
+			}
+		}
+		ast.MapInitExpr {
+			for key in expr.keys {
+				t.collect_ident_names_in_expr(key, mut names)
+			}
+			for val in expr.vals {
+				t.collect_ident_names_in_expr(val, mut names)
+			}
+		}
+		else {}
+	}
+}
+
+fn (t &Transformer) order_runtime_const_inits(inits []RuntimeConstInit) []RuntimeConstInit {
+	if inits.len < 2 {
+		return inits
+	}
+	// Use maps instead of parallel arrays to avoid ARM64 stack corruption
+	// when multiple local arrays interact with array_set operations.
+	mut index_by_name := map[string]int{}
+	for i, item in inits {
+		if item.name !in index_by_name {
+			index_by_name[item.name] = i
+		}
+	}
+	mut indegree := map[int]int{}
+	mut dependents := map[int][]int{}
+	for i, item in inits {
+		mut ident_names := map[string]bool{}
+		t.collect_ident_names_in_expr(item.expr, mut ident_names)
+		for dep_name, _ in ident_names {
+			if dep_name == item.name {
+				continue
+			}
+			if dep_idx := index_by_name[dep_name] {
+				mut dep := dependents[dep_idx] or { []int{} }
+				dep << i
+				dependents[dep_idx] = dep
+				indegree[i] = (indegree[i] or { 0 }) + 1
+			}
+		}
+	}
+	mut ready := []int{}
+	for i := 0; i < inits.len; i++ {
+		deg := indegree[i] or { 0 }
+		if deg == 0 {
+			ready << i
+		}
+	}
+	mut ordered_idx := []int{cap: inits.len}
+	for ready.len > 0 {
+		// Prefer non-call initializers first when dependency order allows it.
+		mut best_pos := 0
+		for pos := 1; pos < ready.len; pos++ {
+			a := ready[pos]
+			b := ready[best_pos]
+			a_has_call := t.contains_call_expr(inits[a].expr)
+			b_has_call := t.contains_call_expr(inits[b].expr)
+			if a_has_call != b_has_call {
+				if !a_has_call && b_has_call {
+					best_pos = pos
+				}
+				continue
+			}
+			if a < b {
+				best_pos = pos
+			}
+		}
+		cur := ready[best_pos]
+		ready.delete(best_pos)
+		ordered_idx << cur
+		deps := dependents[cur] or { []int{} }
+		for dep in deps {
+			indegree[dep] = (indegree[dep] or { 0 }) - 1
+			deg := indegree[dep] or { 0 }
+			if deg == 0 {
+				ready << dep
+			}
+		}
+	}
+	if ordered_idx.len != inits.len {
+		return inits
+	}
+	mut ordered := []RuntimeConstInit{cap: inits.len}
+	for idx in ordered_idx {
+		ordered << inits[idx]
+	}
+	return ordered
 }
 
 fn (mut t Transformer) inject_runtime_const_init_fns(mut files []ast.File) {
@@ -619,7 +1570,8 @@ fn (mut t Transformer) inject_runtime_const_init_fns(mut files []ast.File) {
 		}
 		fn_name := runtime_const_init_base_name(mod)
 		t.runtime_const_init_fn_name[mod] = fn_name
-		fn_stmt := t.runtime_const_init_fn_stmt(mod, fn_name, inits)
+		ordered_inits := t.order_runtime_const_inits(inits)
+		fn_stmt := t.runtime_const_init_fn_stmt(mod, fn_name, ordered_inits)
 		for i, file in files {
 			if file.mod != mod {
 				continue
@@ -830,10 +1782,7 @@ fn (mut t Transformer) transform_file(file ast.File) ast.File {
 		t.scope = unsafe { nil }
 	}
 
-	mut stmts := []ast.Stmt{cap: file.stmts.len}
-	for stmt in file.stmts {
-		stmts << t.transform_stmt(stmt)
-	}
+	stmts := t.transform_stmts(file.stmts)
 	return ast.File{
 		attributes: file.attributes
 		mod:        file.mod
@@ -867,8 +1816,20 @@ fn (mut t Transformer) transform_stmt(stmt ast.Stmt) ast.Stmt {
 			}
 		}
 		ast.ComptimeStmt {
-			// Unwrap ComptimeStmt - the inner stmt is transformed directly
-			t.transform_stmt(stmt.stmt)
+			// Keep ComptimeStmt wrapper for $for — cleanc handles it at codegen time
+			if stmt.stmt is ast.ForStmt {
+				for_stmt := stmt.stmt as ast.ForStmt
+				ast.Stmt(ast.ComptimeStmt{
+					stmt: ast.Stmt(ast.ForStmt{
+						init:  for_stmt.init
+						cond:  for_stmt.cond
+						post:  for_stmt.post
+						stmts: t.transform_stmts(for_stmt.stmts)
+					})
+				})
+			} else {
+				t.transform_stmt(stmt.stmt)
+			}
 		}
 		ast.DeferStmt {
 			ast.DeferStmt{
@@ -899,6 +1860,12 @@ fn (mut t Transformer) transform_stmt(stmt ast.Stmt) ast.Stmt {
 		ast.ForInStmt {
 			t.transform_for_in_stmt(stmt)
 		}
+		ast.LabelStmt {
+			ast.LabelStmt{
+				name: stmt.name
+				stmt: t.transform_stmt(stmt.stmt)
+			}
+		}
 		ast.ReturnStmt {
 			t.transform_return_stmt(stmt)
 		}
@@ -920,12 +1887,62 @@ fn (mut t Transformer) transform_stmt(stmt ast.Stmt) ast.Stmt {
 	}
 }
 
+fn (mut t Transformer) append_transformed_stmt(mut result []ast.Stmt, stmt ast.Stmt) {
+	transformed := t.transform_stmt(stmt)
+	if t.pending_stmts.len > 0 {
+		for ps in t.pending_stmts {
+			result << ps
+		}
+		t.pending_stmts.clear()
+	}
+	result << transformed
+}
+
 fn (mut t Transformer) transform_stmts(stmts []ast.Stmt) []ast.Stmt {
 	mut result := []ast.Stmt{cap: stmts.len}
 	is_native_be := t.pref != unsafe { nil } && (t.pref.backend == .arm64 || t.pref.backend == .x64)
 	for stmt in stmts {
 		// Check for OrExpr assignment that expands to multiple statements
 		if stmt is ast.AssignStmt {
+			// Expand comptime $if assignment: `mut res := $if flag ? { expr1 } $else { stmts... ; expr_n }`
+			// When the selected branch has multiple statements, inline the statements and use
+			// the last expression as the assignment RHS.
+			if stmt.rhs.len == 1 && stmt.rhs[0] is ast.ComptimeExpr {
+				comptime_expr := stmt.rhs[0] as ast.ComptimeExpr
+				if comptime_expr.expr is ast.IfExpr {
+					comptime_if := comptime_expr.expr as ast.IfExpr
+					if !t.can_eval_comptime_cond(comptime_if.cond) {
+						t.append_transformed_stmt(mut result, stmt)
+						continue
+					}
+					selected := t.resolve_comptime_if_stmts(comptime_if)
+					if selected.len > 0 {
+						// Inline all but the last statement
+						for i := 0; i < selected.len - 1; i++ {
+							t.append_transformed_stmt(mut result, selected[i])
+						}
+						// Use the last statement's expression as the assignment RHS
+						last_stmt := selected[selected.len - 1]
+						if last_stmt is ast.ExprStmt {
+							t.append_transformed_stmt(mut result, ast.Stmt(ast.AssignStmt{
+								op:  stmt.op
+								lhs: stmt.lhs
+								rhs: [t.transform_expr(last_stmt.expr)]
+								pos: stmt.pos
+							}))
+							continue
+						} else if last_stmt is ast.AssignStmt {
+							t.append_transformed_stmt(mut result, ast.Stmt(ast.AssignStmt{
+								op:  stmt.op
+								lhs: stmt.lhs
+								rhs: last_stmt.rhs
+								pos: stmt.pos
+							}))
+							continue
+						}
+					}
+				}
+			}
 			// Native backends (arm64/x64): lower interface casts.
 			// `shape1 := Shape(rect)` → `shape1 := rect` and record concrete type mapping.
 			if is_native_be && stmt.rhs.len == 1 && stmt.lhs.len == 1 && stmt.lhs[0] is ast.Ident
@@ -937,25 +1954,89 @@ fn (mut t Transformer) transform_stmts(stmts []ast.Stmt) []ast.Stmt {
 					t.interface_concrete_types[lhs_name] = concrete
 				}
 				// Replace the interface cast with just the inner value
-				result << t.transform_stmt(ast.AssignStmt{
+				t.append_transformed_stmt(mut result, ast.Stmt(ast.AssignStmt{
 					op:  stmt.op
 					lhs: stmt.lhs
 					rhs: [rhs_cast.expr]
 					pos: stmt.pos
-				})
+				}))
 				continue
+			}
+			// Native backends: expand sincos(x) → sin(x), cos(x) since sincos uses
+			// ChebSeries struct constants that aren't initialized by the native backend.
+			// The separate sin/cos functions use C library calls via .c.v overrides.
+			if is_native_be && stmt.lhs.len >= 2 && stmt.rhs.len == 1 {
+				if sincos_arg := t.try_extract_sincos_arg(stmt.rhs[0]) {
+					lhs0 := stmt.lhs[0]
+					lhs1 := stmt.lhs[1]
+					is_blank0 := lhs0 is ast.Ident && (lhs0 as ast.Ident).name == '_'
+					is_blank1 := lhs1 is ast.Ident && (lhs1 as ast.Ident).name == '_'
+					if !is_blank0 {
+						t.append_transformed_stmt(mut result, ast.Stmt(ast.AssignStmt{
+							op:  stmt.op
+							lhs: [lhs0]
+							rhs: [
+								ast.Expr(ast.CallExpr{
+									lhs:  ast.Expr(ast.Ident{
+										name: 'sin'
+									})
+									args: [sincos_arg]
+									pos:  stmt.pos
+								}),
+							]
+							pos: stmt.pos
+						}))
+					}
+					if !is_blank1 {
+						t.append_transformed_stmt(mut result, ast.Stmt(ast.AssignStmt{
+							op:  stmt.op
+							lhs: [lhs1]
+							rhs: [
+								ast.Expr(ast.CallExpr{
+									lhs:  ast.Expr(ast.Ident{
+										name: 'cos'
+									})
+									args: [sincos_arg]
+									pos:  stmt.pos
+								}),
+							]
+							pos: stmt.pos
+						}))
+					}
+					continue
+				}
 			}
 			if expanded_or_assign := t.try_expand_or_expr_assign_stmts(stmt) {
 				// Note: expand_direct_or_expr_assign already transforms expressions internally,
 				// so we don't call transform_stmt again to avoid double transformation
 				// (which would cause smartcasts to be applied twice)
+				if t.pending_stmts.len > 0 {
+					for ps in t.pending_stmts {
+						result << ps
+					}
+					t.pending_stmts.clear()
+				}
 				result << expanded_or_assign
+				continue
+			}
+			// Check for tuple if-expression: x, y, w, h := if cond { a, b, c, d } else { e, f, g, h }
+			if expanded_tuple_if := t.try_expand_tuple_if_assign_stmts(stmt) {
+				for exp_stmt in expanded_tuple_if {
+					t.append_transformed_stmt(mut result, exp_stmt)
+				}
+				continue
+			}
+			// Lower multi-value call assignment: a, b = call() → _tuple_t = call(); a = _tuple_t.arg0; b = _tuple_t.arg1
+			if expanded_tuple_call := t.try_expand_tuple_call_assign(stmt) {
+				for exp_stmt in expanded_tuple_call {
+					t.append_transformed_stmt(mut result, exp_stmt)
+				}
 				continue
 			}
 			// Check for if-guard expression: x := if r := map[key] { r } else { default }
 			if expanded_if_guard_assign := t.try_expand_if_guard_assign_stmts(stmt) {
 				for exp_stmt in expanded_if_guard_assign {
-					result << t.transform_stmt(exp_stmt)
+					t.append_transformed_stmt(mut result, exp_stmt)
 				}
 				continue
 			}
@@ -963,7 +2044,7 @@ fn (mut t Transformer) transform_stmts(stmts []ast.Stmt) []ast.Stmt {
 			// Transform to a statement-form if that assigns in each branch.
 			if expanded_if_expr_assign := t.try_expand_if_expr_assign_stmts(stmt) {
 				for exp_stmt in expanded_if_expr_assign {
-					result << t.transform_stmt(exp_stmt)
+					t.append_transformed_stmt(mut result, exp_stmt)
 				}
 				continue
 			}
@@ -972,12 +2053,22 @@ fn (mut t Transformer) transform_stmts(stmts []ast.Stmt) []ast.Stmt {
 		if stmt is ast.ExprStmt {
 			if stmt.expr is ast.ComptimeExpr {
 				if stmt.expr.expr is ast.IfExpr {
-					selected := t.resolve_comptime_if_stmts(stmt.expr.expr)
-					// Process through transform_stmts to handle nested $if blocks
-					transformed := t.transform_stmts(selected)
-					for s in transformed {
-						result << s
+					if t.can_eval_comptime_cond(stmt.expr.expr.cond) {
+						selected := t.resolve_comptime_if_stmts(stmt.expr.expr)
+						// Process through transform_stmts to handle nested $if blocks
+						transformed := t.transform_stmts(selected)
+						for s in transformed {
+							result << s
+						}
+						continue
 					}
+					// Can't evaluate — transform body stmts and keep the comptime wrapper
+					transformed_comptime := t.transform_comptime_if_bodies(stmt.expr.expr)
+					result << ast.Stmt(ast.ExprStmt{
+						expr: ast.Expr(ast.ComptimeExpr{
+							expr: ast.Expr(transformed_comptime)
+						})
+					})
 					continue
 				}
 			}
@@ -988,6 +2079,12 @@ fn (mut t Transformer) transform_stmts(stmts []ast.Stmt) []ast.Stmt {
 				// Note: expand_single_or_expr already transforms expressions internally,
 				// so we don't call transform_stmt again to avoid double transformation
 				// (which would cause interface method _object to be added twice)
+				if t.pending_stmts.len > 0 {
+					for ps in t.pending_stmts {
+						result << ps
+					}
+					t.pending_stmts.clear()
+				}
 				result << expanded_or_stmt
 				continue
 			}
@@ -1036,7 +2133,7 @@ fn (mut t Transformer) transform_stmts(stmts []ast.Stmt) []ast.Stmt {
 			// Into: if cond { return a } else { return b }
 			if expanded_return_if := t.try_expand_return_if_expr(stmt) {
 				for exp_stmt in expanded_return_if {
-					result << t.transform_stmt(exp_stmt)
+					t.append_transformed_stmt(mut result, exp_stmt)
 				}
 				continue
 			}
@@ -1044,7 +2141,13 @@ fn (mut t Transformer) transform_stmts(stmts []ast.Stmt) []ast.Stmt {
 		// Expand lock/rlock expressions into mutex lock/unlock calls around the body
 		if stmt is ast.ExprStmt {
 			if stmt.expr is ast.LockExpr {
-				result << t.expand_lock_expr(stmt.expr)
+				// Store in a temp variable to avoid double evaluation of expand_lock_expr.
+				// V1's C backend compiles `result << fn_call()` as
+				// `array__push_many(&result, fn_call().data, fn_call().len)` which calls
+				// the function twice, causing temp_counter to advance twice and generating
+				// mismatched variable IDs.
+				expanded_lock := t.expand_lock_expr(stmt.expr)
+				result << expanded_lock
 				continue
 			}
 			// Expand map[key] << value to get_and_set + array_push
@@ -1057,20 +2160,31 @@ fn (mut t Transformer) transform_stmts(stmts []ast.Stmt) []ast.Stmt {
 				result << expanded_map_postfix
 				continue
 			}
+			// For native backends, transform obj.field++ / obj.field-- to compound assignment
+			// to avoid the build_postfix code path which has issues in self-hosted binaries.
+			if t.pref.backend == .arm64 || t.pref.backend == .x64 {
+				if postfix_assign := t.try_transform_selector_postfix(stmt) {
+					result << postfix_assign
+					continue
+				}
+			}
 		}
 		// Check for map iteration expansion
 		if stmt is ast.ForStmt {
 			if expanded_for_in_map := t.try_expand_for_in_map(stmt) {
 				for exp_stmt in expanded_for_in_map {
-					result << t.transform_stmt(exp_stmt)
+					t.append_transformed_stmt(mut result, exp_stmt)
 				}
 				continue
 			}
 		}
 		// Expand assert statements into if + eprintln + exit
 		if stmt is ast.AssertStmt {
-			for exp_stmt in t.expand_assert_stmt(stmt) {
-				result << t.transform_stmt(exp_stmt)
+			// Store in temp variable to avoid V1 C backend double-evaluation of
+			// `for x in fn()` which calls fn() twice per iteration.
+			expanded_asserts := t.expand_assert_stmt(stmt)
+			for exp_stmt in expanded_asserts {
+				t.append_transformed_stmt(mut result, exp_stmt)
 				// Drain pending_stmts (e.g. from filter/map expansion in assert condition)
 				if t.pending_stmts.len > 0 {
 					last := result.pop()
@@ -1085,7 +2199,7 @@ fn (mut t Transformer) transform_stmts(stmts []ast.Stmt) []ast.Stmt {
 		}
 		// Transform the statement. Filter/map expression expansions may populate
 		// pending_stmts during this call, which must be hoisted before the result.
-		result << t.transform_stmt(stmt)
+		t.append_transformed_stmt(mut result, stmt)
 		if t.pending_stmts.len > 0 {
 			// Move the just-appended transformed statement to after pending_stmts.
 			last := result.pop()
@@ -1097,6 +2211,326 @@ fn (mut t Transformer) transform_stmts(stmts []ast.Stmt) []ast.Stmt {
 		}
 	}
 	return result
+}
+
+fn find_target_or_expr_path_in_stmts(stmts []ast.Stmt, target_id int, prefix string) ?string {
+	for i, stmt in stmts {
+		stmt_prefix := '${prefix}/stmt[${i}]:${stmt.type_name()}'
+		if path := find_target_or_expr_path_in_stmt(stmt, target_id, stmt_prefix) {
+			return path
+		}
+	}
+	return none
+}
+
+fn find_target_or_expr_path_in_stmt(stmt ast.Stmt, target_id int, prefix string) ?string {
+	match stmt {
+		ast.AssignStmt {
+			for i, lhs in stmt.lhs {
+				if path := find_target_or_expr_path_in_expr(lhs, target_id, '${prefix}/lhs[${i}]') {
+					return path
+				}
+			}
+			for i, rhs in stmt.rhs {
+				if path := find_target_or_expr_path_in_expr(rhs, target_id, '${prefix}/rhs[${i}]') {
+					return path
+				}
+			}
+		}
+		ast.BlockStmt {
+			return find_target_or_expr_path_in_stmts(stmt.stmts, target_id, prefix)
+		}
+		ast.ComptimeStmt {
+			return find_target_or_expr_path_in_stmt(stmt.stmt, target_id, prefix)
+		}
+		ast.DeferStmt {
+			return find_target_or_expr_path_in_stmts(stmt.stmts, target_id, prefix)
+		}
+		ast.ExprStmt {
+			return find_target_or_expr_path_in_expr(stmt.expr, target_id, '${prefix}/expr')
+		}
+		ast.ForStmt {
+			if path := find_target_or_expr_path_in_stmt(stmt.init, target_id, '${prefix}/init') {
+				return path
+			}
+			if path := find_target_or_expr_path_in_expr(stmt.cond, target_id, '${prefix}/cond') {
+				return path
+			}
+			if path := find_target_or_expr_path_in_stmt(stmt.post, target_id, '${prefix}/post') {
+				return path
+			}
+			return find_target_or_expr_path_in_stmts(stmt.stmts, target_id, prefix)
+		}
+		ast.ForInStmt {
+			if path := find_target_or_expr_path_in_expr(stmt.key, target_id, '${prefix}/key') {
+				return path
+			}
+			if path := find_target_or_expr_path_in_expr(stmt.value, target_id, '${prefix}/value') {
+				return path
+			}
+			if path := find_target_or_expr_path_in_expr(stmt.expr, target_id, '${prefix}/expr') {
+				return path
+			}
+		}
+		ast.ReturnStmt {
+			for i, expr in stmt.exprs {
+				if path := find_target_or_expr_path_in_expr(expr, target_id, '${prefix}/expr[${i}]') {
+					return path
+				}
+			}
+		}
+		ast.AssertStmt {
+			return find_target_or_expr_path_in_expr(stmt.expr, target_id, '${prefix}/expr')
+		}
+		else {}
+	}
+	return none
+}
+
+fn find_target_or_expr_path_in_expr(expr ast.Expr, target_id int, prefix string) ?string {
+	if !expr_has_valid_data(expr) {
+		return none
+	}
+	if expr is ast.OrExpr {
+		if expr.pos.id == target_id {
+			return '${prefix}/OrExpr'
+		}
+		if path := find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/inner') {
+			return path
+		}
+		return find_target_or_expr_path_in_stmts(expr.stmts, target_id, prefix)
+	}
+	match expr {
+		ast.ArrayInitExpr {
+			if path := find_target_or_expr_path_in_expr(expr.typ, target_id, '${prefix}/typ') {
+				return path
+			}
+			for i, inner in expr.exprs {
+				if path := find_target_or_expr_path_in_expr(inner, target_id,
+					'${prefix}/expr[${i}]')
+				{
+					return path
+				}
+			}
+			if path := find_target_or_expr_path_in_expr(expr.init, target_id, '${prefix}/init') {
+				return path
+			}
+			if path := find_target_or_expr_path_in_expr(expr.len, target_id, '${prefix}/len') {
+				return path
+			}
+			return find_target_or_expr_path_in_expr(expr.cap, target_id, '${prefix}/cap')
+		}
+		ast.AsCastExpr {
+			if path := find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr') {
+				return path
+			}
+			return find_target_or_expr_path_in_expr(expr.typ, target_id, '${prefix}/typ')
+		}
+		ast.AssocExpr {
+			if path := find_target_or_expr_path_in_expr(expr.typ, target_id, '${prefix}/typ') {
+				return path
+			}
+			if path := find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr') {
+				return path
+			}
+			for i, field in expr.fields {
+				if path := find_target_or_expr_path_in_expr(field.value, target_id,
+					'${prefix}/field[${i}]')
+				{
+					return path
+				}
+			}
+		}
+		ast.CallExpr {
+			if path := find_target_or_expr_path_in_expr(expr.lhs, target_id, '${prefix}/lhs') {
+				return path
+			}
+			for i, arg in expr.args {
+				if path := find_target_or_expr_path_in_expr(arg, target_id, '${prefix}/arg[${i}]') {
+					return path
+				}
+			}
+		}
+		ast.CallOrCastExpr {
+			if path := find_target_or_expr_path_in_expr(expr.lhs, target_id, '${prefix}/lhs') {
+				return path
+			}
+			return find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr')
+		}
+		ast.CastExpr {
+			if path := find_target_or_expr_path_in_expr(expr.typ, target_id, '${prefix}/typ') {
+				return path
+			}
+			return find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr')
+		}
+		ast.ComptimeExpr {
+			return find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr')
+		}
+		ast.FieldInit {
+			return find_target_or_expr_path_in_expr(expr.value, target_id, '${prefix}/value')
+		}
+		ast.FnLiteral {
+			return find_target_or_expr_path_in_stmts(expr.stmts, target_id, prefix)
+		}
+		ast.GenericArgs {
+			if path := find_target_or_expr_path_in_expr(expr.lhs, target_id, '${prefix}/lhs') {
+				return path
+			}
+			for i, arg in expr.args {
+				if path := find_target_or_expr_path_in_expr(arg, target_id, '${prefix}/arg[${i}]') {
+					return path
+				}
+			}
+		}
+		ast.GenericArgOrIndexExpr {
+			if path := find_target_or_expr_path_in_expr(expr.lhs, target_id, '${prefix}/lhs') {
+				return path
+			}
+			return find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr')
+		}
+		ast.IfExpr {
+			if path := find_target_or_expr_path_in_expr(expr.cond, target_id, '${prefix}/cond') {
+				return path
+			}
+			if path := find_target_or_expr_path_in_stmts(expr.stmts, target_id, prefix) {
+				return path
+			}
+			return find_target_or_expr_path_in_expr(expr.else_expr, target_id, '${prefix}/else')
+		}
+		ast.IfGuardExpr {
+			return find_target_or_expr_path_in_stmt(ast.Stmt(expr.stmt), target_id, prefix)
+		}
+		ast.IndexExpr {
+			if path := find_target_or_expr_path_in_expr(expr.lhs, target_id, '${prefix}/lhs') {
+				return path
+			}
+			return find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr')
+		}
+		ast.InfixExpr {
+			if path := find_target_or_expr_path_in_expr(expr.lhs, target_id, '${prefix}/lhs') {
+				return path
+			}
+			return find_target_or_expr_path_in_expr(expr.rhs, target_id, '${prefix}/rhs')
+		}
+		ast.InitExpr {
+			if path := find_target_or_expr_path_in_expr(expr.typ, target_id, '${prefix}/typ') {
+				return path
+			}
+			for i, field in expr.fields {
+				if path := find_target_or_expr_path_in_expr(field.value, target_id,
+					'${prefix}/field[${i}]')
+				{
+					return path
+				}
+			}
+		}
+		ast.KeywordOperator {
+			for i, inner in expr.exprs {
+				if path := find_target_or_expr_path_in_expr(inner, target_id,
+					'${prefix}/expr[${i}]')
+				{
+					return path
+				}
+			}
+		}
+		ast.LambdaExpr {
+			return find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr')
+		}
+		ast.LockExpr {
+			for i, inner in expr.lock_exprs {
+				if path := find_target_or_expr_path_in_expr(inner, target_id,
+					'${prefix}/lock[${i}]')
+				{
+					return path
+				}
+			}
+			for i, inner in expr.rlock_exprs {
+				if path := find_target_or_expr_path_in_expr(inner, target_id,
+					'${prefix}/rlock[${i}]')
+				{
+					return path
+				}
+			}
+			return find_target_or_expr_path_in_stmts(expr.stmts, target_id, prefix)
+		}
+		ast.MapInitExpr {
+			if path := find_target_or_expr_path_in_expr(expr.typ, target_id, '${prefix}/typ') {
+				return path
+			}
+			for i, inner in expr.keys {
+				if path := find_target_or_expr_path_in_expr(inner, target_id, '${prefix}/key[${i}]') {
+					return path
+				}
+			}
+			for i, inner in expr.vals {
+				if path := find_target_or_expr_path_in_expr(inner, target_id, '${prefix}/val[${i}]') {
+					return path
+				}
+			}
+		}
+		ast.MatchExpr {
+			if path := find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr') {
+				return path
+			}
+			for i, branch in expr.branches {
+				if path := find_target_or_expr_path_in_stmts(branch.stmts, target_id,
+					'${prefix}/branch[${i}]')
+				{
+					return path
+				}
+			}
+		}
+		ast.ModifierExpr {
+			return find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr')
+		}
+		ast.ParenExpr {
+			return find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr')
+		}
+		ast.PostfixExpr {
+			return find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr')
+		}
+		ast.PrefixExpr {
+			return find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr')
+		}
+		ast.SelectExpr {
+			if path := find_target_or_expr_path_in_stmt(expr.stmt, target_id, '${prefix}/stmt') {
+				return path
+			}
+			if path := find_target_or_expr_path_in_stmts(expr.stmts, target_id, prefix) {
+				return path
+			}
+			return find_target_or_expr_path_in_expr(expr.next, target_id, '${prefix}/next')
+		}
+		ast.SelectorExpr {
+			return find_target_or_expr_path_in_expr(expr.lhs, target_id, '${prefix}/lhs')
+		}
+		ast.SqlExpr {
+			return find_target_or_expr_path_in_expr(expr.expr, target_id, '${prefix}/expr')
+		}
+		ast.StringInterLiteral {
+			for i, inter in expr.inters {
+				if path := find_target_or_expr_path_in_expr(inter.expr, target_id,
+					'${prefix}/expr[${i}]')
+				{
+					return path
+				}
+			}
+		}
+		ast.Tuple {
+			for i, inner in expr.exprs {
+				if path := find_target_or_expr_path_in_expr(inner, target_id,
+					'${prefix}/expr[${i}]')
+				{
+					return path
+				}
+			}
+		}
+		ast.UnsafeExpr {
+			return find_target_or_expr_path_in_stmts(expr.stmts, target_id, prefix)
+		}
+		else {}
+	}
+	return none
 }
 
 fn (mut t Transformer) transform_const_decl(decl ast.ConstDecl) ast.ConstDecl {
@@ -1127,6 +2561,78 @@ fn (mut t Transformer) transform_global_decl(decl ast.GlobalDecl) ast.GlobalDecl
 		attributes: decl.attributes
 		fields:     fields
 	}
+}
+
+fn (_ &Transformer) get_tuple_lhs(stmt ast.AssignStmt) ?[]ast.Expr {
+	if stmt.lhs.len > 1 {
+		return stmt.lhs
+	}
+	if stmt.lhs.len == 1 && stmt.lhs[0] is ast.Tuple {
+		return (stmt.lhs[0] as ast.Tuple).exprs
+	}
+	return none
+}
+
+// try_expand_tuple_call_assign expands `a, b = call()` to:
+//   _tuple_tN := call()
+//   a = _tuple_tN.arg0
+//   b = _tuple_tN.arg1
+// This handles tuple-returning calls when cleanc can't resolve the tuple type.
+fn (mut t Transformer) try_expand_tuple_call_assign(stmt ast.AssignStmt) ?[]ast.Stmt {
+	tuple_lhs := t.get_tuple_lhs(stmt) or { return none }
+	n := tuple_lhs.len
+	if n < 2 {
+		return none
+	}
+	// Must have single RHS (a call expression or similar)
+	if stmt.rhs.len != 1 {
+		return none
+	}
+	// Skip if RHS is an IfExpr (handled by try_expand_tuple_if_assign_stmts)
+	if stmt.rhs[0] is ast.IfExpr {
+		return none
+	}
+	rhs_expr := stmt.rhs[0]
+	// Only handle when RHS is a call expression or postfix unwrap of a call
+	mut is_call := rhs_expr is ast.CallExpr
+	if rhs_expr is ast.PostfixExpr {
+		if rhs_expr.op in [.not, .question] {
+			is_call = rhs_expr.expr is ast.CallExpr
+		}
+	}
+	if !is_call {
+		return none
+	}
+	t.temp_counter++
+	tmp_name := '_tuple_t${t.temp_counter}'
+	tmp_ident := ast.Ident{
+		name: tmp_name
+	}
+	mut result := []ast.Stmt{cap: n + 1}
+	// Assign call result to temp variable
+	result << ast.Stmt(ast.AssignStmt{
+		op:  .decl_assign
+		lhs: [ast.Expr(tmp_ident)]
+		rhs: [rhs_expr]
+		pos: stmt.pos
+	})
+	// Extract .arg0, .arg1, etc. Use decl_assign for new declarations, assign for re-assignments.
+	for i in 0 .. n {
+		result << ast.Stmt(ast.AssignStmt{
+			op:  stmt.op
+			lhs: [tuple_lhs[i]]
+			rhs: [
+				ast.Expr(ast.SelectorExpr{
+					lhs: tmp_ident
+					rhs: ast.Ident{
+						name: 'arg${i}'
+					}
+				}),
+			]
+			pos: stmt.pos
+		})
+	}
+	return result
 }
 
 fn (mut t Transformer) transform_assign_stmt(stmt ast.AssignStmt) ast.AssignStmt {
@@ -1301,9 +2807,41 @@ fn (t &Transformer) get_var_name(expr ast.Expr) string {
 	return ''
 }
 
+// try_extract_sincos_arg checks if an expression is a call to `sincos(x)` and returns the argument.
+fn (t &Transformer) try_extract_sincos_arg(expr ast.Expr) ?ast.Expr {
+	if expr is ast.CallExpr {
+		if expr.lhs is ast.Ident {
+			name := (expr.lhs as ast.Ident).name
+			if name == 'sincos' && expr.args.len == 1 {
+				return expr.args[0]
+			}
+		} else if expr.lhs is ast.SelectorExpr {
+			sel := expr.lhs as ast.SelectorExpr
+			if sel.rhs.name == 'sincos' && expr.args.len == 1 {
+				return expr.args[0]
+			}
+		}
+	}
+	// sincos(x) with single arg may be parsed as CallOrCastExpr
+	if expr is ast.CallOrCastExpr {
+		if expr.lhs is ast.Ident {
+			name := (expr.lhs as ast.Ident).name
+			if name == 'sincos' {
+				return expr.expr
+			}
+		} else if expr.lhs is ast.SelectorExpr {
+			sel := expr.lhs as ast.SelectorExpr
+			if sel.rhs.name == 'sincos' {
+				return expr.expr
+			}
+		}
+	}
+	return none
+}
+
 // try_expand_or_expr_assign checks if an assignment has an OrExpr RHS (used by transform_stmt)
 // Returns none since expansion is handled by try_expand_or_expr_assign_stmts at the list level
-fn (mut t Transformer) try_expand_or_expr_assign(stmt ast.AssignStmt) ?ast.Stmt {
+fn (mut t Transformer) try_expand_or_expr_assign(_stmt ast.AssignStmt) ?ast.Stmt {
 	return none
 }
 
@@ -1311,6 +2849,9 @@ fn (mut t Transformer) try_expand_or_expr_assign(stmt ast.AssignStmt) ?ast.Stmt 
 // Transforms: m[key] = val -> map__set(&m, &key, &val)
 // Also handles compound assignments: m[key] += val -> { tmp = map_get(m,key); tmp += val; map_set(m,key,tmp) }
 fn (mut t Transformer) try_transform_map_index_assign(stmt ast.AssignStmt) ?ast.Stmt {
+	if t.is_eval_backend() {
+		return none
+	}
 	// Handle compound assignment by converting to: m[key] = m[key] op val
 	if stmt.op != .assign && stmt.op != .decl_assign {
 		infix_op := match stmt.op {
@@ -1400,7 +2941,21 @@ fn (mut t Transformer) try_transform_map_index_assign(stmt ast.AssignStmt) ?ast.
 	// statement-expression temporaries ({...}) used as function call arguments.
 	mut prefix_stmts := []ast.Stmt{}
 	key_arg := t.addr_of_with_prefix_temp(index_expr.expr, map_type.key_type, mut prefix_stmts)
-	val_arg := t.addr_of_with_prefix_temp(stmt.rhs[0], map_type.value_type, mut prefix_stmts)
+	// When the map's value type is a sum type, the RHS may be a bare variant
+	// (e.g., m['key'] = Fn{...} where the map stores Object = Fn | int).
+	// Wrap the RHS in a CastExpr so the value is properly sum-type-tagged
+	// before being passed to map__set.
+	mut rhs_val := stmt.rhs[0]
+	if map_type.value_type is types.SumType {
+		st := map_type.value_type as types.SumType
+		rhs_val = ast.CastExpr{
+			typ:  ast.Ident{
+				name: st.name
+			}
+			expr: rhs_val
+		}
+	}
+	val_arg := t.addr_of_with_prefix_temp(rhs_val, map_type.value_type, mut prefix_stmts)
 
 	call_stmt := ast.Stmt(ast.ExprStmt{
 		expr: ast.CallExpr{
@@ -1548,6 +3103,9 @@ fn (mut t Transformer) map_index_lhs_to_ptr(lhs ast.Expr, lhs_type types.Type) a
 // try_transform_map_index_push transforms map[key] << value to get_and_set + array_push.
 // Transforms: m[key] << val -> array__push_noscan((array*)map__get_and_set(&m, &key, &empty), val)
 fn (mut t Transformer) try_transform_map_index_push(stmt ast.ExprStmt) ?ast.Stmt {
+	if t.is_eval_backend() {
+		return none
+	}
 	if stmt.expr !is ast.InfixExpr {
 		return none
 	}
@@ -1590,14 +3148,16 @@ fn (mut t Transformer) try_transform_map_index_push(stmt ast.ExprStmt) ?ast.Stmt
 		}))
 	})
 
-	// Common: (array*)map__get_and_set(&m, &key, &empty_array)
+	// Common: (array*)map__get(&m, &key, &empty_array)
+	// Use map__get (not map__get_and_set) so that pushing to a missing key is a no-op:
+	// map__get returns a pointer to the existing value or to the zero value without inserting.
 	arr_ptr_expr := ast.Expr(ast.CastExpr{
 		typ:  ast.Ident{
 			name: 'array*'
 		}
 		expr: ast.CallExpr{
 			lhs:  ast.Ident{
-				name: 'map__get_and_set'
+				name: 'map__get'
 			}
 			args: [
 				map_arg,
@@ -1717,7 +3277,35 @@ fn (mut t Transformer) try_transform_map_index_postfix(stmt ast.ExprStmt) ?ast.S
 		lhs: [ast.Expr(index_expr)]
 		rhs: [new_rhs]
 	}
+	if t.is_eval_backend() {
+		return assign_stmt
+	}
 	return t.try_transform_map_index_assign(assign_stmt)
+}
+
+// try_transform_selector_postfix transforms obj.field++ / obj.field-- to compound assignment.
+// Converts: obj.field++ -> obj.field += 1   and   obj.field-- -> obj.field -= 1
+// This avoids the build_postfix SelectorExpr code path which has issues in self-hosted binaries.
+fn (mut t Transformer) try_transform_selector_postfix(stmt ast.ExprStmt) ?ast.Stmt {
+	if stmt.expr !is ast.PostfixExpr {
+		return none
+	}
+	postfix := stmt.expr as ast.PostfixExpr
+	if postfix.op != .inc && postfix.op != .dec {
+		return none
+	}
+	if postfix.expr !is ast.SelectorExpr {
+		return none
+	}
+	assign_op := if postfix.op == .inc { token.Token.plus_assign } else { token.Token.minus_assign }
+	return ast.AssignStmt{
+		op:  assign_op
+		lhs: [t.transform_expr(postfix.expr)]
+		rhs: [ast.Expr(ast.BasicLiteral{
+			value: '1'
+			kind:  .number
+		})]
+	}
 }
 
 // try_expand_or_expr_assign_stmts expands an OrExpr assignment to multiple statements.
@@ -1736,70 +3324,6 @@ fn (mut t Transformer) try_expand_or_expr_assign_stmts(stmt ast.AssignStmt) ?[]a
 	if rhs_expr is ast.OrExpr {
 		return t.expand_direct_or_expr_assign(stmt, rhs_expr)
 	}
-	// Handle `!` error propagation (PostfixExpr with .not) for native backends.
-	// `a := fn()!` expands to: `_t := fn(); if !_t { return 0 }; a := _t`
-	// Also handle bare CallExpr/CallOrCastExpr with Result/Option return type
-	// (parser sometimes strips PostfixExpr wrapper but the call still needs error propagation)
-	if t.pref != unsafe { nil } && (t.pref.backend == .arm64 || t.pref.backend == .x64) {
-		mut call_expr := ast.empty_expr
-		mut is_error_propagation := false
-		if rhs_expr is ast.PostfixExpr {
-			postfix := rhs_expr as ast.PostfixExpr
-			if postfix.op in [.not, .question] {
-				call_expr = postfix.expr
-				is_error_propagation = true
-			}
-		} else if rhs_expr is ast.CallExpr || rhs_expr is ast.CallOrCastExpr {
-			// Check if the call returns a Result or Option type
-			if ret_type := t.get_expr_type(rhs_expr) {
-				if ret_type is types.ResultType || ret_type is types.OptionType {
-					call_expr = rhs_expr
-					is_error_propagation = true
-				}
-			}
-		}
-		if is_error_propagation {
-			temp_name := t.gen_temp_name()
-			temp_ident := ast.Ident{
-				name: temp_name
-			}
-			mut stmts := []ast.Stmt{}
-			// 1. _t := call_expr
-			stmts << ast.AssignStmt{
-				op:  .decl_assign
-				lhs: [ast.Expr(temp_ident)]
-				rhs: [t.transform_expr(call_expr)]
-				pos: stmt.pos
-			}
-			// 2. if !_t { return 0 } (error propagation)
-			stmts << ast.ExprStmt{
-				expr: ast.IfExpr{
-					cond:  ast.PrefixExpr{
-						op:   .not
-						expr: temp_ident
-					}
-					stmts: [
-						ast.Stmt(ast.ReturnStmt{
-							exprs: [
-								ast.Expr(ast.BasicLiteral{
-									value: '0'
-									kind:  .number
-								}),
-							]
-						}),
-					]
-				}
-			}
-			// 3. a := _t
-			stmts << ast.AssignStmt{
-				op:  stmt.op
-				lhs: stmt.lhs
-				rhs: [ast.Expr(temp_ident)]
-				pos: stmt.pos
-			}
-			return stmts
-		}
-	}
 	// Check if RHS contains an OrExpr (nested case like cast(OrExpr))
 	if t.expr_has_or_expr(rhs_expr) {
 		mut prefix_stmts := []ast.Stmt{}
@@ -1807,13 +3331,52 @@ fn (mut t Transformer) try_expand_or_expr_assign_stmts(stmt ast.AssignStmt) ?[]a
 		if prefix_stmts.len == 0 {
 			return none
 		}
-		// Add the final assignment with the extracted expression
-		prefix_stmts << ast.AssignStmt{
+		// Add the final assignment with the extracted expression.
+		// Run through transform_stmt to handle map index assignment lowering (map__set),
+		// string compound assignment (string__plus), and other statement-level transforms.
+		transformed_rhs := t.transform_expr(new_rhs)
+		// For tuple destructuring (a, b := call()?), expand to:
+		//   _tuple_tmp := extracted_value
+		//   a := _tuple_tmp.arg0
+		//   b := _tuple_tmp.arg1
+		if tuple_lhs := t.get_tuple_lhs(stmt) {
+			if tuple_lhs.len >= 2 {
+				t.temp_counter++
+				tuple_tmp_name := '_tuple_tmp_${t.temp_counter}'
+				tuple_tmp_ident := ast.Ident{
+					name: tuple_tmp_name
+				}
+				prefix_stmts << ast.Stmt(ast.AssignStmt{
+					op:  .decl_assign
+					lhs: [ast.Expr(tuple_tmp_ident)]
+					rhs: [transformed_rhs]
+					pos: stmt.pos
+				})
+				for i in 0 .. tuple_lhs.len {
+					prefix_stmts << ast.Stmt(ast.AssignStmt{
+						op:  stmt.op
+						lhs: [tuple_lhs[i]]
+						rhs: [
+							ast.Expr(ast.SelectorExpr{
+								lhs: tuple_tmp_ident
+								rhs: ast.Ident{
+									name: 'arg${i}'
+								}
+							}),
+						]
+						pos: stmt.pos
+					})
+				}
+				return prefix_stmts
+			}
+		}
+		final_assign := ast.AssignStmt{
 			op:  stmt.op
 			lhs: stmt.lhs
-			rhs: [t.transform_expr(new_rhs)]
+			rhs: [transformed_rhs]
 			pos: stmt.pos
 		}
+		prefix_stmts << t.transform_stmt(final_assign)
 		return prefix_stmts
 	}
 	return none
@@ -1832,6 +3395,13 @@ fn (mut t Transformer) expand_direct_or_expr_assign(stmt ast.AssignStmt, or_expr
 		}
 	}
 
+	// Check for array index with or block: arr[idx] or { fallback }
+	if call_expr is ast.IndexExpr {
+		if array_result := t.try_expand_array_index_or_assign(stmt, or_expr) {
+			return array_result
+		}
+	}
+
 	// Check for string range with or block: s[0..20] or { 'fallback' }
 	// The checker types this as `string`, but it needs `string__substr_with_check`
 	// which returns `!string` (Result).
@@ -1841,7 +3411,6 @@ fn (mut t Transformer) expand_direct_or_expr_assign(stmt ast.AssignStmt, or_expr
 			is_string_range_or = true
 		}
 	}
-
 	// Check if expression returns Result or Option using expression-based lookup
 	// This works for both function calls and method calls
 	mut is_result := t.expr_returns_result(call_expr)
@@ -1858,97 +3427,28 @@ fn (mut t Transformer) expand_direct_or_expr_assign(stmt ast.AssignStmt, or_expr
 		if is_string_range_or {
 			is_result = true
 		} else {
+			if t.cur_fn_name_str == 'fetch_msgs_for' && or_expr.pos.id == 235054 {
+				mut call_type_name := '<none>'
+				if call_type := t.get_expr_type(call_expr) {
+					call_type_name = call_type.name()
+				}
+				panic('debug expand_direct_or_expr_assign: file=${t.cur_file_name} fn=${t.cur_fn_name_str} stmt_pos=${stmt.pos} or_pos=${or_expr.pos} call=${call_expr.type_name()} fn_name=${fn_name} call_type=${call_type_name} is_result=${is_result} is_option=${is_option}')
+			}
 			return none
 		}
 	}
 
-	// Native backends (arm64/x64) don't use Option/Result structs.
-	// Expand `a := fn() or { fallback }` to:
-	//   _t := fn(); a := if _t { _t } else { fallback }
-	if t.pref != unsafe { nil } && (t.pref.backend == .arm64 || t.pref.backend == .x64) {
-		// For string range with or, use inline bounds checking
-		// to avoid calling string__substr which panics on out-of-bounds.
-		if is_string_range_or {
-			idx_expr := call_expr as ast.IndexExpr
-			mut stmts := []ast.Stmt{}
-			result_expr := t.expand_string_range_or_native_expr(idx_expr, or_expr.stmts, mut
-				stmts)
-			stmts << ast.AssignStmt{
-				op:  stmt.op
-				lhs: stmt.lhs
-				rhs: [result_expr]
-				pos: stmt.pos
-			}
-			return stmts
-		}
-		temp_name := t.gen_temp_name()
-		temp_ident := ast.Ident{
-			name: temp_name
-		}
-		// For ?SumType returns, use _data field check instead of raw truthiness.
-		// Sumtypes are {_tag, _data} structs - the first variant has _tag=0,
-		// which would be indistinguishable from none (all zeros).
-		mut base_type_name := t.get_expr_base_type(call_expr)
-		if base_type_name == '' {
-			fn_name2 := t.get_call_fn_name(call_expr)
-			if fn_name2 != '' {
-				base_type_name = t.get_fn_return_base_type(fn_name2)
-			}
-		}
-		is_sumtype_return := base_type_name != '' && t.is_sum_type(base_type_name)
-		// Condition expression: _t for simple types, _t._data for sumtypes
-		synth_pos2 := t.next_synth_pos()
-		cond_expr := if is_sumtype_return {
-			t.synth_selector(temp_ident, '_data', types.Type(types.voidptr_))
-		} else {
-			ast.Expr(temp_ident)
-		}
-		not_cond_expr := if is_sumtype_return {
-			ast.Expr(ast.PrefixExpr{
-				op:   .not
-				expr: t.synth_selector(ast.Ident{
-					name: temp_name
-					pos:  synth_pos2
-				}, '_data', types.Type(types.voidptr_))
-			})
-		} else {
-			ast.Expr(ast.PrefixExpr{
-				op:   .not
-				expr: temp_ident
-			})
-		}
+	if t.pref != unsafe { nil } && (t.pref.backend == .arm64 || t.pref.backend == .x64)
+		&& is_string_range_or {
+		// String ranges still need the native inline bounds-check path because the
+		// checker records them as `string` instead of `!string`.
+		idx_expr := call_expr as ast.IndexExpr
 		mut stmts := []ast.Stmt{}
-		// 1. _t := call_expr
-		stmts << ast.AssignStmt{
-			op:  .decl_assign
-			lhs: [ast.Expr(temp_ident)]
-			rhs: [t.transform_expr(call_expr)]
-			pos: stmt.pos
-		}
-		// 2. Run or-block side effects in else path, then assign
-		or_side_effect_stmts, or_value := t.get_or_block_stmts_and_value(or_expr.stmts)
-		// If there are side-effect statements (e.g., print_str('error')),
-		// wrap them in: if !_t { side_effects... }
-		if or_side_effect_stmts.len > 0 {
-			stmts << ast.ExprStmt{
-				expr: ast.IfExpr{
-					cond:  not_cond_expr
-					stmts: or_side_effect_stmts
-				}
-			}
-		}
-		// 3. a := if _t { _t } else { or_value }
-		modified_if := ast.IfExpr{
-			cond:      cond_expr
-			stmts:     [ast.Stmt(ast.ExprStmt{
-				expr: temp_ident
-			})]
-			else_expr: or_value
-		}
+		result_expr := t.expand_string_range_or_native_expr(idx_expr, or_expr.stmts, mut stmts)
 		stmts << ast.AssignStmt{
 			op:  stmt.op
 			lhs: stmt.lhs
-			rhs: [ast.Expr(modified_if)]
+			rhs: [result_expr]
 			pos: stmt.pos
 		}
 		return stmts
@@ -1973,10 +3473,9 @@ fn (mut t Transformer) expand_direct_or_expr_assign(stmt ast.AssignStmt, or_expr
 	}
 
 	// Register temp variable type (the Result/Option wrapper type)
-	if wrapper_type := t.get_expr_type(call_expr) {
-		if wrapper_type is types.ResultType || wrapper_type is types.OptionType {
-			t.register_temp_var(temp_name, wrapper_type)
-		}
+	if wrapper_type := t.expr_wrapper_type_for_or(call_expr) {
+		t.register_temp_var(temp_name, wrapper_type)
+		t.register_synth_type(call_expr.pos(), wrapper_type)
 	} else if ret_type := t.get_method_return_type(call_expr) {
 		// Method-call result types are often missing from env expr positions.
 		// Register the resolved return wrapper type so cleanc can unwrap `.data`/`.err`.
@@ -2050,7 +3549,8 @@ fn (mut t Transformer) expand_direct_or_expr_assign(stmt ast.AssignStmt, or_expr
 		// Or-block contains return - transform statements here to handle string
 		// concatenation and other transformations. This is done here instead of
 		// relying on later transform_stmt to avoid double smartcast transformation.
-		if_stmts << t.transform_stmts(or_expr.stmts)
+		transformed_or_stmts := t.transform_stmts(or_expr.stmts)
+		if_stmts << transformed_or_stmts
 	} else if !is_void_result {
 		// Or-block provides a value - assign to data (only for non-void results)
 		or_side_effect_stmts, or_value := t.get_or_block_stmts_and_value(or_expr.stmts)
@@ -2082,13 +3582,47 @@ fn (mut t Transformer) expand_direct_or_expr_assign(stmt ast.AssignStmt, or_expr
 	}
 	// 3. a := _t1.data (extract value) - only for non-void results
 	if !is_void_result {
-		// Variable type is already tracked in scope by checker
+		data_expr := t.synth_selector(temp_ident, 'data', types.Type(types.voidptr_))
+		// For tuple destructuring (a, b := call()?), expand to:
+		//   _tuple_tmp := _t1.data
+		//   a := _tuple_tmp.arg0
+		//   b := _tuple_tmp.arg1
+		if tuple_lhs := t.get_tuple_lhs(stmt) {
+			if tuple_lhs.len >= 2 {
+				t.temp_counter++
+				tuple_tmp_name := '_tuple_tmp_${t.temp_counter}'
+				tuple_tmp_ident := ast.Ident{
+					name: tuple_tmp_name
+				}
+				stmts << ast.AssignStmt{
+					op:  .decl_assign
+					lhs: [ast.Expr(tuple_tmp_ident)]
+					rhs: [data_expr]
+					pos: stmt.pos
+				}
+				for i in 0 .. tuple_lhs.len {
+					stmts << ast.AssignStmt{
+						op:  stmt.op
+						lhs: [tuple_lhs[i]]
+						rhs: [
+							ast.Expr(ast.SelectorExpr{
+								lhs: tuple_tmp_ident
+								rhs: ast.Ident{
+									name: 'arg${i}'
+								}
+							}),
+						]
+						pos: stmt.pos
+					}
+				}
+				return stmts
+			}
+		}
+		// Single variable assignment
 		stmts << ast.AssignStmt{
 			op:  stmt.op
 			lhs: stmt.lhs
-			rhs: [
-				t.synth_selector(temp_ident, 'data', types.Type(types.voidptr_)),
-			]
+			rhs: [data_expr]
 			pos: stmt.pos
 		}
 	}
@@ -2120,6 +3654,14 @@ fn (mut t Transformer) gen_filter_temp_name() string {
 // to t.pending_stmts, and returns the temp variable ident as the replacement expression.
 fn (mut t Transformer) try_expand_filter_or_map_expr(expr ast.Expr) ?ast.Expr {
 	method_name, receiver_expr, body_expr := t.get_filter_or_map_call_info(expr) or { return none }
+	// Handle .any() and .all() — expand to bool result + for loop with break
+	// Skip expansion when receiver is a flag enum (handled by flag enum rewrite later).
+	if method_name in ['any', 'all'] {
+		if t.is_flag_enum_receiver(receiver_expr, t.get_enum_type(receiver_expr)) {
+			return none
+		}
+		return t.expand_any_or_all_expr(method_name, receiver_expr, body_expr)
+	}
 	// Get the array type from the receiver
 	array_type := t.get_array_type_str(receiver_expr) or { return none }
 	elem_type := array_type['Array_'.len..]
@@ -2309,10 +3851,37 @@ fn (mut t Transformer) try_expand_filter_or_map_expr(expr ast.Expr) ?ast.Expr {
 	}
 
 	// 2. for _filter_it in receiver { ... }
+	// Cache complex receiver expressions (e.g., arr[0..3]) in a temp variable
+	// to prevent multiple re-evaluations in the for-in expansion. Simple idents
+	// and selector expressions are cheap to re-evaluate.
+	// NOTE: Do NOT pre-transform receiver_expr here. The for loop goes through
+	// transform_stmt which will transform the expression. Pre-transforming
+	// causes double smartcast application (e.g., expr.types in a match arm
+	// gets expr._data._Variant applied twice).
+	mut receiver_for_loop := receiver_expr
+	mut has_cache_stmt := false
+	mut cache_stmt := ast.empty_stmt
+	if receiver_expr !is ast.Ident && receiver_expr !is ast.SelectorExpr {
+		transformed_receiver := t.transform_expr(receiver_expr)
+		cache_name := '_filter_recv${t.temp_counter}'
+		cache_ident := ast.Ident{
+			name: cache_name
+		}
+		if recv_type := t.get_expr_type(receiver_expr) {
+			t.register_temp_var(cache_name, recv_type)
+		}
+		cache_stmt = ast.Stmt(ast.AssignStmt{
+			op:  .decl_assign
+			lhs: [ast.Expr(cache_ident)]
+			rhs: [transformed_receiver]
+		})
+		has_cache_stmt = true
+		receiver_for_loop = cache_ident
+	}
 	for_stmt := ast.Stmt(ast.ForStmt{
 		init:  ast.ForInStmt{
 			value: it_ident
-			expr:  t.transform_expr(receiver_expr)
+			expr:  receiver_for_loop
 		}
 		stmts: loop_body
 	})
@@ -2324,10 +3893,127 @@ fn (mut t Transformer) try_expand_filter_or_map_expr(expr ast.Expr) ?ast.Expr {
 	transformed_init := t.transform_stmt(init_stmt)
 	transformed_for := t.transform_stmt(for_stmt)
 	t.pending_stmts = saved_pending
+	if has_cache_stmt {
+		t.pending_stmts << cache_stmt
+	}
 	t.pending_stmts << transformed_init
 	t.pending_stmts << transformed_for
 
 	// Return the temp variable as the replacement expression
+	return temp_ident
+}
+
+// expand_any_or_all_expr expands array.any(cond) / array.all(cond) calls.
+// .any(cond) → bool _filter_tN = false; for _filter_itN in arr { if cond { _filter_tN = true; break; } }
+// .all(cond) → bool _filter_tN = true; for _filter_itN in arr { if !cond { _filter_tN = false; break; } }
+fn (mut t Transformer) expand_any_or_all_expr(method_name string, receiver_expr ast.Expr, body_expr ast.Expr) ?ast.Expr {
+	is_any := method_name == 'any'
+	temp_name := t.gen_filter_temp_name()
+	temp_ident := ast.Ident{
+		name: temp_name
+	}
+	it_ident := ast.Ident{
+		name: '_filter_it${t.temp_counter}'
+	}
+	// bool _filter_tN = false (any) / true (all)
+	init_val := if is_any {
+		ast.Expr(ast.BasicLiteral{
+			kind:  .key_false
+			value: 'false'
+		})
+	} else {
+		ast.Expr(ast.BasicLiteral{
+			kind:  .key_true
+			value: 'true'
+		})
+	}
+	init_stmt := ast.Stmt(ast.AssignStmt{
+		op:  .decl_assign
+		lhs: [ast.Expr(ast.ModifierExpr{
+			kind: .key_mut
+			expr: temp_ident
+		})]
+		rhs: [init_val]
+	})
+	// Replace 'it' with '_filter_itN' in the body expression
+	transformed_body := t.replace_it_ident(body_expr, it_ident.name)
+	// Build condition: for any, use cond directly; for all, negate it
+	cond := if is_any {
+		transformed_body
+	} else {
+		ast.Expr(ast.PrefixExpr{
+			op:   .not
+			expr: transformed_body
+		})
+	}
+	// The value to assign on match: true for any, false for all
+	assign_val := if is_any {
+		ast.Expr(ast.BasicLiteral{
+			kind:  .key_true
+			value: 'true'
+		})
+	} else {
+		ast.Expr(ast.BasicLiteral{
+			kind:  .key_false
+			value: 'false'
+		})
+	}
+	// Build loop body: if cond { _filter_tN = true/false; break; }
+	loop_body := [
+		ast.Stmt(ast.ExprStmt{
+			expr: ast.IfExpr{
+				cond:  cond
+				stmts: [
+					ast.Stmt(ast.AssignStmt{
+						op:  .assign
+						lhs: [ast.Expr(temp_ident)]
+						rhs: [assign_val]
+					}),
+					ast.Stmt(ast.FlowControlStmt{
+						op: .key_break
+					}),
+				]
+			}
+		}),
+	]
+	// Cache complex receiver expressions
+	mut receiver_for_loop := receiver_expr
+	mut has_cache_stmt := false
+	mut cache_stmt := ast.empty_stmt
+	if receiver_expr !is ast.Ident && receiver_expr !is ast.SelectorExpr {
+		transformed_receiver := t.transform_expr(receiver_expr)
+		cache_name := '_filter_recv${t.temp_counter}'
+		cache_ident := ast.Ident{
+			name: cache_name
+		}
+		if recv_type := t.get_expr_type(receiver_expr) {
+			t.register_temp_var(cache_name, recv_type)
+		}
+		cache_stmt = ast.Stmt(ast.AssignStmt{
+			op:  .decl_assign
+			lhs: [ast.Expr(cache_ident)]
+			rhs: [transformed_receiver]
+		})
+		has_cache_stmt = true
+		receiver_for_loop = cache_ident
+	}
+	for_stmt := ast.Stmt(ast.ForStmt{
+		init:  ast.ForInStmt{
+			value: it_ident
+			expr:  receiver_for_loop
+		}
+		stmts: loop_body
+	})
+	saved_pending := t.pending_stmts.clone()
+	t.pending_stmts.clear()
+	transformed_init := t.transform_stmt(init_stmt)
+	transformed_for := t.transform_stmt(for_stmt)
+	t.pending_stmts = saved_pending
+	if has_cache_stmt {
+		t.pending_stmts << cache_stmt
+	}
+	t.pending_stmts << transformed_init
+	t.pending_stmts << transformed_for
 	return temp_ident
 }
 
@@ -2339,7 +4025,7 @@ fn (t &Transformer) get_filter_or_map_call_info(expr ast.Expr) ?(string, ast.Exp
 		if expr.lhs is ast.SelectorExpr {
 			sel := expr.lhs as ast.SelectorExpr
 			method_name := sel.rhs.name
-			if method_name in ['filter', 'map'] {
+			if method_name in ['filter', 'map', 'any', 'all'] {
 				return method_name, sel.lhs, expr.expr
 			}
 		}
@@ -2349,7 +4035,7 @@ fn (t &Transformer) get_filter_or_map_call_info(expr ast.Expr) ?(string, ast.Exp
 		if expr.lhs is ast.SelectorExpr {
 			sel := expr.lhs as ast.SelectorExpr
 			method_name := sel.rhs.name
-			if method_name in ['filter', 'map'] && expr.args.len == 1 {
+			if method_name in ['filter', 'map', 'any', 'all'] && expr.args.len == 1 {
 				return method_name, sel.lhs, expr.args[0]
 			}
 		}
@@ -2446,6 +4132,13 @@ fn (t &Transformer) replace_it_ident(expr ast.Expr, new_name string) ast.Expr {
 				lhs:  t.replace_it_ident(expr.lhs, new_name)
 				expr: t.replace_it_ident(expr.expr, new_name)
 				pos:  expr.pos
+			}
+		}
+		ast.OrExpr {
+			return ast.OrExpr{
+				expr:  t.replace_it_ident(expr.expr, new_name)
+				stmts: expr.stmts
+				pos:   expr.pos
 			}
 		}
 		ast.CastExpr {
@@ -2628,7 +4321,37 @@ fn (t &Transformer) or_block_has_return(stmts []ast.Stmt) bool {
 					return true
 				}
 			}
+			// Check for if-expression where all branches diverge
+			// e.g., if cond { continue } else { return err }
+			if stmt.expr is ast.IfExpr {
+				if t.if_expr_all_branches_diverge(stmt.expr as ast.IfExpr) {
+					return true
+				}
+			}
 		}
+	}
+	return false
+}
+
+// if_expr_all_branches_diverge checks if every branch of an if-expression
+// contains a return, continue, break, or other diverging control flow.
+// Used to detect or-blocks like: if cond { continue } else { return err }
+fn (t &Transformer) if_expr_all_branches_diverge(expr ast.IfExpr) bool {
+	// Plain else block: cond is EmptyExpr, just check its stmts
+	if expr.cond is ast.EmptyExpr {
+		return t.or_block_has_return(expr.stmts)
+	}
+	// Check the then-branch
+	if !t.or_block_has_return(expr.stmts) {
+		return false
+	}
+	// Must have an else branch, otherwise the if might fall through
+	if expr.else_expr is ast.EmptyExpr {
+		return false
+	}
+	// else-if chain or plain else: recurse into the nested IfExpr
+	if expr.else_expr is ast.IfExpr {
+		return t.if_expr_all_branches_diverge(expr.else_expr as ast.IfExpr)
 	}
 	return false
 }
@@ -2734,7 +4457,7 @@ fn (mut t Transformer) get_or_block_stmts_and_value(stmts []ast.Stmt) ([]ast.Stm
 //   if _t1.is_error { err := _t1.err; _t1.data = 0 }
 //   println(_t1.data)
 fn (mut t Transformer) try_expand_or_expr_stmt(stmt ast.ExprStmt) ?[]ast.Stmt {
-	// Check if expression contains any OrExpr
+	// Check if expression contains any OrExpr or error propagation (PostfixExpr{.not/.question})
 	if !t.expr_has_or_expr(stmt.expr) {
 		return none
 	}
@@ -2744,9 +4467,27 @@ fn (mut t Transformer) try_expand_or_expr_stmt(stmt ast.ExprStmt) ?[]ast.Stmt {
 	if prefix_stmts.len == 0 {
 		return none
 	}
+	// Save/restore pending_stmts: transform_expr(new_expr) may generate
+	// pending_stmts (e.g., lower_if_expr_value creates _if_tN). These must
+	// be placed AFTER the or-expr prefix_stmts (which define _or_tN used
+	// by the if condition), not before.
+	saved_pending := t.pending_stmts.clone()
+	t.pending_stmts.clear()
+	// The expression is used at statement level (ExprStmt), so skip
+	// IfExpr value lowering which would create temp variables for void results.
+	saved_skip_if := t.skip_if_value_lowering
+	t.skip_if_value_lowering = true
+	transformed_new := t.transform_expr(new_expr)
+	t.skip_if_value_lowering = saved_skip_if
+	inner_pending := t.pending_stmts.clone()
+	t.pending_stmts = saved_pending
+	// Merge: prefix_stmts first (or-expr decls), then any inner pending
+	for ip in inner_pending {
+		prefix_stmts << ip
+	}
 	// Add the final expression statement
 	prefix_stmts << ast.ExprStmt{
-		expr: t.transform_expr(new_expr)
+		expr: transformed_new
 	}
 	return prefix_stmts
 }
@@ -2790,6 +4531,13 @@ fn (mut t Transformer) try_expand_or_expr_return(stmt ast.ReturnStmt) ?[]ast.Stm
 fn (t &Transformer) expr_has_or_expr(expr ast.Expr) bool {
 	if expr is ast.OrExpr {
 		return true
+	}
+	// `expr!` and `expr?` are syntactic sugar for `expr or { return err }`
+	// and `expr or { none }` respectively — treat them like OrExpr.
+	if expr is ast.PostfixExpr {
+		if expr.op in [.not, .question] {
+			return true
+		}
 	}
 	match expr {
 		ast.CallExpr {
@@ -2875,6 +4623,37 @@ fn (mut t Transformer) extract_or_expr(expr ast.Expr, mut prefix_stmts []ast.Stm
 	if expr is ast.OrExpr {
 		return t.expand_single_or_expr(expr, mut prefix_stmts)
 	}
+	// `expr!` (error propagation) is equivalent to `expr or { return err }`
+	// `expr?` (option propagation) is equivalent to `expr or { return none }`
+	if expr is ast.PostfixExpr {
+		if expr.op in [.not, .question] {
+			or_stmts := if expr.op == .not {
+				// `!` → `or { return err }`
+				[
+					ast.Stmt(ast.ReturnStmt{
+						exprs: [ast.Expr(ast.Ident{
+							name: 'err'
+						})]
+					}),
+				]
+			} else {
+				// `?` → `or { return none }`
+				[
+					ast.Stmt(ast.ReturnStmt{
+						exprs: [ast.Expr(ast.Ident{
+							name: 'none'
+						})]
+					}),
+				]
+			}
+			or_expr := ast.OrExpr{
+				expr:  expr.expr
+				stmts: or_stmts
+				pos:   expr.pos
+			}
+			return t.expand_single_or_expr(or_expr, mut prefix_stmts)
+		}
+	}
 	// Recursively check sub-expressions
 	match expr {
 		ast.CallExpr {
@@ -2889,6 +4668,33 @@ fn (mut t Transformer) extract_or_expr(expr ast.Expr, mut prefix_stmts []ast.Stm
 			}
 		}
 		ast.CallOrCastExpr {
+			// When the single argument is directly an OrExpr and the lhs is a function
+			// call (not a type cast), the `or {}` MAY belong to the call result.
+			// Lift it only when the call itself returns option/result:
+			//   `f(x or {z})` → `f(x) or {z}`    (when f returns ?T / !T)
+			// When f returns a plain type, the `or {}` belongs to the argument:
+			//   `f(map[key] or {z})` → `tmp := map[key] or {z}; f(tmp)`
+			// For type casts like `i8(call() or { 0 })`, keep the OrExpr inside so
+			// the cast applies to the unwrapped data, not the Result.
+			if expr.expr is ast.OrExpr && !t.call_or_cast_lhs_is_type(expr.lhs) {
+				or_inner := expr.expr as ast.OrExpr
+				// Build the hypothetical lifted call to check if it returns option/result
+				lifted_call := ast.Expr(ast.CallOrCastExpr{
+					lhs:  expr.lhs
+					expr: or_inner.expr
+					pos:  expr.pos
+				})
+				if t.expr_returns_option(lifted_call) || t.expr_returns_result(lifted_call) {
+					lifted := ast.OrExpr{
+						expr:  lifted_call
+						stmts: or_inner.stmts
+						pos:   or_inner.pos
+					}
+					return t.expand_single_or_expr(lifted, mut prefix_stmts)
+				}
+				// The call does NOT return option/result — the `or {}` belongs to the
+				// argument.  Recurse into the inner expression to expand it there.
+			}
 			new_inner := t.extract_or_expr(expr.expr, mut prefix_stmts)
 			return ast.CallOrCastExpr{
 				lhs:  expr.lhs
@@ -2907,6 +4713,19 @@ fn (mut t Transformer) extract_or_expr(expr ast.Expr, mut prefix_stmts []ast.Stm
 			}
 		}
 		ast.PrefixExpr {
+			if expr.op == .arrow && expr.expr is ast.OrExpr {
+				or_expr := expr.expr as ast.OrExpr
+				rewritten_or := ast.OrExpr{
+					expr:  ast.Expr(ast.PrefixExpr{
+						op:   .arrow
+						expr: or_expr.expr
+						pos:  expr.pos
+					})
+					stmts: or_expr.stmts
+					pos:   or_expr.pos
+				}
+				return t.expand_single_or_expr(rewritten_or, mut prefix_stmts)
+			}
 			new_inner := t.extract_or_expr(expr.expr, mut prefix_stmts)
 			return ast.PrefixExpr{
 				op:   expr.op
@@ -3002,6 +4821,12 @@ fn (mut t Transformer) expand_single_or_expr(or_expr ast.OrExpr, mut prefix_stmt
 		return result
 	}
 
+	// Check for array index with or block: arr[idx] or { fallback }
+	// Lower to: if idx < arr.len { arr[idx] } else { fallback }
+	if result := t.try_expand_array_index_or(or_expr, mut prefix_stmts) {
+		return result
+	}
+
 	// Check for string range with or block: s[0..20] or { 'fallback' }
 	mut is_string_range_or := false
 	if call_expr is ast.IndexExpr {
@@ -3028,68 +4853,10 @@ fn (mut t Transformer) expand_single_or_expr(or_expr ast.OrExpr, mut prefix_stmt
 		is_result = true
 	}
 
-	// Native backends (arm64/x64) don't use Option/Result structs.
-	// Expand `fn() or { fallback }` to: { _t := fn(); if _t { _t } else { fallback } }
-	if t.pref != unsafe { nil } && (t.pref.backend == .arm64 || t.pref.backend == .x64) {
-		// For string range with or, use inline bounds checking
-		if is_string_range_or {
-			idx_expr := call_expr as ast.IndexExpr
-			return t.expand_string_range_or_native_expr(idx_expr, or_expr.stmts, mut prefix_stmts)
-		}
-		temp_name := t.gen_temp_name()
-		temp_ident := ast.Ident{
-			name: temp_name
-		}
-		// For ?SumType returns, use _data field check instead of raw truthiness.
-		mut base_type_name2 := t.get_expr_base_type(call_expr)
-		if base_type_name2 == '' {
-			if fn_name != '' {
-				base_type_name2 = t.get_fn_return_base_type(fn_name)
-			}
-		}
-		is_sumtype_return2 := base_type_name2 != '' && t.is_sum_type(base_type_name2)
-		synth_pos3 := t.next_synth_pos()
-		cond_expr2 := if is_sumtype_return2 {
-			t.synth_selector(temp_ident, '_data', types.Type(types.voidptr_))
-		} else {
-			ast.Expr(temp_ident)
-		}
-		not_cond_expr2 := if is_sumtype_return2 {
-			ast.Expr(ast.PrefixExpr{
-				op:   .not
-				expr: t.synth_selector(ast.Ident{
-					name: temp_name
-					pos:  synth_pos3
-				}, '_data', types.Type(types.voidptr_))
-			})
-		} else {
-			ast.Expr(ast.PrefixExpr{
-				op:   .not
-				expr: temp_ident
-			})
-		}
-		prefix_stmts << ast.AssignStmt{
-			op:  .decl_assign
-			lhs: [ast.Expr(temp_ident)]
-			rhs: [t.transform_expr(call_expr)]
-		}
-		or_side_effect_stmts, or_value := t.get_or_block_stmts_and_value(or_expr.stmts)
-		// If there are side-effect statements, wrap in: if !_t._data { side_effects... }
-		if or_side_effect_stmts.len > 0 {
-			prefix_stmts << ast.ExprStmt{
-				expr: ast.IfExpr{
-					cond:  not_cond_expr2
-					stmts: or_side_effect_stmts
-				}
-			}
-		}
-		return ast.IfExpr{
-			cond:      cond_expr2
-			stmts:     [ast.Stmt(ast.ExprStmt{
-				expr: temp_ident
-			})]
-			else_expr: or_value
-		}
+	if t.pref != unsafe { nil } && (t.pref.backend == .arm64 || t.pref.backend == .x64)
+		&& is_string_range_or {
+		idx_expr := call_expr as ast.IndexExpr
+		return t.expand_string_range_or_native_expr(idx_expr, or_expr.stmts, mut prefix_stmts)
 	}
 
 	// Get base type using expression-based lookup first, then fallback
@@ -3102,7 +4869,25 @@ fn (mut t Transformer) expand_single_or_expr(or_expr ast.OrExpr, mut prefix_stmt
 	temp_ident := ast.Ident{
 		name: temp_name
 	}
-	if call_type := t.get_expr_type(call_expr) {
+	if wrapper_type := t.expr_wrapper_type_for_or(call_expr) {
+		t.register_temp_var(temp_name, wrapper_type)
+		t.register_synth_type(call_expr.pos(), wrapper_type)
+		// Correct is_result/is_option based on resolved type
+		if wrapper_type is types.OptionType {
+			is_result = false
+			is_option = true
+		} else if wrapper_type is types.ResultType {
+			is_result = true
+			is_option = false
+		}
+		if base_type == '' {
+			if wrapper_type is types.ResultType {
+				base_type = wrapper_type.base_type.name()
+			} else if wrapper_type is types.OptionType {
+				base_type = wrapper_type.base_type.name()
+			}
+		}
+	} else if call_type := t.get_expr_type(call_expr) {
 		if call_type is types.OptionType || call_type is types.ResultType {
 			t.register_temp_var(temp_name, call_type)
 			// Correct is_result/is_option based on resolved type
@@ -3244,7 +5029,8 @@ fn (mut t Transformer) expand_single_or_expr(or_expr ast.OrExpr, mut prefix_stmt
 		// Or-block contains return - transform statements here to handle string
 		// concatenation and other transformations. This is done here instead of
 		// relying on later transform_stmt to avoid double smartcast transformation.
-		if_stmts << t.transform_stmts(or_expr.stmts)
+		transformed_or_stmts := t.transform_stmts(or_expr.stmts)
+		if_stmts << transformed_or_stmts
 	} else if !is_void_result {
 		// Or-block provides a value - assign to data (only for non-void results)
 		or_side_effect_stmts, or_value := t.get_or_block_stmts_and_value(or_expr.stmts)
@@ -3279,41 +5065,184 @@ fn (mut t Transformer) expand_single_or_expr(or_expr ast.OrExpr, mut prefix_stmt
 		// For void results, return an empty expression since there's no value
 		return ast.empty_expr
 	}
-	return t.synth_selector(temp_ident, 'data', types.Type(types.voidptr_))
-}
-
-// typed_deref generates a typed dereference of a voidptr:
-// *unsafe { &ValueType(ptr) }
-// This is needed because map__get_check returns voidptr, and dereferencing
-// voidptr in the SSA builder loads only 1 byte (i8). The typed deref
-// emits bitcast(ptr, *ValueType) + load(*ValueType) for correct load size.
-fn (t &Transformer) typed_deref(ptr ast.Expr, value_type types.Type) ast.Expr {
-	// For native backends (arm64/x64), map__get_check returns voidptr and
-	// dereferencing voidptr loads only 1 byte (i8). Emit bitcast to correct
-	// pointer type first: *(&ValueType(ptr))
-	is_native := t.pref != unsafe { nil } && (t.pref.backend == .arm64 || t.pref.backend == .x64)
-	if is_native {
-		type_name := t.type_to_name(value_type)
-		if type_name != '' {
-			return ast.PrefixExpr{
-				op:   .mul
-				expr: ast.PrefixExpr{
-					op:   .amp
-					expr: ast.CastExpr{
-						typ:  ast.Ident{
-							name: type_name
-						}
-						expr: ptr
-					}
-				}
+	// Use the actual unwrapped base type for the .data selector, so that
+	// downstream code (e.g., array_value_elem_type) can detect the type
+	// correctly. Falls back to voidptr if the type is not available.
+	mut data_type := types.Type(types.voidptr_)
+	if t.fn_root_scope != unsafe { nil } {
+		if temp_obj_type := t.fn_root_scope.lookup_var_type(temp_name) {
+			if temp_obj_type is types.ResultType {
+				data_type = temp_obj_type.base_type
+			} else if temp_obj_type is types.OptionType {
+				data_type = temp_obj_type.base_type
 			}
 		}
 	}
-	// C/cleanc backends handle voidptr deref correctly via C casts
+	return t.synth_selector(temp_ident, 'data', data_type)
+}
+
+// typed_deref generates a typed dereference of a voidptr:
+// *(&ValueType(ptr))
+// This is needed because map__get_check returns voidptr, and dereferencing
+// voidptr is invalid in C and loads only 1 byte (i8) in the SSA builder.
+// The typed deref casts to the correct pointer type first.
+fn (t &Transformer) typed_deref(ptr ast.Expr, value_type types.Type) ast.Expr {
+	// Use the same cast shape as transform_index_expr:
+	// *(&ValueType(ptr)) where &ValueType is encoded as a cast type.
+	// For C/cleanc: generates *((ValueType*)(ptr))
+	// For native:   emits bitcast(ptr, *ValueType) + load(*ValueType)
 	return ast.PrefixExpr{
 		op:   .mul
-		expr: ptr
+		expr: ast.CastExpr{
+			typ:  ast.PrefixExpr{
+				op:   .amp
+				expr: t.type_to_ast_type_expr(value_type)
+			}
+			expr: ptr
+		}
 	}
+}
+
+// try_expand_array_index_or handles: arr[idx] or { fallback }
+// Transforms to: if idx < arr.len { arr[idx] } else { fallback }
+fn (mut t Transformer) try_expand_array_index_or(or_expr ast.OrExpr, mut _prefix_stmts []ast.Stmt) ?ast.Expr {
+	if or_expr.expr !is ast.IndexExpr {
+		return none
+	}
+	index_expr := or_expr.expr as ast.IndexExpr
+	// Skip map indices and range expressions
+	if _ := t.get_map_type_for_expr(index_expr.lhs) {
+		return none
+	}
+	if index_expr.expr is ast.RangeExpr {
+		return none
+	}
+	// Check it's an array type
+	if arr_type := t.get_expr_type(index_expr.lhs) {
+		base := t.unwrap_alias_and_pointer_type(arr_type)
+		if base !is types.Array {
+			return none
+		}
+	} else {
+		return none
+	}
+	// Build: if idx < arr.len { arr[idx] } else { fallback }
+	transformed_arr := t.transform_expr(index_expr.lhs)
+	transformed_idx := t.transform_expr(index_expr.expr)
+	cond := ast.Expr(ast.InfixExpr{
+		op:  .lt
+		lhs: transformed_idx
+		rhs: t.synth_selector(transformed_arr, 'len', types.Type(types.int_))
+		pos: or_expr.pos
+	})
+	// True branch: arr[idx]
+	arr_access := ast.ExprStmt{
+		expr: ast.IndexExpr{
+			lhs:  transformed_arr
+			expr: transformed_idx
+			pos:  index_expr.pos
+		}
+	}
+	// Else branch: fallback from or block
+	side_effects, fallback := t.get_or_block_stmts_and_value(or_expr.stmts)
+	mut else_stmts := []ast.Stmt{}
+	else_stmts << side_effects
+	else_stmts << ast.ExprStmt{
+		expr: fallback
+	}
+	result_if := ast.IfExpr{
+		cond:      cond
+		stmts:     [ast.Stmt(arr_access)]
+		else_expr: ast.IfExpr{
+			stmts: else_stmts
+		}
+		pos:       or_expr.pos
+	}
+	return ast.Expr(result_if)
+}
+
+// try_expand_array_index_or_assign handles: x := arr[idx] or { fallback }
+fn (mut t Transformer) try_expand_array_index_or_assign(stmt ast.AssignStmt, or_expr ast.OrExpr) ?[]ast.Stmt {
+	if or_expr.expr !is ast.IndexExpr {
+		return none
+	}
+	index_expr := or_expr.expr as ast.IndexExpr
+	if _ := t.get_map_type_for_expr(index_expr.lhs) {
+		return none
+	}
+	if index_expr.expr is ast.RangeExpr {
+		return none
+	}
+	if arr_type := t.get_expr_type(index_expr.lhs) {
+		base := t.unwrap_alias_and_pointer_type(arr_type)
+		if base !is types.Array {
+			return none
+		}
+	} else {
+		return none
+	}
+	if stmt.lhs.len != 1 {
+		return none
+	}
+	transformed_arr := t.transform_expr(index_expr.lhs)
+	transformed_idx := t.transform_expr(index_expr.expr)
+	cond := ast.Expr(ast.InfixExpr{
+		op:  .lt
+		lhs: transformed_idx
+		rhs: t.synth_selector(transformed_arr, 'len', types.Type(types.int_))
+		pos: or_expr.pos
+	})
+	mut then_stmts := []ast.Stmt{}
+	then_stmts << ast.AssignStmt{
+		op:  .assign
+		lhs: stmt.lhs
+		rhs: [
+			ast.Expr(ast.IndexExpr{
+				lhs:  transformed_arr
+				expr: transformed_idx
+				pos:  index_expr.pos
+			}),
+		]
+		pos: stmt.pos
+	}
+	mut else_stmts := []ast.Stmt{}
+	if t.or_block_has_return(or_expr.stmts) {
+		else_stmts = t.transform_stmts(or_expr.stmts)
+	} else {
+		side_effects, fallback := t.get_or_block_stmts_and_value(or_expr.stmts)
+		else_stmts << side_effects
+		else_stmts << ast.AssignStmt{
+			op:  .assign
+			lhs: stmt.lhs
+			rhs: [fallback]
+			pos: stmt.pos
+		}
+	}
+	// Generate: lhs_type lhs; if (idx < arr.len) { lhs = arr[idx]; } else { lhs = fallback; }
+	mut result := []ast.Stmt{}
+	// If decl_assign, first declare the variable with zero value, then use assign in branches
+	if stmt.op == .decl_assign {
+		result << ast.AssignStmt{
+			op:  .decl_assign
+			lhs: stmt.lhs
+			rhs: [ast.Expr(ast.BasicLiteral{
+				kind:  .number
+				value: '0'
+			})]
+			pos: stmt.pos
+		}
+	}
+	result << ast.ExprStmt{
+		expr: ast.IfExpr{
+			cond:      cond
+			stmts:     then_stmts
+			else_expr: ast.IfExpr{
+				stmts: else_stmts
+			}
+			pos:       or_expr.pos
+		}
+	}
+	return result
 }
 
 // try_expand_map_index_or handles the pattern: map[key] or { fallback }
@@ -3330,6 +5259,60 @@ fn (mut t Transformer) try_expand_map_index_or(or_expr ast.OrExpr, mut prefix_st
 	map_expr_typ := t.get_expr_type(index_expr.lhs) or { return none }
 	map_type := t.unwrap_map_type(map_expr_typ) or { return none }
 	value_type := map_type.value_type
+
+	if t.is_eval_backend() {
+		temp_name := t.gen_temp_name()
+		temp_ident := ast.Ident{
+			name: temp_name
+		}
+		t.register_temp_var(temp_name, value_type)
+		prefix_stmts << ast.AssignStmt{
+			op:  .decl_assign
+			lhs: [ast.Expr(temp_ident)]
+			rhs: [t.zero_value_expr_for_type(value_type)]
+		}
+		cond := ast.Expr(ast.InfixExpr{
+			op:  .key_in
+			lhs: t.transform_expr(index_expr.expr)
+			rhs: t.transform_expr(index_expr.lhs)
+			pos: or_expr.pos
+		})
+		mut then_stmts := []ast.Stmt{}
+		then_stmts << ast.AssignStmt{
+			op:  .assign
+			lhs: [ast.Expr(temp_ident)]
+			rhs: [
+				ast.Expr(ast.IndexExpr{
+					lhs:      t.transform_expr(index_expr.lhs)
+					expr:     t.transform_expr(index_expr.expr)
+					is_gated: index_expr.is_gated
+					pos:      index_expr.pos
+				}),
+			]
+		}
+		mut else_stmts := []ast.Stmt{}
+		if t.or_block_has_return(or_expr.stmts) {
+			else_stmts = t.transform_stmts(or_expr.stmts)
+		} else {
+			side_effects, fallback := t.get_or_block_stmts_and_value(or_expr.stmts)
+			else_stmts << side_effects
+			else_stmts << ast.AssignStmt{
+				op:  .assign
+				lhs: [ast.Expr(temp_ident)]
+				rhs: [fallback]
+			}
+		}
+		prefix_stmts << ast.ExprStmt{
+			expr: ast.IfExpr{
+				cond:      cond
+				stmts:     then_stmts
+				else_expr: ast.IfExpr{
+					stmts: else_stmts
+				}
+			}
+		}
+		return ast.Expr(temp_ident)
+	}
 
 	// Generate temp variable name for the pointer result
 	temp_name := t.gen_temp_name()
@@ -3451,6 +5434,60 @@ fn (mut t Transformer) try_expand_map_index_or_assign(stmt ast.AssignStmt, or_ex
 	// Get the LHS variable name from the assignment
 	if stmt.lhs.len != 1 {
 		return none
+	}
+
+	if t.is_eval_backend() {
+		mut stmts := []ast.Stmt{}
+		stmts << ast.AssignStmt{
+			op:  stmt.op
+			lhs: stmt.lhs
+			rhs: [t.zero_value_expr_for_type(value_type)]
+			pos: stmt.pos
+		}
+		cond := ast.Expr(ast.InfixExpr{
+			op:  .key_in
+			lhs: t.transform_expr(index_expr.expr)
+			rhs: t.transform_expr(index_expr.lhs)
+			pos: or_expr.pos
+		})
+		mut then_stmts := []ast.Stmt{}
+		then_stmts << ast.AssignStmt{
+			op:  .assign
+			lhs: stmt.lhs
+			rhs: [
+				ast.Expr(ast.IndexExpr{
+					lhs:      t.transform_expr(index_expr.lhs)
+					expr:     t.transform_expr(index_expr.expr)
+					is_gated: index_expr.is_gated
+					pos:      index_expr.pos
+				}),
+			]
+			pos: stmt.pos
+		}
+		mut else_stmts := []ast.Stmt{}
+		if t.or_block_has_return(or_expr.stmts) {
+			else_stmts = t.transform_stmts(or_expr.stmts)
+		} else {
+			side_effects, fallback := t.get_or_block_stmts_and_value(or_expr.stmts)
+			else_stmts << side_effects
+			else_stmts << ast.AssignStmt{
+				op:  .assign
+				lhs: stmt.lhs
+				rhs: [fallback]
+				pos: stmt.pos
+			}
+		}
+		stmts << ast.ExprStmt{
+			expr: ast.IfExpr{
+				cond:      cond
+				stmts:     then_stmts
+				else_expr: ast.IfExpr{
+					stmts: else_stmts
+				}
+				pos:       stmt.pos
+			}
+		}
+		return stmts
 	}
 
 	mut stmts := []ast.Stmt{}
@@ -3612,14 +5649,40 @@ fn (mut t Transformer) try_expand_map_index_or_assign(stmt ast.AssignStmt, or_ex
 			}
 		}
 	} else {
-		// 2b. lhs := fallback
-		stmts << ast.AssignStmt{
-			op:  stmt.op
-			lhs: stmt.lhs
-			rhs: [t.get_or_block_value(or_expr.stmts)]
-			pos: stmt.pos
+		// 2b/3b. Non-control-flow fallback:
+		// if _t1 == nil { side effects; lhs = fallback } else { lhs = *_t1 }.
+		or_side_effect_stmts, or_value := t.get_or_block_stmts_and_value(or_expr.stmts)
+		needs_decl := stmt.op == .decl_assign
+		if needs_decl {
+			stmts << ast.AssignStmt{
+				op:  .decl_assign
+				lhs: stmt.lhs
+				rhs: [t.zero_value_expr_for_type(value_type)]
+				pos: stmt.pos
+			}
 		}
-		// 3b. if _t1 != nil { lhs = *_t1 } (typed deref for correct load size)
+		mut nil_branch_stmts := []ast.Stmt{}
+		if or_side_effect_stmts.len > 0 {
+			nil_branch_stmts << or_side_effect_stmts
+		}
+		nil_branch_stmts << ast.Stmt(ast.AssignStmt{
+			op:  .assign
+			lhs: stmt.lhs
+			rhs: [or_value]
+			pos: stmt.pos
+		})
+		stmts << ast.ExprStmt{
+			expr: ast.IfExpr{
+				cond:  ast.InfixExpr{
+					op:  .eq
+					lhs: temp_ident
+					rhs: ast.Ident{
+						name: 'nil'
+					}
+				}
+				stmts: nil_branch_stmts
+			}
+		}
 		stmts << ast.ExprStmt{
 			expr: ast.IfExpr{
 				cond:  ast.InfixExpr{
@@ -3634,6 +5697,7 @@ fn (mut t Transformer) try_expand_map_index_or_assign(stmt ast.AssignStmt, or_ex
 						op:  .assign
 						lhs: stmt.lhs
 						rhs: [t.typed_deref(temp_ident, value_type)]
+						pos: stmt.pos
 					}),
 				]
 			}
@@ -3701,8 +5765,12 @@ fn (mut t Transformer) expand_lock_expr(expr ast.LockExpr) []ast.Stmt {
 			}
 		}
 	}
-	// Emit transformed body stmts
-	for stmt in t.transform_stmts(expr.stmts) {
+	// Emit transformed body stmts.
+	// Store in a temp variable to avoid V1 C backend double-evaluation bug:
+	// `for x in fn()` compiles to `for (i=0; i < fn().len; i++) { x = fn().data[i]; }`
+	// which calls fn() twice per iteration, causing temp_counter mismatches.
+	transformed_lock_body := t.transform_stmts(expr.stmts)
+	for stmt in transformed_lock_body {
 		result << stmt
 	}
 	// Emit unlock calls (reverse order of lock)
@@ -3745,13 +5813,47 @@ fn (mut t Transformer) expand_lock_expr(expr ast.LockExpr) []ast.Stmt {
 // lower_defer_stmts collects DeferStmts from the function body (at any nesting level),
 // removes them, and injects their bodies before every return statement (and at the end
 // of the function). Defers execute in LIFO order (last defer first).
-fn (mut t Transformer) lower_defer_stmts(stmts []ast.Stmt, has_return_type bool) []ast.Stmt {
+fn defer_return_uses_fn_return_type(expr ast.Expr, fn_return_type types.Type) bool {
+	if fn_return_type is types.Void {
+		return false
+	}
+	match expr {
+		ast.BasicLiteral {
+			return expr.value == '0'
+				&& (fn_return_type is types.OptionType || fn_return_type is types.ResultType)
+		}
+		ast.Keyword {
+			return expr.tok == .key_none && fn_return_type is types.OptionType
+		}
+		ast.Ident {
+			return expr.name == 'none' && fn_return_type is types.OptionType
+		}
+		ast.Type {
+			return expr is ast.NoneType && fn_return_type is types.OptionType
+		}
+		else {
+			return false
+		}
+	}
+}
+
+fn (mut t Transformer) register_defer_return_temp(name string, expr ast.Expr, fn_return_type types.Type) {
+	if expr_type := t.get_expr_type(expr) {
+		t.register_temp_var(name, expr_type)
+		return
+	}
+	if defer_return_uses_fn_return_type(expr, fn_return_type) {
+		t.register_temp_var(name, fn_return_type)
+	}
+}
+
+fn (mut t Transformer) lower_defer_stmts(stmts []ast.Stmt, has_return_type bool, fn_return_type types.Type) []ast.Stmt {
 	if !t.has_defer_stmt(stmts) {
 		return stmts
 	}
 	// Lower defers in source order so returns before a defer do not run it.
 	mut active_defers := [][]ast.Stmt{}
-	mut lowered := t.lower_defer_block(stmts, mut active_defers, has_return_type)
+	mut lowered := t.lower_defer_block(stmts, mut active_defers, has_return_type, fn_return_type)
 	if lowered.len == 0 || !t.stmt_ends_with_return(lowered[lowered.len - 1]) {
 		t.append_defer_bodies(mut lowered, active_defers)
 	}
@@ -3820,19 +5922,21 @@ fn (t &Transformer) copy_defer_stack(active_defers [][]ast.Stmt) [][]ast.Stmt {
 	return copied
 }
 
-fn (mut t Transformer) lower_defer_else(else_expr ast.Expr, active_defers [][]ast.Stmt, has_return_type bool) ast.Expr {
+fn (mut t Transformer) lower_defer_else(else_expr ast.Expr, active_defers [][]ast.Stmt, has_return_type bool, fn_return_type types.Type) ast.Expr {
 	if else_expr is ast.IfExpr {
 		mut branch_defers := t.copy_defer_stack(active_defers)
 		return ast.IfExpr{
 			cond:      else_expr.cond
-			stmts:     t.lower_defer_block(else_expr.stmts, mut branch_defers, has_return_type)
-			else_expr: t.lower_defer_else(else_expr.else_expr, active_defers, has_return_type)
+			stmts:     t.lower_defer_block(else_expr.stmts, mut branch_defers, has_return_type,
+				fn_return_type)
+			else_expr: t.lower_defer_else(else_expr.else_expr, active_defers, has_return_type,
+				fn_return_type)
 		}
 	}
 	return else_expr
 }
 
-fn (mut t Transformer) lower_defer_block(stmts []ast.Stmt, mut active_defers [][]ast.Stmt, has_return_type bool) []ast.Stmt {
+fn (mut t Transformer) lower_defer_block(stmts []ast.Stmt, mut active_defers [][]ast.Stmt, has_return_type bool, fn_return_type types.Type) []ast.Stmt {
 	mut result := []ast.Stmt{cap: stmts.len}
 	for stmt in stmts {
 		match stmt {
@@ -3845,9 +5949,7 @@ fn (mut t Transformer) lower_defer_block(stmts []ast.Stmt, mut active_defers [][
 				} else if has_return_type && stmt.exprs.len > 0 {
 					t.temp_counter++
 					temp_name := '_defer_t${t.temp_counter}'
-					if expr_type := t.get_expr_type(stmt.exprs[0]) {
-						t.register_temp_var(temp_name, expr_type)
-					}
+					t.register_defer_return_temp(temp_name, stmt.exprs[0], fn_return_type)
 					ret_expr := ast.Expr(stmt.exprs[0])
 					result << ast.Stmt(ast.AssignStmt{
 						op:  .decl_assign
@@ -3874,9 +5976,9 @@ fn (mut t Transformer) lower_defer_block(stmts []ast.Stmt, mut active_defers [][
 						expr: ast.IfExpr{
 							cond:      stmt.expr.cond
 							stmts:     t.lower_defer_block(stmt.expr.stmts, mut then_defers,
-								has_return_type)
+								has_return_type, fn_return_type)
 							else_expr: t.lower_defer_else(stmt.expr.else_expr, active_defers,
-								has_return_type)
+								has_return_type, fn_return_type)
 						}
 					})
 				} else if stmt.expr is ast.UnsafeExpr {
@@ -3884,7 +5986,7 @@ fn (mut t Transformer) lower_defer_block(stmts []ast.Stmt, mut active_defers [][
 					result << ast.Stmt(ast.ExprStmt{
 						expr: ast.UnsafeExpr{
 							stmts: t.lower_defer_block(stmt.expr.stmts, mut unsafe_defers,
-								has_return_type)
+								has_return_type, fn_return_type)
 						}
 					})
 				} else {
@@ -3897,13 +5999,15 @@ fn (mut t Transformer) lower_defer_block(stmts []ast.Stmt, mut active_defers [][
 					init:  stmt.init
 					cond:  stmt.cond
 					post:  stmt.post
-					stmts: t.lower_defer_block(stmt.stmts, mut loop_defers, has_return_type)
+					stmts: t.lower_defer_block(stmt.stmts, mut loop_defers, has_return_type,
+						fn_return_type)
 				})
 			}
 			ast.BlockStmt {
 				mut block_defers := t.copy_defer_stack(active_defers)
 				result << ast.Stmt(ast.BlockStmt{
-					stmts: t.lower_defer_block(stmt.stmts, mut block_defers, has_return_type)
+					stmts: t.lower_defer_block(stmt.stmts, mut block_defers, has_return_type,
+						fn_return_type)
 				})
 			}
 			else {
@@ -3966,76 +6070,54 @@ fn (t &Transformer) stmt_ends_with_return(stmt ast.Stmt) bool {
 	return stmt is ast.ReturnStmt
 }
 
-fn (mut t Transformer) transform_return_stmt(stmt ast.ReturnStmt) ast.ReturnStmt {
-	// Native backends (arm64/x64) don't use Option/Result structs.
-	// `return error(...)` and `return none` should be lowered to `return 0` (error/none indicator).
-	if t.pref != unsafe { nil } && (t.pref.backend == .arm64 || t.pref.backend == .x64) {
-		error_fn_names := ['error', 'error_posix', 'error_with_code', 'error_win32']
-		if stmt.exprs.len == 1 {
-			ret_expr := stmt.exprs[0]
-			// Check for `error(...)` / `error_posix(...)` call — appears as CallOrCastExpr with lhs=Ident
-			if ret_expr is ast.CallOrCastExpr {
-				if ret_expr.lhs is ast.Ident && ret_expr.lhs.name in error_fn_names {
-					return ast.ReturnStmt{
-						exprs: [
-							ast.Expr(ast.BasicLiteral{
-								kind:  .number
-								value: '0'
-							}),
-						]
-					}
-				}
-			}
-			// Also check for CallExpr form
-			if ret_expr is ast.CallExpr {
-				if ret_expr.lhs is ast.Ident && ret_expr.lhs.name in error_fn_names {
-					return ast.ReturnStmt{
-						exprs: [
-							ast.Expr(ast.BasicLiteral{
-								kind:  .number
-								value: '0'
-							}),
-						]
-					}
-				}
-			}
-			// Check for `return none` — appears as Keyword{tok:.key_none} or Ident{name:'none'}
-			is_none_type := if ret_expr is ast.Type {
-				ret_expr is ast.NoneType
-			} else {
-				false
-			}
-			is_none_ident := ret_expr is ast.Ident && ret_expr.name == 'none'
-			if is_none_type || is_none_ident {
-				// For sum type returns (?SumType), return two zeros (tag=0, data=0)
-				// so the SSA builder doesn't try to wrap the single 0 in a sum type constructor
-				if t.cur_fn_ret_type_name != '' && t.is_sum_type(t.cur_fn_ret_type_name) {
-					return ast.ReturnStmt{
-						exprs: [
-							ast.Expr(ast.BasicLiteral{
-								kind:  .number
-								value: '0'
-							}),
-							ast.Expr(ast.BasicLiteral{
-								kind:  .number
-								value: '0'
-							}),
-						]
-					}
-				}
-				return ast.ReturnStmt{
-					exprs: [
-						ast.Expr(ast.BasicLiteral{
-							kind:  .number
-							value: '0'
-						}),
-					]
-				}
+fn (t &Transformer) return_expr_should_skip_sumtype_wrap(expr ast.Expr) bool {
+	error_fn_names := ['error', 'error_posix', 'error_with_code', 'error_win32']
+	match expr {
+		ast.CallExpr {
+			if expr.lhs is ast.Ident && expr.lhs.name in error_fn_names {
+				return true
 			}
 		}
+		ast.CallOrCastExpr {
+			if expr.lhs is ast.Ident && expr.lhs.name in error_fn_names {
+				return true
+			}
+		}
+		ast.Ident {
+			if expr.name in ['none', 'err'] {
+				return true
+			}
+		}
+		ast.Type {
+			if expr is ast.NoneType {
+				return true
+			}
+		}
+		else {}
 	}
+	if typ := t.get_expr_type(expr) {
+		match typ {
+			types.Interface {
+				if typ.name == 'IError' {
+					return true
+				}
+			}
+			types.OptionType, types.ResultType {
+				return true
+			}
+			else {}
+		}
+	}
+	return false
+}
+
+fn (mut t Transformer) transform_return_stmt(stmt ast.ReturnStmt) ast.ReturnStmt {
+	should_wrap_return_sumtype := t.cur_fn_ret_type_name != ''
+		&& t.is_sum_type(t.cur_fn_ret_type_name)
 	mut exprs := []ast.Expr{cap: stmt.exprs.len}
 	for expr in stmt.exprs {
+		skip_return_sumtype_wrap := (t.cur_fn_returns_option || t.cur_fn_returns_result)
+			&& t.return_expr_should_skip_sumtype_wrap(expr)
 		// Resolve enum shorthands in return expressions (e.g., return .string → token__Token__string)
 		if t.cur_fn_ret_type_name != '' {
 			if expr is ast.SelectorExpr {
@@ -4049,8 +6131,7 @@ fn (mut t Transformer) transform_return_stmt(stmt ast.ReturnStmt) ast.ReturnStmt
 		}
 		// If the return expression is a MatchExpr and the return type is a sum type,
 		// set sumtype_return_wrap so transform_match_expr wraps each branch value
-		if expr is ast.MatchExpr && t.cur_fn_ret_type_name != ''
-			&& t.is_sum_type(t.cur_fn_ret_type_name) {
+		if expr is ast.MatchExpr && should_wrap_return_sumtype && !skip_return_sumtype_wrap {
 			old_wrap := t.sumtype_return_wrap
 			t.sumtype_return_wrap = t.cur_fn_ret_type_name
 			transformed := t.transform_expr(expr)
@@ -4061,37 +6142,64 @@ fn (mut t Transformer) transform_return_stmt(stmt ast.ReturnStmt) ast.ReturnStmt
 		// Before transforming, check if the expression is a smartcasted identifier
 		// that needs re-wrapping into the return sum type
 		mut smartcast_variant := ''
-		if t.cur_fn_ret_type_name != '' && t.is_sum_type(t.cur_fn_ret_type_name) {
+		if should_wrap_return_sumtype && !skip_return_sumtype_wrap {
 			if expr is ast.Ident {
 				if ctx := t.find_smartcast_for_expr(expr.name) {
 					smartcast_variant = ctx.variant
 				}
+				// If the variable's declared type IS the return sum type (e.g., in
+				// multi-variant match arms like `Primitive, Array, ... { return t }`),
+				// skip both smartcast extraction AND re-wrapping. The smartcast
+				// roundtrip would extract variant data to a stack local and return a
+				// pointer to it, creating a dangling pointer after the function returns.
+				if smartcast_variant != '' {
+					if var_type := t.lookup_var_type(expr.name) {
+						var_c_name := t.type_to_c_name(var_type)
+						if t.is_same_sumtype_name(var_c_name, t.cur_fn_ret_type_name) {
+							// Remove smartcast temporarily to prevent transform_expr
+							// from applying the smartcast dereference
+							removed_ctx := t.remove_smartcast_for_expr(expr.name)
+							transformed_no_sc := t.transform_expr(expr)
+							// Restore the smartcast context
+							if ctx2 := removed_ctx {
+								t.push_smartcast_full(ctx2.expr, ctx2.variant, ctx2.variant_full,
+									ctx2.sumtype)
+							}
+							exprs << transformed_no_sc
+							continue
+						}
+					}
+				}
 			}
-		}
-		if t.cur_fn_name_str == 'base_type' {
-			eprintln('TRACE ret base_type: expr_type=${expr.type_name()} smartcast=${smartcast_variant} ret_sum=${t.cur_fn_ret_type_name}')
+			// For native backends, try wrapping BEFORE transformation using the
+			// original expression which still has valid checker position/type info.
+			// wrap_sumtype_value calls transform_expr internally, so the value
+			// is properly transformed.
+			if t.pref != unsafe { nil } && (t.pref.backend == .arm64 || t.pref.backend == .x64) {
+				if wrapped := t.wrap_sumtype_value(expr, t.cur_fn_ret_type_name) {
+					exprs << wrapped
+					continue
+				}
+			}
 		}
 		transformed := t.transform_expr(expr)
 		// Wrap variant values in sum type initialization if needed.
 		// Use wrap_sumtype_value_transformed because the value is already transformed above.
 		// Using wrap_sumtype_value would transform the value a second time, causing
 		// double smartcast dereferences (e.g., ((T*)(((T*)(x._data._T))->_data._T))->field).
-		if t.cur_fn_ret_type_name != '' && t.is_sum_type(t.cur_fn_ret_type_name) {
+		if should_wrap_return_sumtype && !skip_return_sumtype_wrap {
 			if wrapped := t.wrap_sumtype_value_transformed(transformed, t.cur_fn_ret_type_name) {
 				exprs << wrapped
 				continue
 			}
 			// If wrapping failed but we have a smartcast context, use the variant from it
 			if smartcast_variant != '' {
-				if wrapped := t.build_sumtype_init(transformed, smartcast_variant, t.cur_fn_ret_type_name) {
+				if wrapped := t.build_sumtype_init(transformed, smartcast_variant,
+					t.cur_fn_ret_type_name)
+				{
 					exprs << wrapped
 					continue
 				}
-				eprintln('WRAP-FAIL: build_sumtype_init failed for variant=${smartcast_variant} sumtype=${t.cur_fn_ret_type_name} fn=${t.cur_fn_name_str}')
-			}
-			// Diagnostic: wrapping failed completely
-			if t.pref != unsafe { nil } && (t.pref.backend == .arm64 || t.pref.backend == .x64) {
-				eprintln('WRAP-MISS: return in sumtype fn without wrapping: sumtype=${t.cur_fn_ret_type_name} smartcast=${smartcast_variant} fn=${t.cur_fn_name_str}')
 			}
 		}
 		exprs << transformed
@@ -4126,6 +6234,13 @@ fn (mut t Transformer) gen_assoc_temp_name() string {
 fn (mut t Transformer) lower_assoc_expr(node ast.AssocExpr, take_addr bool) ast.Expr {
 	// {base | field: val} -> unsafe { tmp := Type(base); tmp.field = val; tmp }
 	// &{base | field: val} -> unsafe { tmp := Type(base); tmp.field = val; &tmp }
+	// Force lowering of if-expressions in field values — the skip flag from outer
+	// statement-level if must not leak into struct update field value transforms.
+	saved_skip_if := t.skip_if_value_lowering
+	t.skip_if_value_lowering = false
+	defer {
+		t.skip_if_value_lowering = saved_skip_if
+	}
 	mut target_c := ''
 	if target_type := t.get_expr_type(ast.Expr(node)) {
 		target_c = t.type_to_c_name(target_type)
@@ -4157,7 +6272,13 @@ fn (mut t Transformer) lower_assoc_expr(node ast.AssocExpr, take_addr bool) ast.
 	}
 
 	// Hoist temp declaration and field updates before current statement via pending_stmts.
-	t.pending_stmts << ast.Stmt(ast.AssignStmt{
+	// Save pending_stmts from outer context to prevent field value transforms
+	// (which may call transform_stmts internally, e.g., for if-expression branches)
+	// from draining our accumulated stmts into the wrong scope.
+	saved_pending := t.pending_stmts.clone()
+	t.pending_stmts.clear()
+	mut assoc_stmts := []ast.Stmt{cap: 1 + node.fields.len * 2}
+	assoc_stmts << ast.Stmt(ast.AssignStmt{
 		op:  .decl_assign
 		lhs: [ast.Expr(tmp_ident)]
 		rhs: [
@@ -4170,15 +6291,30 @@ fn (mut t Transformer) lower_assoc_expr(node ast.AssocExpr, take_addr bool) ast.
 	})
 
 	// Apply field updates.
+	// Each transform_expr(field.value) may generate pending_stmts (e.g., lowered if-expressions).
+	// Capture and interleave them correctly.
 	for field in node.fields {
-		t.pending_stmts << ast.Stmt(ast.AssignStmt{
+		transformed_value := t.transform_expr(field.value)
+		// Drain any pending_stmts generated by the field value transform (e.g., _if_t temps)
+		if t.pending_stmts.len > 0 {
+			for ps in t.pending_stmts {
+				assoc_stmts << ps
+			}
+			t.pending_stmts.clear()
+		}
+		assoc_stmts << ast.Stmt(ast.AssignStmt{
 			op:  .assign
 			lhs: [
 				t.synth_selector_from_struct(tmp_ident, field.name, target_c),
 			]
-			rhs: [t.transform_expr(field.value)]
+			rhs: [transformed_value]
 			pos: node.pos
 		})
+	}
+	// Restore outer pending_stmts and append our assoc stmts
+	t.pending_stmts = saved_pending
+	for s in assoc_stmts {
+		t.pending_stmts << s
 	}
 
 	// Yield value or address.
@@ -4199,11 +6335,24 @@ fn (t &Transformer) is_nil_expr(expr ast.Expr) bool {
 		ast.Keyword {
 			expr.tok == .key_nil
 		}
+		ast.BasicLiteral {
+			expr.kind == .number && expr.value == '0'
+		}
 		ast.Type {
 			expr is ast.NilType
 		}
 		ast.ParenExpr {
 			t.is_nil_expr(expr.expr)
+		}
+		ast.CastExpr {
+			t.is_nil_expr(expr.expr)
+		}
+		ast.UnsafeExpr {
+			if expr.stmts.len == 1 && expr.stmts[0] is ast.ExprStmt {
+				t.is_nil_expr((expr.stmts[0] as ast.ExprStmt).expr)
+			} else {
+				false
+			}
 		}
 		else {
 			false
@@ -4434,6 +6583,11 @@ fn (t &Transformer) get_sprintf_format_for_type(typ types.Type) string {
 			return '%d'
 		}
 		types.Pointer {
+			// If the pointed-to type has a str() method, use %s (the value will be
+			// dereferenced and passed to str() by transform_sprintf_arg).
+			if _ := t.get_str_fn_name_for_type(typ.base_type) {
+				return '%s'
+			}
 			return '%p'
 		}
 		types.Alias {
@@ -4451,10 +6605,44 @@ fn (t &Transformer) get_sprintf_format_for_type(typ types.Type) string {
 	}
 }
 
+fn (t &Transformer) sprintf_int_format_suffix(typ types.Type, decimal string, unsigned_fmt string) string {
+	match typ {
+		types.Alias {
+			base_fmt := t.get_sprintf_format_for_type(typ)
+			if base_fmt.len > 1 {
+				return base_fmt[1..]
+			}
+		}
+		types.Primitive {
+			if typ.props.has(types.Properties.unsigned) {
+				if typ.size == 64 {
+					return 'll${unsigned_fmt}'
+				}
+				return unsigned_fmt
+			}
+			if typ.size == 64 {
+				return 'll${decimal}'
+			}
+			return decimal
+		}
+		types.Enum {
+			return decimal
+		}
+		else {}
+	}
+	return decimal
+}
+
 fn (mut t Transformer) resolve_sprintf_format(inter ast.StringInter) string {
 	mut fmt := '%'
 	mut width := inter.width
 	mut precision := inter.precision
+	mut arg_typ := types.Type(types.Primitive{})
+	mut has_arg_typ := false
+	if typ := t.get_expr_type(inter.expr) {
+		arg_typ = typ
+		has_arg_typ = true
+	}
 	// Extract width/precision from format_expr when not set explicitly by the parser
 	if width == 0 && precision == 0 && inter.format_expr !is ast.EmptyExpr {
 		if inter.format_expr is ast.BasicLiteral {
@@ -4488,17 +6676,59 @@ fn (mut t Transformer) resolve_sprintf_format(inter ast.StringInter) string {
 	}
 	if inter.format != .unformatted {
 		match inter.format {
-			.decimal { fmt += 'd' }
-			.float { fmt += 'f' }
-			.hex { fmt += 'x' }
-			.octal { fmt += 'o' }
-			.character { fmt += 'c' }
-			.exponent { fmt += 'e' }
-			.exponent_short { fmt += 'g' }
-			.binary { fmt += 'd' } // binary not supported in printf, fallback to decimal
-			.pointer_address { fmt += 'p' }
-			.string { fmt += 's' }
-			.unformatted { fmt += 'd' }
+			.decimal {
+				fmt += if has_arg_typ {
+					t.sprintf_int_format_suffix(arg_typ, 'd', 'u')
+				} else {
+					'd'
+				}
+			}
+			.float {
+				fmt += 'f'
+			}
+			.hex {
+				fmt += if has_arg_typ {
+					t.sprintf_int_format_suffix(arg_typ, 'x', 'x')
+				} else {
+					'x'
+				}
+			}
+			.octal {
+				fmt += if has_arg_typ {
+					t.sprintf_int_format_suffix(arg_typ, 'o', 'o')
+				} else {
+					'o'
+				}
+			}
+			.character {
+				fmt += 'c'
+			}
+			.exponent {
+				fmt += 'e'
+			}
+			.exponent_short {
+				fmt += 'g'
+			}
+			.binary {
+				fmt += if has_arg_typ {
+					t.sprintf_int_format_suffix(arg_typ, 'd', 'u')
+				} else {
+					'd'
+				}
+			} // binary not supported in printf, fallback to decimal
+			.pointer_address {
+				fmt += 'p'
+			}
+			.string {
+				fmt += 's'
+			}
+			.unformatted {
+				fmt += if has_arg_typ {
+					t.sprintf_int_format_suffix(arg_typ, 'd', 'u')
+				} else {
+					'd'
+				}
+			}
 		}
 		return fmt
 	}
@@ -4514,6 +6744,19 @@ fn (mut t Transformer) transform_sprintf_arg(inter ast.StringInter) ast.Expr {
 	typ := t.get_expr_type(inter.expr) or {
 		return transformed // can't resolve type, pass as-is
 	}
+	// Keep string-producing expressions unchanged so interface method calls like
+	// `err.type_name()` stay as regular lowered call expressions.
+	match typ {
+		types.String {
+			return transformed
+		}
+		types.Alias {
+			if typ.base_type is types.String {
+				return transformed
+			}
+		}
+		else {}
+	}
 	// When an explicit format is specified, pass the expression as-is.
 	// The user has explicitly chosen the format, so no wrapping is needed
 	// (e.g., ${ptr:p} should pass the pointer directly, not call .str()).
@@ -4528,35 +6771,35 @@ fn (mut t Transformer) transform_sprintf_arg(inter ast.StringInter) ast.Expr {
 	}
 	match typ {
 		types.String {
-			// string -> expr.str (access C char* pointer for sprintf %s)
-			return t.synth_selector(transformed, 'str', types.Type(types.voidptr_))
+			// Keep as string value; backend string interpolation lowering
+			// handles conversion to C `%s` argument.
+			return transformed
+		}
+		types.Pointer {
+			// Pointer to a type with str(): dereference and call str().
+			// e.g., `mut t Termios` is &Termios → *t passed to Termios__str.
+			if str_fn_name := t.get_str_fn_name_for_type(typ.base_type) {
+				t.needed_str_fns[str_fn_name] = ''
+				deref := ast.Expr(ast.PrefixExpr{
+					op:   .mul
+					expr: transformed
+				})
+				str_call := ast.Expr(ast.CallExpr{
+					lhs:  ast.Ident{
+						name: str_fn_name
+					}
+					args: [deref]
+				})
+				return t.synth_selector(str_call, 'str', types.Type(types.voidptr_))
+			}
+			return transformed
 		}
 		types.Primitive {
 			if typ.props.has(types.Properties.boolean) {
-				is_native_be := t.pref != unsafe { nil }
-					&& (t.pref.backend == .arm64 || t.pref.backend == .x64 || t.pref.backend == .c)
-				if is_native_be {
-					// For native/SSA backends, pass the bool as-is; the SSA builder's
-					// convert_to_string will call builtin__bool__str.
-					return transformed
-				}
-				// bool -> if expr { "true" } else { "false" } (ternary for %s)
-				return ast.Expr(ast.IfExpr{
-					cond:      transformed
-					stmts:     [
-						ast.Stmt(ast.ExprStmt{
-							expr: ast.Expr(ast.StringLiteral{
-								kind:  .c
-								value: '"true"'
-							})
-						}),
-					]
-					else_expr: ast.Expr(ast.StringLiteral{
-						kind:  .c
-						value: '"false"'
-					})
-					pos:       inter.expr.pos()
-				})
+				// All backends handle bool→string in their own codegen:
+				// - SSA backends: convert_to_string calls builtin__bool__str
+				// - cleanc: write_sprintf_arg generates ternary ? "true" : "false"
+				return transformed
 			}
 			if typ.props.has(types.Properties.float) {
 				// float -> f64__str(expr).str for V-style formatting ('0.0' not '0.000000')
@@ -4579,6 +6822,8 @@ fn (mut t Transformer) transform_sprintf_arg(inter ast.StringInter) ast.Expr {
 		types.Enum {
 			// Enums should call their .str() method for string representation
 			if str_fn_name := t.get_str_fn_name_for_type(typ) {
+				t.needed_str_fns[str_fn_name] = ''
+				t.needed_enum_str_fns[str_fn_name] = typ
 				str_call := ast.Expr(ast.CallExpr{
 					lhs:  ast.Ident{
 						name: str_fn_name
@@ -4596,26 +6841,11 @@ fn (mut t Transformer) transform_sprintf_arg(inter ast.StringInter) ast.Expr {
 			base := typ.base_type
 			match base {
 				types.String {
-					return t.synth_selector(transformed, 'str', types.Type(types.voidptr_))
+					return transformed
 				}
 				types.Primitive {
 					if base.props.has(types.Properties.boolean) {
-						return ast.Expr(ast.IfExpr{
-							cond:      transformed
-							stmts:     [
-								ast.Stmt(ast.ExprStmt{
-									expr: ast.Expr(ast.StringLiteral{
-										kind:  .c
-										value: '"true"'
-									})
-								}),
-							]
-							else_expr: ast.Expr(ast.StringLiteral{
-								kind:  .c
-								value: '"false"'
-							})
-							pos:       inter.expr.pos()
-						})
+						return transformed
 					}
 					return transformed
 				}
@@ -4629,6 +6859,11 @@ fn (mut t Transformer) transform_sprintf_arg(inter ast.StringInter) ast.Expr {
 			str_fn_info := t.get_str_fn_info_for_expr(inter.expr)
 			if str_fn_info.str_fn_name != '' {
 				t.needed_str_fns[str_fn_info.str_fn_name] = str_fn_info.elem_type
+				if etyp := t.get_expr_type(inter.expr) {
+					if etyp is types.Enum {
+						t.needed_enum_str_fns[str_fn_info.str_fn_name] = etyp
+					}
+				}
 				str_call := ast.Expr(ast.CallExpr{
 					lhs:  ast.Ident{
 						name: str_fn_info.str_fn_name
@@ -4646,11 +6881,25 @@ fn (mut t Transformer) transform_sprintf_arg(inter ast.StringInter) ast.Expr {
 fn (mut t Transformer) transform_string_inter_literal(expr ast.StringInterLiteral) ast.Expr {
 	mut new_inters := []ast.StringInter{cap: expr.inters.len}
 	for inter in expr.inters {
+		mut actual_inter := inter
+		if t.interpolation_expr_uses_smartcast(inter.expr) {
+			if expr_typ := t.get_expr_type(inter.expr) {
+				// Hoist the original expression FIRST, then wrap with .str() etc.
+				// This prevents double-wrapping: the hoisted temp has the original type,
+				// and transform_sprintf_arg wraps it correctly.
+				hoisted := t.hoist_expr_to_temp(t.transform_expr(inter.expr), expr_typ)
+				actual_inter = ast.StringInter{
+					...inter
+					expr: hoisted
+				}
+			}
+		}
+		inter_expr := t.transform_sprintf_arg(actual_inter)
 		new_inters << ast.StringInter{
 			format:       inter.format
 			width:        inter.width
 			precision:    inter.precision
-			expr:         t.transform_sprintf_arg(inter)
+			expr:         inter_expr
 			format_expr:  inter.format_expr
 			resolved_fmt: t.resolve_sprintf_format(inter)
 		}
@@ -4662,6 +6911,40 @@ fn (mut t Transformer) transform_string_inter_literal(expr ast.StringInterLitera
 	}
 }
 
+fn (t &Transformer) interpolation_expr_uses_smartcast(expr ast.Expr) bool {
+	if !t.has_active_smartcast() {
+		return false
+	}
+	expr_str := t.expr_to_string(expr)
+	if expr_str == '' {
+		return false
+	}
+	for ctx in t.smartcast_stack {
+		if ctx.expr == '' {
+			continue
+		}
+		if expr_str == ctx.expr || expr_str.starts_with(ctx.expr + '.')
+			|| expr_str.starts_with(ctx.expr + '[') {
+			return true
+		}
+	}
+	return false
+}
+
+fn (mut t Transformer) hoist_expr_to_temp(expr ast.Expr, typ types.Type) ast.Expr {
+	tmp_name := t.gen_temp_name()
+	tmp_ident := ast.Ident{
+		name: tmp_name
+	}
+	t.register_temp_var(tmp_name, typ)
+	t.pending_stmts << ast.Stmt(ast.AssignStmt{
+		op:  .decl_assign
+		lhs: [ast.Expr(tmp_ident)]
+		rhs: [expr]
+	})
+	return ast.Expr(tmp_ident)
+}
+
 // apply_smartcast_direct_ctx generates a cast expression for direct access to a smartcast variable
 // For primitives: ((int)(intptr_t)v._data._int) - cast from pointer space back to value
 // For structs/strings: (*((ast__Type*)v._data._Type)) - dereference pointer
@@ -4669,19 +6952,42 @@ fn (mut t Transformer) apply_smartcast_direct_ctx(original_expr ast.Expr, ctx Sm
 	// variant (short name) is used for union member access: _data._Array_Attribute
 	// variant_full (full name) is used for type cast: (Array_ast__Attribute*)
 	variant_short := ctx.variant
-	// Extract simple variant name for _data._ accessor (strip module prefix for non-composite types)
-	// But preserve composite type prefixes like Array_, Map_, Array_fixed_
+	// Extract simple variant name for _data._ accessor
+	// Union fields use: _Null (same-module Ident), _time__Time (cross-module SelectorExpr),
+	// _Array_json2__Any (composite). Only strip module prefix for same-module types.
+	// Union fields use the name as seen from the declaring module:
+	// same-module Ident → _Null, cross-module SelectorExpr → _time__Time.
+	// Strip module prefix when the variant's module matches the sumtype's module,
+	// because those variants were declared as Idents (no module prefix in the union).
+	sumtype_module := if ctx.sumtype.contains('__') {
+		ctx.sumtype.all_before_last('__')
+	} else {
+		''
+	}
 	variant_simple := if variant_short.starts_with('Array_') || variant_short.starts_with('Map_') {
 		// For composite types (arrays, maps), use the short name to match union member
 		variant_short
 	} else if variant_short.contains('__') {
-		variant_short.all_after_last('__')
+		mod_prefix := variant_short.all_before_last('__')
+		if mod_prefix == sumtype_module {
+			// Same module as sumtype: union field uses short name (e.g., _Null for json2__Null)
+			variant_short.all_after_last('__')
+		} else {
+			// Cross-module: union field keeps module prefix (e.g., _time__Time)
+			variant_short
+		}
 	} else {
 		variant_short
 	}
 	// For type cast, use the full variant name from context
 	// This has the proper module prefix for the typedef
-	mangled_variant := if ctx.variant_full != '' {
+	// But never add module prefix to builtin types (string, i64, bool, etc.)
+	is_builtin_variant := variant_short in ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32',
+		'u64', 'byte', 'rune', 'f32', 'f64', 'usize', 'isize', 'bool', 'string', 'voidptr', 'charptr',
+		'byteptr']
+	mangled_variant := if is_builtin_variant {
+		variant_short
+	} else if ctx.variant_full != '' {
 		ctx.variant_full
 	} else if variant_short.contains('__') {
 		variant_short // Already has module prefix
@@ -4706,6 +7012,25 @@ fn (mut t Transformer) apply_smartcast_direct_ctx(original_expr ast.Expr, ctx Sm
 	// Already concretely casted to this variant by an outer smartcast context.
 	if t.expr_is_casted_to_type(transformed_base, mangled_variant) {
 		return transformed_base
+	}
+	// For interface smartcasts, use _object instead of _data (interfaces don't have _data)
+	is_interface_ctx := ctx.sumtype.starts_with('__iface__')
+	if is_interface_ctx {
+		object_access := t.synth_selector(transformed_base, '_object', types.Type(types.voidptr_))
+		cast_expr := ast.CastExpr{
+			typ:  ast.Ident{
+				name: '${mangled_variant}*'
+			}
+			expr: object_access
+		}
+		return ast.ParenExpr{
+			expr: ast.PrefixExpr{
+				op:   token.Token.mul
+				expr: ast.ParenExpr{
+					expr: cast_expr
+				}
+			}
+		}
 	}
 	// Create data access.
 	// For native backends (arm64/x64): _data is a plain i64 (void pointer) in the SSA struct.
@@ -4763,18 +7088,38 @@ fn (mut t Transformer) apply_smartcast_receiver_ctx(sumtype_expr ast.Expr, ctx S
 	// variant (short name) is used for union member access
 	// variant_full (full name) is used for type cast
 	variant_short := ctx.variant
-	// Extract simple variant name for _data._ accessor (strip module prefix)
-	// But preserve composite type prefixes like Array_, Map_, Array_fixed_
+	// Extract simple variant name for _data._ accessor
+	// Union fields use: _Null (same-module Ident), _time__Time (cross-module SelectorExpr),
+	// _Array_json2__Any (composite). Only strip module prefix for same-module types.
+	// Union fields use the name as seen from the declaring module:
+	// same-module Ident → _Null, cross-module SelectorExpr → _time__Time.
+	// Strip module prefix when the variant's module matches the sumtype's module.
+	sumtype_module := if ctx.sumtype.contains('__') {
+		ctx.sumtype.all_before_last('__')
+	} else {
+		''
+	}
 	variant_simple := if variant_short.starts_with('Array_') || variant_short.starts_with('Map_') {
 		// For composite types, use the short name to match union member
 		variant_short
 	} else if variant_short.contains('__') {
-		variant_short.all_after_last('__')
+		mod_prefix := variant_short.all_before_last('__')
+		if mod_prefix == sumtype_module {
+			variant_short.all_after_last('__')
+		} else {
+			variant_short
+		}
 	} else {
 		variant_short
 	}
 	// Use full variant name for type cast from context
-	mangled_variant := if ctx.variant_full != '' {
+	// But never add module prefix to builtin types (string, i64, bool, etc.)
+	is_builtin_variant := variant_short in ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32',
+		'u64', 'byte', 'rune', 'f32', 'f64', 'usize', 'isize', 'bool', 'string', 'voidptr', 'charptr',
+		'byteptr']
+	mangled_variant := if is_builtin_variant {
+		variant_short
+	} else if ctx.variant_full != '' {
 		ctx.variant_full
 	} else if variant_short.contains('__') {
 		variant_short // Already has module prefix
@@ -4810,6 +7155,27 @@ fn (mut t Transformer) apply_smartcast_receiver_ctx(sumtype_expr ast.Expr, ctx S
 		data_access
 	} else {
 		t.synth_selector(data_access, '_${variant_simple}', types.Type(types.voidptr_))
+	}
+	if t.is_eval_backend() {
+		return variant_access
+	}
+	// Primitive variants are boxed directly in pointer-sized storage.
+	// Unbox to the value type before dispatching method calls (e.g. int.str()).
+	if variant_simple in ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64', 'f32', 'f64',
+		'bool', 'rune', 'byte', 'usize', 'isize'] {
+		return ast.ParenExpr{
+			expr: ast.CastExpr{
+				typ:  ast.Ident{
+					name: variant_simple
+				}
+				expr: ast.CastExpr{
+					typ:  ast.Ident{
+						name: 'intptr_t'
+					}
+					expr: variant_access
+				}
+			}
+		}
 	}
 	// Create: (mangled_variant*)variant_access
 	cast_expr := ast.CastExpr{
@@ -4954,6 +7320,8 @@ fn (t &Transformer) smartcast_context_from_is_check(expr ast.InfixExpr) ?Smartca
 		if sel.lhs is ast.Ident {
 			variant_module = (sel.lhs as ast.Ident).name
 		}
+	} else if expr.rhs is ast.Type {
+		variant_name = t.type_expr_to_variant_name(expr.rhs)
 	}
 	if variant_name == '' {
 		return none
@@ -4966,6 +7334,46 @@ fn (t &Transformer) smartcast_context_from_is_check(expr ast.InfixExpr) ?Smartca
 		}
 		if t.lookup_type(lookup_name) == none && t.lookup_type(variant_name) == none {
 			return none
+		}
+	}
+
+	// Interface smartcast: `if iface is ConcreteType { ... }`
+	// This allows receiver.method() calls in the body to resolve to concrete methods.
+	if lhs_type := t.resolve_expr_type(expr.lhs) {
+		lhs_base := t.unwrap_alias_and_pointer_type(lhs_type)
+		if lhs_base is types.Interface {
+			mut concrete_lookup := if variant_module != '' {
+				'${variant_module}__${variant_name}'
+			} else {
+				variant_name
+			}
+			mut concrete_type := t.lookup_type(concrete_lookup) or {
+				concrete_lookup = variant_name
+				t.lookup_type(concrete_lookup) or { return none }
+			}
+			// Skip smartcast when the RHS is also an interface (interface-to-interface
+			// narrowing). Casting _object to an interface struct pointer is invalid since
+			// _object points to the concrete type, not another interface struct.
+			if concrete_type is types.Interface {
+				return none
+			}
+			if concrete_type.type_name() != '' {
+				mut concrete_full := t.type_to_c_name(concrete_type)
+				if concrete_full == '' {
+					concrete_full = concrete_lookup
+				}
+				concrete_short := if concrete_full.contains('__') {
+					concrete_full.all_after_last('__')
+				} else {
+					variant_name
+				}
+				return SmartcastContext{
+					expr:         t.expr_to_string(expr.lhs)
+					variant:      concrete_short
+					variant_full: concrete_full
+					sumtype:      '__iface__${lhs_type.name()}'
+				}
+			}
 		}
 	}
 
@@ -4996,17 +7404,22 @@ fn (t &Transformer) smartcast_context_from_is_check(expr ast.InfixExpr) ?Smartca
 		return none
 	}
 
+	// Convert V-style variant names ([]T, map[K]V) to C-style for code generation
+	c_variant_name := t.variant_name_to_c(variant_name)
 	qualified_variant := if variant_module != '' {
-		'${variant_module}__${variant_name}'
+		'${variant_module}__${c_variant_name}'
 	} else {
-		variant_name
+		c_variant_name
 	}
 	qualified_variant_full := if variant_module != '' {
-		'${variant_module}__${variant_name}'
+		'${variant_module}__${c_variant_name}'
+	} else if c_variant_name.contains('__') {
+		// Already module-qualified (e.g. Array_json2__Any from type_expr_to_variant_name)
+		c_variant_name
 	} else if t.cur_module != '' && t.cur_module != 'main' && t.cur_module != 'builtin' {
-		'${t.cur_module}__${variant_name}'
+		'${t.cur_module}__${c_variant_name}'
 	} else {
-		variant_name
+		c_variant_name
 	}
 	return SmartcastContext{
 		expr:         t.expr_to_string(expr.lhs)
@@ -5039,6 +7452,42 @@ fn (t &Transformer) match_variant(c_name string, variants []string) ?string {
 	if c_name in variants {
 		return c_name
 	}
+	// Allow matching C-mangled container names (Array_*, Map_*, Array_fixed_*)
+	// against V-notation sum variants (e.g. []string, map[string]int, [3]int).
+	// Only call c_name_to_type for container prefixes - it constructs Array/Map/ArrayFixed
+	// types directly without scope lookup. For other names, skip to string-based matching
+	// to avoid scope.lookup_parent which can crash in v3 (ARM64) due to corrupted sumtype
+	// data when extracting nested Type from Object from map[string]Object.
+	if c_name.starts_with('Array_') || c_name.starts_with('Map_') {
+		if c_typ := t.c_name_to_type(c_name) {
+			v_name := c_typ.name()
+			if v_name in variants {
+				return v_name
+			}
+			v_short := if v_name.contains('__') { v_name.all_after_last('__') } else { v_name }
+			for v in variants {
+				var_short := if v.contains('__') { v.all_after_last('__') } else { v }
+				if v_name == v || v_short == var_short || v_short == v {
+					return v
+				}
+			}
+		}
+		// Fallback for Map_* when c_name_to_type can't resolve the value type:
+		// Convert C-mangled Map_string_X to V-style map[string]X and match directly
+		if c_name.starts_with('Map_string_') {
+			v_style_name := 'map[string]${c_name['Map_string_'.len..]}'
+			if v_style_name in variants {
+				return v_style_name
+			}
+		}
+		// Also try V-style []X for Array_X
+		if c_name.starts_with('Array_') {
+			v_style_name := '[]${c_name['Array_'.len..]}'
+			if v_style_name in variants {
+				return v_style_name
+			}
+		}
+	}
 	c_short := if c_name.contains('__') { c_name.all_after_last('__') } else { c_name }
 	for v in variants {
 		v_short := if v.contains('__') { v.all_after_last('__') } else { v }
@@ -5047,6 +7496,28 @@ fn (t &Transformer) match_variant(c_name string, variants []string) ?string {
 		}
 	}
 	return none
+}
+
+// is_same_sumtype_name checks whether `actual` denotes the same sum type as
+// `expected`, allowing the checker to report short names (e.g. `Type`) while
+// transformer state tracks fully-qualified names (e.g. `types__Type`).
+fn (t &Transformer) is_same_sumtype_name(actual string, expected string) bool {
+	if actual == '' || expected == '' {
+		return false
+	}
+	if actual == expected {
+		return true
+	}
+	if !t.is_sum_type(expected) {
+		return false
+	}
+	if !actual.contains('__') && expected.contains('__') {
+		return expected.all_after_last('__') == actual
+	}
+	if actual.contains('__') && !expected.contains('__') {
+		return actual.all_after_last('__') == expected
+	}
+	return false
 }
 
 fn (t &Transformer) is_array_value_expr(expr ast.Expr) bool {
@@ -5147,6 +7618,24 @@ fn (t &Transformer) get_array_method_info(expr ast.Expr) ?ArrayMethodInfo {
 		if elem_type_name == '' || elem_type_name == 'void' {
 			return none
 		}
+		// Check if the expression's C type name indicates a fixed array.
+		// get_array_elem_type_str loses fixed-array info, so recover it here.
+		if expr is ast.Ident {
+			var_type := t.get_var_type_name(expr.name)
+			c_type := t.v_type_name_to_c_name(var_type)
+			if c_type.starts_with('Array_fixed_') {
+				payload := c_type['Array_fixed_'.len..]
+				if payload.contains('_') {
+					len_str := payload.all_after_last('_')
+					return ArrayMethodInfo{
+						array_type: c_type
+						elem_type:  elem_type_name
+						is_fixed:   true
+						fixed_len:  len_str.int()
+					}
+				}
+			}
+		}
 		return ArrayMethodInfo{
 			array_type: 'Array_${elem_type_name}'
 			elem_type:  elem_type_name
@@ -5236,6 +7725,23 @@ fn (mut t Transformer) transform_flag_enum_method(receiver ast.Expr, method stri
 	}
 
 	// receiver & flag
+	if t.pref != unsafe { nil } && t.pref.backend == .cleanc {
+		helper_name := if method == 'has' {
+			'__v2_flag_has_int'
+		} else {
+			'__v2_flag_all_int'
+		}
+		return ast.CallExpr{
+			lhs:  ast.Ident{
+				name: helper_name
+			}
+			args: [
+				ast.Expr(receiver_int),
+				ast.Expr(arg_int),
+			]
+		}
+	}
+
 	and_expr := ast.InfixExpr{
 		op:  .amp
 		lhs: receiver_int
@@ -5243,7 +7749,6 @@ fn (mut t Transformer) transform_flag_enum_method(receiver ast.Expr, method stri
 	}
 
 	if method == 'has' {
-		// (receiver & flag) != 0
 		paren_pos := t.next_synth_pos()
 		if int_obj := t.scope.lookup_parent('int', 0) {
 			t.register_synth_type(paren_pos, int_obj.typ())
@@ -5259,26 +7764,25 @@ fn (mut t Transformer) transform_flag_enum_method(receiver ast.Expr, method stri
 				value: '0'
 			}
 		}
-	} else { // all
-		// (receiver & flags) == int(flags)
-		arg_int2 := ast.CastExpr{
-			typ:  ast.Ident{
-				name: 'int'
-			}
-			expr: resolved_arg
+	}
+
+	arg_int2 := ast.CastExpr{
+		typ:  ast.Ident{
+			name: 'int'
 		}
-		paren_pos := t.next_synth_pos()
-		if int_obj := t.scope.lookup_parent('int', 0) {
-			t.register_synth_type(paren_pos, int_obj.typ())
+		expr: resolved_arg
+	}
+	paren_pos := t.next_synth_pos()
+	if int_obj := t.scope.lookup_parent('int', 0) {
+		t.register_synth_type(paren_pos, int_obj.typ())
+	}
+	return ast.InfixExpr{
+		op:  .eq
+		lhs: ast.ParenExpr{
+			expr: and_expr
+			pos:  paren_pos
 		}
-		return ast.InfixExpr{
-			op:  .eq
-			lhs: ast.ParenExpr{
-				expr: and_expr
-				pos:  paren_pos
-			}
-			rhs: arg_int2
-		}
+		rhs: arg_int2
 	}
 }
 
@@ -5369,7 +7873,7 @@ fn (t &Transformer) resolve_enum_shorthand(expr ast.Expr, enum_type string) ast.
 		if sel.lhs is ast.EmptyExpr {
 			// Resolve to EnumType__member as an Ident (C-mangled name)
 			return ast.Ident{
-				name: '${enum_type}__${sel.rhs.name}'
+				name: enum_member_ident(enum_type, sel.rhs.name)
 				pos:  sel.pos
 			}
 		}
@@ -5647,11 +8151,6 @@ fn (t &Transformer) is_string_expr(expr ast.Expr) bool {
 			return expr.name in ['@FN', '@FILE', '@MOD', '@STRUCT', '@METHOD', '@LOCATION',
 				'@FUNCTION', '@VMODROOT']
 		}
-		// Check if variable type is string via scope lookup
-		var_type_name := t.get_var_type_name(expr.name)
-		if var_type_name == 'string' {
-			return true
-		}
 		// Use type environment to look up the identifier's type
 		if mut scope := t.get_current_scope() {
 			if obj := scope.lookup_parent(expr.name, 0) {
@@ -5784,7 +8283,7 @@ fn (t &Transformer) is_string_expr(expr ast.Expr) bool {
 			if sel.lhs is ast.Ident {
 				mod_name := (sel.lhs as ast.Ident).name
 				// Try looking up as a module-qualified function
-				if fn_type := t.env.lookup_fn(mod_name, method_name) {
+				if fn_type := t.lookup_fn_cached(mod_name, method_name) {
 					if return_type := fn_type.get_return_type() {
 						if return_type is types.String {
 							return true
@@ -5799,7 +8298,7 @@ fn (t &Transformer) is_string_expr(expr ast.Expr) bool {
 			// Try method lookup
 			if receiver_type := t.get_expr_type(sel.lhs) {
 				type_name := t.get_type_name(receiver_type)
-				if fn_type := t.env.lookup_method(type_name, method_name) {
+				if fn_type := t.lookup_method_cached(type_name, method_name) {
 					if return_type := fn_type.get_return_type() {
 						if return_type is types.String {
 							return true
@@ -5816,29 +8315,51 @@ fn (t &Transformer) is_string_expr(expr ast.Expr) bool {
 			if method_name in ['pop', 'first', 'last'] {
 				if sel.lhs is ast.Ident {
 					receiver_name := (sel.lhs as ast.Ident).name
-					receiver_type := t.get_var_type_name(receiver_name)
-					if receiver_type == 'Array_string' {
+					receiver_type_name := t.get_var_type_name(receiver_name)
+					if receiver_type_name == 'Array_string' {
 						return true
 					}
 				}
 			}
-			// Fallback: check known string-returning methods
-			if t.is_string_returning_method(method_name) {
+			// Fallback: check known string-returning methods, but only when
+			// the receiver type is unknown. Methods like 'reverse', 'clone'
+			// exist on both string and array — if the receiver resolved to
+			// a non-string type above, trust that instead of the heuristic.
+			if method_name in ['reverse', 'clone'] {
+				// These methods are ambiguous (exist on string AND array).
+				// Only treat as string if the receiver is known to be a string.
+				if t.is_string_expr(sel.lhs) {
+					return true
+				}
+			} else if t.is_string_returning_method(method_name) {
 				return true
 			}
 			// Also check if receiver is string and method typically returns string
-			if t.is_string_expr(sel.lhs) && method_name in ['clone', 'str', 'string'] {
+			if t.is_string_expr(sel.lhs) && method_name in ['str', 'string'] {
 				return true
 			}
 		}
 		// Check function return type using environment
 		if expr.lhs is ast.Ident {
 			fn_name := expr.lhs.name
-			// Check for already-transformed string functions
-			if fn_name.starts_with('string__') && fn_name !in ['string__bytes', 'string__vbytes'] {
-				// string__ prefix functions return string (string__plus, string__repeat, etc.)
-				// except string__bytes/string__vbytes which return []u8
-				return true
+			// array__ prefix functions return array, not string
+			if fn_name.starts_with('array__') || fn_name.starts_with('new_array_from_') {
+				return false
+			}
+			// Check for already-transformed string__ prefix functions.
+			if fn_name.starts_with('string__') {
+				// Known string-returning string__ functions
+				if fn_name in ['string__plus', 'string__repeat', 'string__substr',
+					'string__substr_unsafe', 'string__replace', 'string__replace_once',
+					'string__trim', 'string__trim_left', 'string__trim_right', 'string__trim_space',
+					'string__to_upper', 'string__to_lower', 'string__reverse', 'string__clone',
+					'string__strip_margin', 'string__capitalize', 'string__uncapitalize',
+					'string__after', 'string__before', 'string__all_before', 'string__all_after',
+					'string__all_before_last', 'string__all_after_last', 'string__hex',
+					'string__ascii_str', 'string__bytestr'] {
+					return true
+				}
+				return false
 			}
 			// Try to find the function in the current module's scope
 			if mut scope := t.get_current_scope() {
@@ -5869,7 +8390,7 @@ fn (t &Transformer) is_string_expr(expr ast.Expr) bool {
 					mod_name := parts[0]
 					actual_fn := parts[1..].join('__')
 					// Use environment's lookup_fn which checks the module's scope
-					if fn_type := t.env.lookup_fn(mod_name, actual_fn) {
+					if fn_type := t.lookup_fn_cached(mod_name, actual_fn) {
 						if return_type := fn_type.get_return_type() {
 							if return_type is types.String {
 								return true
@@ -5896,7 +8417,7 @@ fn (t &Transformer) is_string_expr(expr ast.Expr) bool {
 			// First check for module-qualified function calls (e.g., os.user_os())
 			if sel.lhs is ast.Ident {
 				mod_name := (sel.lhs as ast.Ident).name
-				if fn_type := t.env.lookup_fn(mod_name, method_name) {
+				if fn_type := t.lookup_fn_cached(mod_name, method_name) {
 					if return_type := fn_type.get_return_type() {
 						if return_type is types.String {
 							return true
@@ -5911,7 +8432,7 @@ fn (t &Transformer) is_string_expr(expr ast.Expr) bool {
 			// Try method lookup
 			if receiver_type := t.get_expr_type(sel.lhs) {
 				type_name := t.get_type_name(receiver_type)
-				if fn_type := t.env.lookup_method(type_name, method_name) {
+				if fn_type := t.lookup_method_cached(type_name, method_name) {
 					if return_type := fn_type.get_return_type() {
 						if return_type is types.String {
 							return true
@@ -5965,7 +8486,7 @@ fn (t &Transformer) is_string_expr(expr ast.Expr) bool {
 				if parts.len >= 2 {
 					mod_name := parts[0]
 					actual_fn := parts[1..].join('__')
-					if fn_type := t.env.lookup_fn(mod_name, actual_fn) {
+					if fn_type := t.lookup_fn_cached(mod_name, actual_fn) {
 						if return_type := fn_type.get_return_type() {
 							if return_type is types.String {
 								return true
@@ -6040,9 +8561,11 @@ fn (t &Transformer) is_string_expr_in_block(expr ast.Expr, stmts []ast.Stmt) boo
 
 // is_string_returning_fn returns true if a function is known to return a string
 fn (t &Transformer) is_string_returning_fn(fn_name string) bool {
-	// Known string-returning functions
+	// Known string-returning functions (hardcoded to avoid scope lookup failures
+	// in ARM64-compiled binaries where the checker's type store may be unreliable)
 	if fn_name in ['string__plus', 'string__plus_two', 'string__substr', 'string__substr_unsafe',
-		'string__repeat'] {
+		'string__repeat', 'tos', 'tos2', 'tos3', 'tos4', 'tos5', 'tos_clone', 'cstring_to_vstring',
+		'string_clone'] {
 		return true
 	}
 	// String module functions generally return strings (except bytes/vbytes which return []u8)
@@ -6157,9 +8680,24 @@ fn (mut t Transformer) get_str_fn_info_for_expr(expr ast.Expr) StrFnInfo {
 	// Try to infer map type
 	if map_type := t.get_map_type_for_expr(expr) {
 		// map_type is like 'Map_string_int'
+		// Encode key|val type names for map str function generation
+		mut elem_info := map_type
+		if typ := t.get_expr_type(expr) {
+			unwrapped := t.unwrap_alias_and_pointer_type(typ)
+			base := if unwrapped is types.Alias {
+				(unwrapped as types.Alias).base_type
+			} else {
+				unwrapped
+			}
+			if base is types.Map {
+				key_c := t.type_to_c_name(base.key_type)
+				val_c := t.type_to_c_name(base.value_type)
+				elem_info = '${key_c}|${val_c}'
+			}
+		}
 		return StrFnInfo{
 			str_fn_name: '${map_type}_str'
-			elem_type:   map_type
+			elem_type:   elem_info
 		}
 	}
 	// Handle ArrayInitExpr directly for inline array literals
@@ -6225,6 +8763,203 @@ fn is_core_generated_fn(name string) bool {
 	return false
 }
 
+// generated_fn_module extracts the module name from a generated function's name
+// by checking if its prefix matches any module in the result files.
+// E.g., "time__FormatDate__str" → "time" if a file with mod=="time" exists.
+// Returns '' if no module match is found (function belongs to main/builtin).
+fn generated_fn_module(fn_name string, files []ast.File) string {
+	// Skip names that don't have a module prefix (no __ separator)
+	if !fn_name.contains('__') {
+		return ''
+	}
+	// Try to match the prefix before the first __ against known module names
+	prefix := fn_name.all_before('__')
+	// Skip common non-module prefixes
+	if prefix in ['Array', 'Map', 'Array_fixed', 'Map_K_V', 'bool', 'int', 'i8', 'i16', 'i32',
+		'i64', 'u8', 'u16', 'u32', 'u64', 'f32', 'f64', 'string', 'rune', 'voidptr', 'byteptr',
+		'charptr', 'isize', 'usize'] {
+		return ''
+	}
+	for file in files {
+		if file.mod == prefix && file.mod != 'main' && file.mod != 'builtin' {
+			return prefix
+		}
+	}
+	return ''
+}
+
+fn clone_generated_fn_scope_module(struct_name string) string {
+	if !struct_name.contains('__') {
+		return 'main'
+	}
+	return struct_name.all_before('__')
+}
+
+fn (mut t Transformer) clone_value_expr(expr ast.Expr, typ types.Type) ast.Expr {
+	resolved := types.resolve_alias(typ)
+	match resolved {
+		types.String {
+			return ast.Expr(ast.CallExpr{
+				lhs:  ast.Ident{
+					name: 'string__clone'
+				}
+				args: [expr]
+			})
+		}
+		types.Array {
+			depth := t.get_array_nesting_depth(resolved)
+			if depth > 1 {
+				return ast.Expr(ast.CallExpr{
+					lhs:  ast.Ident{
+						name: 'array__clone_to_depth'
+					}
+					args: [
+						expr,
+						ast.Expr(ast.BasicLiteral{
+							kind:  .number
+							value: '${depth - 1}'
+						}),
+					]
+				})
+			}
+			return ast.Expr(ast.CallExpr{
+				lhs:  ast.Ident{
+					name: 'array__clone'
+				}
+				args: [expr]
+			})
+		}
+		types.Map {
+			return ast.Expr(ast.CallExpr{
+				lhs:  ast.Ident{
+					name: 'map__clone'
+				}
+				args: [expr]
+			})
+		}
+		types.Struct {
+			if clone_fn_name := t.auto_clone_fn_name_for_type(resolved) {
+				return ast.Expr(ast.CallExpr{
+					lhs:  ast.Ident{
+						name: clone_fn_name
+					}
+					args: [expr]
+				})
+			}
+		}
+		else {}
+	}
+	return expr
+}
+
+fn (mut t Transformer) generate_struct_clone_fn(fn_name string, struct_name string, struct_type types.Struct) ast.Stmt {
+	param_s := ast.Parameter{
+		name: 's'
+		typ:  ast.Ident{
+			name: struct_name
+		}
+	}
+	mut fields := []ast.FieldInit{cap: struct_type.embedded.len + struct_type.fields.len}
+	for embedded in struct_type.embedded {
+		embedded_name := if embedded.name.contains('__') {
+			embedded.name.all_after_last('__')
+		} else {
+			embedded.name
+		}
+		if embedded_name == '' {
+			continue
+		}
+		field_selector := t.synth_selector(ast.Expr(ast.Ident{
+			name: 's'
+		}), embedded_name, types.Type(embedded))
+		fields << ast.FieldInit{
+			name:  embedded_name
+			value: t.clone_value_expr(field_selector, types.Type(embedded))
+		}
+	}
+	for field in struct_type.fields {
+		field_selector := t.synth_selector_from_struct(ast.Expr(ast.Ident{
+			name: 's'
+		}), field.name, struct_name)
+		fields << ast.FieldInit{
+			name:  field.name
+			value: t.clone_value_expr(field_selector, field.typ)
+		}
+	}
+	t.register_generated_fn_scope(fn_name, clone_generated_fn_scope_module(struct_name), [
+		param_s,
+	])
+	return ast.Stmt(ast.FnDecl{
+		name:  fn_name
+		typ:   ast.FnType{
+			params:      [param_s]
+			return_type: ast.Ident{
+				name: struct_name
+			}
+		}
+		stmts: [
+			ast.Stmt(ast.ReturnStmt{
+				exprs: [
+					ast.Expr(ast.InitExpr{
+						typ:    ast.Ident{
+							name: struct_name
+						}
+						fields: fields
+					}),
+				]
+			}),
+		]
+	})
+}
+
+fn (mut t Transformer) generate_clone_functions() []ast.Stmt {
+	mut result := []ast.Stmt{cap: t.needed_clone_fns.len}
+	mut generated := map[string]bool{}
+	for {
+		mut found_new := false
+		for fn_name, struct_name in t.needed_clone_fns {
+			if fn_name in generated {
+				continue
+			}
+			generated[fn_name] = true
+			found_new = true
+			if typ := t.lookup_struct_type_any_module(struct_name) {
+				result << t.generate_struct_clone_fn(fn_name, struct_name, typ)
+				continue
+			}
+			result << ast.Stmt(ast.FnDecl{
+				name:  fn_name
+				typ:   ast.FnType{
+					params:      [
+						ast.Parameter{
+							name: 's'
+							typ:  ast.Ident{
+								name: struct_name
+							}
+						},
+					]
+					return_type: ast.Ident{
+						name: struct_name
+					}
+				}
+				stmts: [
+					ast.Stmt(ast.ReturnStmt{
+						exprs: [
+							ast.Expr(ast.Ident{
+								name: 's'
+							}),
+						]
+					}),
+				]
+			})
+		}
+		if !found_new {
+			break
+		}
+	}
+	return result
+}
+
 fn (mut t Transformer) generate_str_functions() []ast.Stmt {
 	mut result := []ast.Stmt{cap: t.needed_str_fns.len}
 	// Use worklist to handle recursive str function registration
@@ -6246,6 +8981,54 @@ fn (mut t Transformer) generate_str_functions() []ast.Stmt {
 				generated[fn_name] = true
 				found_new = true
 				result << t.generate_array_str_fn(fn_name, elem_type)
+			} else if fn_name.starts_with('Map_') {
+				// Generate map str function
+				generated[fn_name] = true
+				found_new = true
+				result << t.generate_map_str_fn(fn_name, elem_type)
+			} else if fn_name.ends_with('__str') {
+				// Generate str function for struct or enum
+				struct_name := fn_name[..fn_name.len - '__str'.len]
+				// Skip primitive/builtin types that already have real str implementations
+				if struct_name in ['int', 'i8', 'i16', 'i32', 'i64', 'u8', 'u16', 'u32', 'u64',
+					'f32', 'f64', 'bool', 'string', 'rune', 'voidptr', 'byteptr', 'charptr', 'byte',
+					'char'] {
+					continue
+				}
+				generated[fn_name] = true
+				found_new = true
+				if enum_type := t.needed_enum_str_fns[fn_name] {
+					// Generate enum str function with if-else chain for each variant
+					result << t.generate_enum_str_fn(fn_name, struct_name, enum_type)
+				} else {
+					// Generate struct str function: fn StructName__str(s StructName) string { return "StructName{}" }
+					result << ast.Stmt(ast.FnDecl{
+						name:  fn_name
+						typ:   ast.FnType{
+							params:      [
+								ast.Parameter{
+									name: 's'
+									typ:  ast.Ident{
+										name: struct_name
+									}
+								},
+							]
+							return_type: ast.Ident{
+								name: 'string'
+							}
+						}
+						stmts: [
+							ast.Stmt(ast.ReturnStmt{
+								exprs: [
+									ast.Expr(ast.StringLiteral{
+										value: "'${struct_name}{}'"
+										kind:  .v
+									}),
+								]
+							}),
+						]
+					})
+				}
 			}
 		}
 		if !found_new {
@@ -6253,6 +9036,89 @@ fn (mut t Transformer) generate_str_functions() []ast.Stmt {
 		}
 	}
 	return result
+}
+
+fn (mut t Transformer) generate_enum_str_fn(fn_name string, enum_name string, enum_type types.Enum) ast.Stmt {
+	// Build if-else chain: if int(e) == 0 { return 'variant0' } else if int(e) == 1 { ... } else { return int(e).str() }
+	// Build from last to first so we can nest else expressions
+	// Final else: return int(e).str() — converts to int and calls int__str
+	mut else_body := ast.Expr(ast.empty_expr)
+	for i := enum_type.fields.len - 1; i >= 0; i-- {
+		field := enum_type.fields[i]
+		field_name := field.name
+		ret_stmt := ast.Stmt(ast.ReturnStmt{
+			exprs: [
+				ast.Expr(ast.StringLiteral{
+					value: "'${field_name}'"
+					kind:  .v
+				}),
+			]
+		})
+		cond := ast.Expr(ast.InfixExpr{
+			lhs: ast.Expr(ast.CastExpr{
+				typ:  ast.Ident{
+					name: 'int'
+				}
+				expr: ast.Ident{
+					name: 'e'
+				}
+			})
+			op:  .eq
+			rhs: ast.Expr(ast.BasicLiteral{
+				value: '${i}'
+				kind:  .number
+			})
+		})
+		else_body = ast.Expr(ast.IfExpr{
+			cond:      cond
+			stmts:     [ret_stmt]
+			else_expr: else_body
+		})
+	}
+	// Wrap the top-level if-else chain in an ExprStmt, followed by a fallback return
+	mut stmts := []ast.Stmt{}
+	if else_body !is ast.EmptyExpr {
+		stmts << ast.Stmt(ast.ExprStmt{
+			expr: else_body
+		})
+	}
+	// Fallback: return int(e).str()
+	stmts << ast.Stmt(ast.ReturnStmt{
+		exprs: [
+			ast.Expr(ast.CallExpr{
+				lhs:  ast.Ident{
+					name: 'int__str'
+				}
+				args: [
+					ast.Expr(ast.CastExpr{
+						typ:  ast.Ident{
+							name: 'int'
+						}
+						expr: ast.Ident{
+							name: 'e'
+						}
+					}),
+				]
+			}),
+		]
+	})
+	return ast.Stmt(ast.FnDecl{
+		name:  fn_name
+		typ:   ast.FnType{
+			params:      [
+				ast.Parameter{
+					name: 'e'
+					typ:  ast.Ident{
+						name: enum_name
+					}
+				},
+			]
+			return_type: ast.Ident{
+				name: 'string'
+			}
+		}
+		stmts: stmts
+	})
 }
 
 enum ArrayMethodKind {
@@ -6273,8 +9139,7 @@ fn (mut t Transformer) generate_array_method_functions() []ast.Stmt {
 	mut index_names := t.needed_array_index_fns.keys()
 	index_names.sort()
 	for fn_name in index_names {
-		result << t.generate_array_method_fn(fn_name, t.needed_array_index_fns[fn_name],
-			.index)
+		result << t.generate_array_method_fn(fn_name, t.needed_array_index_fns[fn_name], .index)
 	}
 	mut last_index_names := t.needed_array_last_index_fns.keys()
 	last_index_names.sort()
@@ -6296,35 +9161,16 @@ fn (mut t Transformer) generate_array_method_len_expr(info ArrayMethodInfo) ast.
 }
 
 fn (mut t Transformer) generate_array_method_elem_expr(info ArrayMethodInfo, idx_expr ast.Expr) ast.Expr {
-	if info.is_fixed {
-		return ast.Expr(ast.IndexExpr{
-			lhs:  ast.Ident{
-				name: 'a'
-			}
-			expr: idx_expr
-		})
+	pos := t.next_synth_pos()
+	if elem_type := t.c_name_to_type(info.elem_type) {
+		t.register_synth_type(pos, elem_type)
 	}
-	return ast.Expr(ast.PrefixExpr{
-		op:   .mul
-		expr: ast.CastExpr{
-			typ:  ast.PrefixExpr{
-				op:   .amp
-				expr: ast.Ident{
-					name: info.elem_type
-				}
-			}
-			expr: ast.CallExpr{
-				lhs:  ast.Ident{
-					name: 'array__get'
-				}
-				args: [
-					ast.Expr(ast.Ident{
-						name: 'a'
-					}),
-					idx_expr,
-				]
-			}
+	return ast.Expr(ast.IndexExpr{
+		lhs:  ast.Ident{
+			name: 'a'
 		}
+		expr: idx_expr
+		pos:  pos
 	})
 }
 
@@ -6358,50 +9204,31 @@ fn (mut t Transformer) generate_array_method_match_expr(info ArrayMethodInfo, id
 			]
 		})
 	}
-	return ast.Expr(ast.InfixExpr{
-		op:  .eq
-		lhs: elem_expr
-		rhs: ast.Ident{
-			name: 'v'
-		}
-	})
+	return t.make_infix_expr(.eq, elem_expr, ast.Expr(ast.Ident{
+		name: 'v'
+	}))
 }
 
 fn (mut t Transformer) generate_array_method_loop_stmt(info ArrayMethodInfo, kind ArrayMethodKind, loop_body []ast.Stmt) ast.Stmt {
-	mut init_rhs := ast.Expr(ast.BasicLiteral{
-		kind:  .number
-		value: '0'
-	})
+	mut init_rhs := t.make_number_expr('0')
 	mut cond_op := token.Token.lt
 	mut cond_rhs := t.generate_array_method_len_expr(info)
 	mut post_op := token.Token.plus_assign
-	mut post_rhs := ast.Expr(ast.BasicLiteral{
-		kind:  .number
-		value: '1'
-	})
+	mut post_rhs := t.make_number_expr('1')
 	if kind == .last_index {
 		init_rhs = if info.is_fixed {
-			ast.Expr(ast.BasicLiteral{
-				kind:  .number
-				value: (info.fixed_len - 1).str()
-			})
+			t.make_number_expr((info.fixed_len - 1).str())
 		} else {
-			ast.Expr(ast.InfixExpr{
-				op:  .minus
-				lhs: t.synth_selector(ast.Ident{ name: 'a' }, 'len', types.Type(types.int_))
-				rhs: ast.BasicLiteral{
-					kind:  .number
-					value: '1'
-				}
-			})
+			t.make_infix_expr(.minus, t.synth_selector(ast.Ident{ name: 'a' }, 'len',
+				types.Type(types.int_)), t.make_number_expr('1'))
 		}
 		cond_op = .ge
-		cond_rhs = ast.Expr(ast.BasicLiteral{
-			kind:  .number
-			value: '0'
-		})
+		cond_rhs = t.make_number_expr('0')
 		post_op = .minus_assign
 	}
+	cond_expr := t.make_infix_expr(cond_op, ast.Expr(ast.Ident{
+		name: 'i'
+	}), cond_rhs)
 	return ast.Stmt(ast.ForStmt{
 		init:  ast.AssignStmt{
 			op:  .decl_assign
@@ -6412,13 +9239,7 @@ fn (mut t Transformer) generate_array_method_loop_stmt(info ArrayMethodInfo, kin
 			]
 			rhs: [init_rhs]
 		}
-		cond:  ast.InfixExpr{
-			op:  cond_op
-			lhs: ast.Ident{
-				name: 'i'
-			}
-			rhs: cond_rhs
-		}
+		cond:  cond_expr
 		post:  ast.AssignStmt{
 			op:  post_op
 			lhs: [
@@ -6553,6 +9374,9 @@ fn (mut t Transformer) generate_array_str_fn(fn_name string, elem_type string) a
 	mut body_stmts := []ast.Stmt{}
 
 	// mut sb := strings__new_builder(2 + a.len * 10)
+	a_len_expr := t.synth_selector(ast.Ident{ name: 'a' }, 'len', types.Type(types.int_))
+	builder_cap := t.make_infix_expr(.plus, t.make_number_expr('2'), t.make_infix_expr(.mul,
+		a_len_expr, t.make_number_expr('10')))
 	body_stmts << ast.AssignStmt{
 		op:  .decl_assign
 		lhs: [
@@ -6568,23 +9392,7 @@ fn (mut t Transformer) generate_array_str_fn(fn_name string, elem_type string) a
 				lhs:  ast.Ident{
 					name: 'strings__new_builder'
 				}
-				args: [
-					ast.Expr(ast.InfixExpr{
-						op:  .plus
-						lhs: ast.BasicLiteral{
-							kind:  .number
-							value: '2'
-						}
-						rhs: ast.InfixExpr{
-							op:  .mul
-							lhs: t.synth_selector(ast.Ident{ name: 'a' }, 'len', types.Type(types.int_))
-							rhs: ast.BasicLiteral{
-								kind:  .number
-								value: '10'
-							}
-						}
-					}),
-				]
+				args: [builder_cap]
 			}),
 		]
 	}
@@ -6615,18 +9423,12 @@ fn (mut t Transformer) generate_array_str_fn(fn_name string, elem_type string) a
 	mut for_body := []ast.Stmt{}
 
 	// if i > 0 { strings__Builder__write_string(&sb, ", ") }
+	comma_cond := t.make_infix_expr(.gt, ast.Expr(ast.Ident{
+		name: 'i'
+	}), t.make_number_expr('0'))
 	for_body << ast.ExprStmt{
 		expr: ast.IfExpr{
-			cond:  ast.InfixExpr{
-				op:  .gt
-				lhs: ast.Ident{
-					name: 'i'
-				}
-				rhs: ast.BasicLiteral{
-					kind:  .number
-					value: '0'
-				}
-			}
+			cond:  comma_cond
 			stmts: [
 				ast.Stmt(ast.ExprStmt{
 					expr: ast.CallExpr{
@@ -6651,7 +9453,25 @@ fn (mut t Transformer) generate_array_str_fn(fn_name string, elem_type string) a
 		}
 	}
 
-	// strings__Builder__write_string(&sb, elem_str(*(elem_type*)array__get(a, i)))
+	elem_expr := ast.Expr(ast.IndexExpr{
+		lhs:  ast.Ident{
+			name: 'a'
+		}
+		expr: ast.Ident{
+			name: 'i'
+		}
+	})
+	str_arg := if elem_type.ends_with('ptr') && elem_type != 'voidptr' && elem_type != 'charptr'
+		&& elem_type != 'byteptr' {
+		ast.Expr(ast.PrefixExpr{
+			op:   .mul
+			expr: elem_expr
+		})
+	} else {
+		elem_expr
+	}
+
+	// strings__Builder__write_string(&sb, a[i]) for strings, else use the element str helper
 	for_body << ast.ExprStmt{
 		expr: ast.CallExpr{
 			lhs:  ast.Ident{
@@ -6664,43 +9484,24 @@ fn (mut t Transformer) generate_array_str_fn(fn_name string, elem_type string) a
 						name: 'sb'
 					}
 				}),
-				// elem_str(*(elem_type*)array__get(a, i))
-				ast.Expr(ast.CallExpr{
-					lhs:  ast.Ident{
-						name: elem_str_fn
-					}
-					args: [
-						ast.Expr(ast.PrefixExpr{
-							op:   .mul
-							expr: ast.CastExpr{
-								typ:  ast.PrefixExpr{
-									op:   .amp
-									expr: ast.Ident{
-										name: elem_type
-									}
-								}
-								expr: ast.CallExpr{
-									lhs:  ast.Ident{
-										name: 'array__get'
-									}
-									args: [
-										ast.Expr(ast.Ident{
-											name: 'a'
-										}),
-										ast.Expr(ast.Ident{
-											name: 'i'
-										}),
-									]
-								}
-							}
-						}),
-					]
-				}),
+				if elem_type == 'string' {
+					elem_expr
+				} else {
+					ast.Expr(ast.CallExpr{
+						lhs:  ast.Ident{
+							name: elem_str_fn
+						}
+						args: [str_arg]
+					})
+				},
 			]
 		}
 	}
 
 	// for loop: for i := 0; i < a.len; i++ { ... }
+	for_cond := t.make_infix_expr(.lt, ast.Expr(ast.Ident{
+		name: 'i'
+	}), t.synth_selector(ast.Ident{ name: 'a' }, 'len', types.Type(types.int_)))
 	body_stmts << ast.ForStmt{
 		init:  ast.AssignStmt{
 			op:  .decl_assign
@@ -6712,13 +9513,7 @@ fn (mut t Transformer) generate_array_str_fn(fn_name string, elem_type string) a
 				value: '0'
 			})]
 		}
-		cond:  ast.InfixExpr{
-			op:  .lt
-			lhs: ast.Ident{
-				name: 'i'
-			}
-			rhs: t.synth_selector(ast.Ident{ name: 'a' }, 'len', types.Type(types.int_))
-		}
+		cond:  for_cond
 		post:  ast.AssignStmt{
 			op:  .plus_assign
 			lhs: [ast.Expr(ast.Ident{
@@ -6870,6 +9665,7 @@ fn (mut t Transformer) generate_fixed_array_str_fn(fn_name string) ast.Stmt {
 	mut body_stmts := []ast.Stmt{}
 
 	// mut sb := strings__new_builder(2 + arr_size * 10)
+	builder_cap := t.make_number_expr('${2 + arr_size * 10}')
 	body_stmts << ast.AssignStmt{
 		op:  .decl_assign
 		lhs: [
@@ -6885,12 +9681,7 @@ fn (mut t Transformer) generate_fixed_array_str_fn(fn_name string) ast.Stmt {
 				lhs:  ast.Ident{
 					name: 'strings__new_builder'
 				}
-				args: [
-					ast.Expr(ast.BasicLiteral{
-						kind:  .number
-						value: '${2 + arr_size * 10}'
-					}),
-				]
+				args: [builder_cap]
 			}),
 		]
 	}
@@ -6920,18 +9711,12 @@ fn (mut t Transformer) generate_fixed_array_str_fn(fn_name string) ast.Stmt {
 	mut for_body := []ast.Stmt{}
 
 	// if i > 0 { strings__Builder__write_string(&sb, ", ") }
+	comma_cond := t.make_infix_expr(.gt, ast.Expr(ast.Ident{
+		name: 'i'
+	}), t.make_number_expr('0'))
 	for_body << ast.ExprStmt{
 		expr: ast.IfExpr{
-			cond:  ast.InfixExpr{
-				op:  .gt
-				lhs: ast.Ident{
-					name: 'i'
-				}
-				rhs: ast.BasicLiteral{
-					kind:  .number
-					value: '0'
-				}
-			}
+			cond:  comma_cond
 			stmts: [
 				ast.Stmt(ast.ExprStmt{
 					expr: ast.CallExpr{
@@ -6989,6 +9774,9 @@ fn (mut t Transformer) generate_fixed_array_str_fn(fn_name string) ast.Stmt {
 	}
 
 	// for i := 0; i < arr_size; i++ { ... }
+	for_cond := t.make_infix_expr(.lt, ast.Expr(ast.Ident{
+		name: 'i'
+	}), t.make_number_expr('${arr_size}'))
 	body_stmts << ast.ForStmt{
 		init:  ast.AssignStmt{
 			op:  .decl_assign
@@ -7000,16 +9788,7 @@ fn (mut t Transformer) generate_fixed_array_str_fn(fn_name string) ast.Stmt {
 				value: '0'
 			})]
 		}
-		cond:  ast.InfixExpr{
-			op:  .lt
-			lhs: ast.Ident{
-				name: 'i'
-			}
-			rhs: ast.BasicLiteral{
-				kind:  .number
-				value: '${arr_size}'
-			}
-		}
+		cond:  for_cond
 		post:  ast.AssignStmt{
 			op:  .plus_assign
 			lhs: [ast.Expr(ast.Ident{
@@ -7072,6 +9851,400 @@ fn (mut t Transformer) generate_fixed_array_str_fn(fn_name string) ast.Stmt {
 		attributes: []ast.Attribute{}
 		typ:        ast.FnType{
 			params:      [param_a]
+			return_type: ast.Ident{
+				name: 'string'
+			}
+		}
+		stmts:      body_stmts
+	}
+}
+
+fn (mut t Transformer) generate_map_str_fn(fn_name string, elem_type string) ast.Stmt {
+	// Parse key and value types from elem_type (format: 'key_type|val_type')
+	map_type_name := fn_name[..fn_name.len - 4] // Remove '_str' suffix
+	parts := elem_type.split('|')
+	key_type := parts[0]
+	val_type := if parts.len > 1 { parts[1] } else { 'int' }
+
+	param_m := ast.Parameter{
+		name: 'm'
+		typ:  ast.Ident{
+			name: map_type_name
+		}
+	}
+	t.register_generated_fn_scope(fn_name, 'builtin', [param_m])
+
+	sb_ident := ast.Ident{
+		name: 'sb'
+	}
+	sb_ref := ast.Expr(ast.PrefixExpr{
+		op:   .amp
+		expr: sb_ident
+	})
+	m_ident := ast.Ident{
+		name: 'm'
+	}
+
+	mut body_stmts := []ast.Stmt{}
+
+	// mut sb := strings__new_builder(2 + m.len * 20)
+	m_len_expr := t.synth_selector(m_ident, 'len', types.Type(types.int_))
+	builder_cap := t.make_infix_expr(.plus, t.make_number_expr('2'), t.make_infix_expr(.mul,
+		m_len_expr, t.make_number_expr('20')))
+	body_stmts << ast.AssignStmt{
+		op:  .decl_assign
+		lhs: [ast.Expr(ast.ModifierExpr{
+			kind: .key_mut
+			expr: sb_ident
+		})]
+		rhs: [
+			ast.Expr(ast.CallExpr{
+				lhs:  ast.Ident{
+					name: 'strings__new_builder'
+				}
+				args: [builder_cap]
+			}),
+		]
+	}
+
+	// strings__Builder__write_string(&sb, '{')
+	body_stmts << builder_write_string_stmt(sb_ref, ast.Expr(ast.StringLiteral{
+		kind:  .v
+		value: '{'
+	}))
+
+	// mut _map_written := 0
+	written_ident := ast.Ident{
+		name: '_map_written'
+	}
+	body_stmts << ast.AssignStmt{
+		op:  .decl_assign
+		lhs: [ast.Expr(ast.ModifierExpr{
+			kind: .key_mut
+			expr: written_ident
+		})]
+		rhs: [ast.Expr(ast.BasicLiteral{
+			kind:  .number
+			value: '0'
+		})]
+	}
+
+	// key_values selector: m.key_values
+	key_values_expr := t.synth_selector(m_ident, 'key_values', types.Type(types.Struct{
+		name: 'DenseArray'
+	}))
+	// key_values.len selector: m.key_values.len
+	key_values_len_expr := t.synth_selector(ast.Expr(key_values_expr), 'len',
+		types.Type(types.int_))
+	kv_ref := ast.Expr(ast.PrefixExpr{
+		op:   .amp
+		expr: key_values_expr
+	})
+
+	// _map_kv_len := m.key_values.len
+	kv_len_ident := ast.Ident{
+		name: '_map_kv_len'
+	}
+	body_stmts << ast.AssignStmt{
+		op:  .decl_assign
+		lhs: [ast.Expr(kv_len_ident)]
+		rhs: [ast.Expr(key_values_len_expr)]
+	}
+
+	// Build loop body
+	idx_ident := ast.Ident{
+		name: '_map_i'
+	}
+	mut loop_body := []ast.Stmt{}
+
+	// if !DenseArray__has_index(&m.key_values, _map_i) { continue }
+	loop_body << ast.ExprStmt{
+		expr: ast.IfExpr{
+			cond:  ast.PrefixExpr{
+				op:   .not
+				expr: ast.CallExpr{
+					lhs:  ast.Ident{
+						name: 'DenseArray__has_index'
+					}
+					args: [kv_ref, ast.Expr(idx_ident)]
+				}
+			}
+			stmts: [ast.Stmt(ast.FlowControlStmt{
+				op: .key_continue
+			})]
+		}
+	}
+
+	// if _map_written > 0 { strings__Builder__write_string(&sb, ', ') }
+	written_cond := t.make_infix_expr(.gt, ast.Expr(written_ident), t.make_number_expr('0'))
+	loop_body << ast.ExprStmt{
+		expr: ast.IfExpr{
+			cond:  written_cond
+			stmts: [
+				builder_write_string_stmt(sb_ref, ast.Expr(ast.StringLiteral{
+					kind:  .v
+					value: ', '
+				})),
+			]
+		}
+	}
+
+	// k := *(KeyType*)DenseArray__key(&m.key_values, _map_i)
+	key_call := ast.CallExpr{
+		lhs:  ast.Ident{
+			name: 'DenseArray__key'
+		}
+		args: [kv_ref, ast.Expr(idx_ident)]
+	}
+	key_deref := ast.PrefixExpr{
+		op:   .mul
+		expr: ast.CastExpr{
+			typ:  ast.Ident{
+				name: '${key_type}*'
+			}
+			expr: key_call
+		}
+	}
+	k_ident := ast.Ident{
+		name: 'k'
+	}
+	loop_body << ast.AssignStmt{
+		op:  .decl_assign
+		lhs: [ast.Expr(k_ident)]
+		rhs: [ast.Expr(key_deref)]
+	}
+
+	// Write key with proper formatting
+	if key_type == 'string' {
+		// String keys: write 'key'
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(ast.StringLiteral{
+			kind:  .v
+			value: "'"
+		}))
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(k_ident))
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(ast.StringLiteral{
+			kind:  .v
+			value: "': "
+		}))
+	} else if key_type == 'rune' {
+		// Rune keys: write `key`
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(ast.StringLiteral{
+			kind:  .v
+			value: '`'
+		}))
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(ast.CallExpr{
+			lhs:  ast.Ident{
+				name: 'rune__str'
+			}
+			args: [ast.Expr(k_ident)]
+		}))
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(ast.StringLiteral{
+			kind:  .v
+			value: '`: '
+		}))
+	} else {
+		// Other keys (int, etc.): write key_str(k): (space)
+		key_str_fn := if key_type.starts_with('Array_') || key_type.starts_with('Map_') {
+			'${key_type}_str'
+		} else {
+			'${key_type}__str'
+		}
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(ast.CallExpr{
+			lhs:  ast.Ident{
+				name: key_str_fn
+			}
+			args: [ast.Expr(k_ident)]
+		}))
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(ast.StringLiteral{
+			kind:  .v
+			value: ': '
+		}))
+	}
+
+	// v := *(ValueType*)DenseArray__value(&m.key_values, _map_i)
+	// For fixed arrays, use pointer since C can't assign fixed arrays by value:
+	//   vp := (ValueType*)DenseArray__value(...); then use *vp
+	value_call := ast.CallExpr{
+		lhs:  ast.Ident{
+			name: 'DenseArray__value'
+		}
+		args: [kv_ref, ast.Expr(idx_ident)]
+	}
+	is_fixed_array_val := val_type.starts_with('Array_fixed_')
+	v_ident := if is_fixed_array_val {
+		ast.Ident{
+			name: '_vp'
+		}
+	} else {
+		ast.Ident{
+			name: 'v'
+		}
+	}
+	if is_fixed_array_val {
+		// _vp := (ValueType*)DenseArray__value(...)
+		value_ptr := ast.CastExpr{
+			typ:  ast.Ident{
+				name: '${val_type}*'
+			}
+			expr: value_call
+		}
+		loop_body << ast.AssignStmt{
+			op:  .decl_assign
+			lhs: [ast.Expr(v_ident)]
+			rhs: [ast.Expr(value_ptr)]
+		}
+	} else {
+		// v := *(ValueType*)DenseArray__value(...)
+		value_deref := ast.PrefixExpr{
+			op:   .mul
+			expr: ast.CastExpr{
+				typ:  ast.Ident{
+					name: '${val_type}*'
+				}
+				expr: value_call
+			}
+		}
+		loop_body << ast.AssignStmt{
+			op:  .decl_assign
+			lhs: [ast.Expr(v_ident)]
+			rhs: [ast.Expr(value_deref)]
+		}
+	}
+	// For fixed arrays, val_expr is *_vp; otherwise just v
+	val_expr := if is_fixed_array_val {
+		ast.Expr(ast.PrefixExpr{
+			op:   .mul
+			expr: v_ident
+		})
+	} else {
+		ast.Expr(v_ident)
+	}
+
+	// Write value with proper formatting
+	if val_type == 'string' {
+		// String values: write 'value'
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(ast.StringLiteral{
+			kind:  .v
+			value: "'"
+		}))
+		loop_body << builder_write_string_stmt(sb_ref, val_expr)
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(ast.StringLiteral{
+			kind:  .v
+			value: "'"
+		}))
+	} else if val_type == 'rune' {
+		// Rune values: write `value`
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(ast.StringLiteral{
+			kind:  .v
+			value: '`'
+		}))
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(ast.CallExpr{
+			lhs:  ast.Ident{
+				name: 'rune__str'
+			}
+			args: [val_expr]
+		}))
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(ast.StringLiteral{
+			kind:  .v
+			value: '`'
+		}))
+	} else {
+		// Other values: write val_str(v)
+		val_str_fn := if val_type.starts_with('Array_') || val_type.starts_with('Map_') {
+			'${val_type}_str'
+		} else {
+			'${val_type}__str'
+		}
+		loop_body << builder_write_string_stmt(sb_ref, ast.Expr(ast.CallExpr{
+			lhs:  ast.Ident{
+				name: val_str_fn
+			}
+			args: [val_expr]
+		}))
+	}
+
+	// Recursively register str functions for complex key/value types
+	for inner_type in [key_type, val_type] {
+		if inner_type.starts_with('Array_fixed_') {
+			inner_fn := '${inner_type}_str'
+			if inner_fn !in t.needed_str_fns {
+				inner_payload := inner_type['Array_fixed_'.len..]
+				inner_elem := inner_payload.all_before_last('_')
+				t.needed_str_fns[inner_fn] = inner_elem
+			}
+		} else if inner_type.starts_with('Array_') {
+			inner_fn := '${inner_type}_str'
+			if inner_fn !in t.needed_str_fns {
+				inner_elem := inner_type['Array_'.len..]
+				t.needed_str_fns[inner_fn] = inner_elem
+			}
+		} else if inner_type.starts_with('Map_') {
+			inner_fn := '${inner_type}_str'
+			if inner_fn !in t.needed_str_fns {
+				t.needed_str_fns[inner_fn] = inner_type
+			}
+		}
+	}
+
+	// _map_written += 1
+	loop_body << ast.AssignStmt{
+		op:  .plus_assign
+		lhs: [ast.Expr(written_ident)]
+		rhs: [ast.Expr(ast.BasicLiteral{
+			kind:  .number
+			value: '1'
+		})]
+	}
+
+	// for _map_i := 0; _map_i < _map_kv_len; _map_i++ { ... }
+	loop_cond := t.make_infix_expr(.lt, ast.Expr(idx_ident), ast.Expr(kv_len_ident))
+	body_stmts << ast.ForStmt{
+		init:  ast.AssignStmt{
+			op:  .decl_assign
+			lhs: [ast.Expr(idx_ident)]
+			rhs: [ast.Expr(ast.BasicLiteral{
+				kind:  .number
+				value: '0'
+			})]
+		}
+		cond:  loop_cond
+		post:  ast.AssignStmt{
+			op:  .plus_assign
+			lhs: [ast.Expr(idx_ident)]
+			rhs: [ast.Expr(ast.BasicLiteral{
+				kind:  .number
+				value: '1'
+			})]
+		}
+		stmts: loop_body
+	}
+
+	// strings__Builder__write_string(&sb, '}')
+	body_stmts << builder_write_string_stmt(sb_ref, ast.Expr(ast.StringLiteral{
+		kind:  .v
+		value: '}'
+	}))
+
+	// return strings__Builder__str(&sb)
+	body_stmts << ast.ReturnStmt{
+		exprs: [
+			ast.Expr(ast.CallExpr{
+				lhs:  ast.Ident{
+					name: 'strings__Builder__str'
+				}
+				args: [sb_ref]
+			}),
+		]
+	}
+
+	return ast.FnDecl{
+		name:       fn_name
+		is_public:  false
+		is_method:  false
+		is_static:  false
+		attributes: []ast.Attribute{}
+		typ:        ast.FnType{
+			params:      [param_m]
 			return_type: ast.Ident{
 				name: 'string'
 			}
@@ -7175,11 +10348,9 @@ fn (mut t Transformer) expand_assert_stmt(stmt ast.AssertStmt) []ast.Stmt {
 	if stmt.expr is ast.InfixExpr && stmt.expr.op in [.eq, .ne, .lt, .gt, .le, .ge] {
 		if assert_expr_is_simple(stmt.expr.lhs) && assert_expr_is_simple(stmt.expr.rhs) {
 			// eprintln("    Left value: `${lhs}`")
-			body_stmts << t.make_eprintln_inter('    Left value: `', stmt.expr.lhs, '`',
-				pos)
+			body_stmts << t.make_eprintln_inter('    Left value: `', stmt.expr.lhs, '`', pos)
 			// eprintln("   Right value: `${rhs}`")
-			body_stmts << t.make_eprintln_inter('   Right value: `', stmt.expr.rhs, '`',
-				pos)
+			body_stmts << t.make_eprintln_inter('   Right value: `', stmt.expr.rhs, '`', pos)
 		}
 	}
 
@@ -7563,11 +10734,7 @@ fn (mut t Transformer) generate_sort_comparator_fn(fn_name string, info SortComp
 		})
 	} else {
 		// Numeric comparison: lhs < rhs
-		cond_expr = ast.Expr(ast.InfixExpr{
-			lhs: lhs_expr
-			op:  .lt
-			rhs: rhs_expr
-		})
+		cond_expr = t.make_infix_expr(.lt, lhs_expr, rhs_expr)
 	}
 
 	// Body: if (cond) { return -1 } return 1
@@ -7611,4 +10778,274 @@ fn (mut t Transformer) generate_sort_comparator_fn(fn_name string, info SortComp
 		}
 		stmts:      body_stmts
 	})
+}
+
+// generate_go_wrapper_functions generates synthesized functions for lowering
+// `go foo(args)` to goroutine creation via goroutines__goroutine_create.
+//
+// For each go-called function foo(a int, b string), generates:
+// 1. struct __GoArgs_foo { a0 int; a1 string }
+// 2. fn __go_trampoline_foo(arg voidptr) { args := *(&__GoArgs_foo(arg)); foo(args.a0, args.a1); C.free(arg) }
+// 3. fn __go_wrap_foo(a int, b string) { args := C.malloc(sizeof(__GoArgs_foo)); ...; goroutines__goroutine_create(trampoline, args, sizeof) }
+fn (mut t Transformer) generate_go_wrapper_functions() []ast.Stmt {
+	mut result := []ast.Stmt{}
+	for _, info in t.needed_go_wrappers {
+		struct_name := '__GoArgs_${info.fn_name}'
+		trampoline_name := '__go_trampoline_${info.fn_name}'
+		// 1. Generate the args struct
+		if info.param_names.len > 0 {
+			mut fields := []ast.FieldDecl{}
+			for i, pname in info.param_names {
+				fields << ast.FieldDecl{
+					name: pname
+					typ:  ast.Ident{
+						name: info.param_types[i]
+					}
+				}
+			}
+			result << ast.Stmt(ast.StructDecl{
+				name:   struct_name
+				fields: fields
+			})
+		}
+		// 2. Generate the trampoline function
+		if info.param_names.len > 0 {
+			mut trampoline_stmts := []ast.Stmt{}
+			// args := unsafe { *(&__GoArgs_foo(arg)) }
+			// We use a cast + dereference at the C level.
+			// At AST level: args := *voidptr(arg) cast to struct pointer, then deref.
+			// Simpler: use direct field access with cast.
+			trampoline_stmts << ast.Stmt(ast.AssignStmt{
+				op:  .decl_assign
+				lhs: [ast.Expr(ast.Ident{
+					name: '_go_args'
+				})]
+				rhs: [
+					ast.Expr(ast.PrefixExpr{
+						op:   .mul
+						expr: ast.CastExpr{
+							typ:  ast.PrefixExpr{
+								op:   .amp
+								expr: ast.Ident{
+									name: struct_name
+								}
+							}
+							expr: ast.Ident{
+								name: 'arg'
+							}
+						}
+					}),
+				]
+			})
+			// foo(_go_args.a0, _go_args.a1, ...)
+			mut call_args := []ast.Expr{}
+			for pname in info.param_names {
+				call_args << ast.Expr(ast.SelectorExpr{
+					lhs: ast.Ident{
+						name: '_go_args'
+					}
+					rhs: ast.Ident{
+						name: pname
+					}
+				})
+			}
+			trampoline_stmts << ast.Stmt(ast.ExprStmt{
+				expr: ast.CallExpr{
+					lhs:  ast.Ident{
+						name: info.fn_name
+					}
+					args: call_args
+				}
+			})
+			// C.free(arg)
+			trampoline_stmts << ast.Stmt(ast.ExprStmt{
+				expr: ast.CallExpr{
+					lhs:  ast.SelectorExpr{
+						lhs: ast.Ident{
+							name: 'C'
+						}
+						rhs: ast.Ident{
+							name: 'free'
+						}
+					}
+					args: [ast.Expr(ast.Ident{
+						name: 'arg'
+					})]
+				}
+			})
+			result << ast.Stmt(ast.FnDecl{
+				name:  trampoline_name
+				typ:   ast.FnType{
+					params: [
+						ast.Parameter{
+							name: 'arg'
+							typ:  ast.Ident{
+								name: 'voidptr'
+							}
+						},
+					]
+				}
+				stmts: trampoline_stmts
+			})
+		}
+		// 3. Generate the dispatch wrapper function
+		mut dispatch_stmts := []ast.Stmt{}
+		if info.param_names.len == 0 {
+			// Zero args: goroutines__goroutine_create(voidptr(foo), voidptr(0), 0)
+			dispatch_stmts << ast.Stmt(ast.ExprStmt{
+				expr: ast.CallExpr{
+					lhs:  ast.Ident{
+						name: 'goroutines__goroutine_create'
+					}
+					args: [
+						ast.Expr(ast.CastExpr{
+							typ:  ast.Ident{
+								name: 'voidptr'
+							}
+							expr: ast.Ident{
+								name: info.fn_name
+							}
+						}),
+						ast.Expr(ast.CastExpr{
+							typ:  ast.Ident{
+								name: 'voidptr'
+							}
+							expr: ast.BasicLiteral{
+								kind:  .number
+								value: '0'
+							}
+						}),
+						ast.Expr(ast.BasicLiteral{
+							kind:  .number
+							value: '0'
+						}),
+					]
+				}
+			})
+		} else {
+			// Allocate args struct on heap
+			// mut _args := &__GoArgs_foo{ a0: param0, a1: param1, ... }
+			// We use C.malloc + field assignment for simplicity
+			// _args_ptr := C.malloc(sizeof(__GoArgs_foo))
+			dispatch_stmts << ast.Stmt(ast.AssignStmt{
+				op:  .decl_assign
+				lhs: [ast.Expr(ast.Ident{
+					name: '_args_ptr'
+				})]
+				rhs: [
+					ast.Expr(ast.CallExpr{
+						lhs:  ast.SelectorExpr{
+							lhs: ast.Ident{
+								name: 'C'
+							}
+							rhs: ast.Ident{
+								name: 'malloc'
+							}
+						}
+						args: [
+							ast.Expr(ast.KeywordOperator{
+								op:    .key_sizeof
+								exprs: [
+									ast.Expr(ast.Ident{
+										name: struct_name
+									}),
+								]
+							}),
+						]
+					}),
+				]
+			})
+			// _args := &__GoArgs_foo(_args_ptr)
+			dispatch_stmts << ast.Stmt(ast.AssignStmt{
+				op:  .decl_assign
+				lhs: [ast.Expr(ast.Ident{
+					name: '_args'
+				})]
+				rhs: [
+					ast.Expr(ast.CastExpr{
+						typ:  ast.PrefixExpr{
+							op:   .amp
+							expr: ast.Ident{
+								name: struct_name
+							}
+						}
+						expr: ast.Ident{
+							name: '_args_ptr'
+						}
+					}),
+				]
+			})
+			// _args.field = param for each field
+			for _, pname in info.param_names {
+				dispatch_stmts << ast.Stmt(ast.AssignStmt{
+					op:  .assign
+					lhs: [
+						ast.Expr(ast.SelectorExpr{
+							lhs: ast.Ident{
+								name: '_args'
+							}
+							rhs: ast.Ident{
+								name: pname
+							}
+						}),
+					]
+					rhs: [ast.Expr(ast.Ident{
+						name: pname
+					})]
+				})
+			}
+			// goroutines__goroutine_create(voidptr(trampoline), voidptr(_args_ptr), sizeof(__GoArgs_foo))
+			dispatch_stmts << ast.Stmt(ast.ExprStmt{
+				expr: ast.CallExpr{
+					lhs:  ast.Ident{
+						name: 'goroutines__goroutine_create'
+					}
+					args: [
+						ast.Expr(ast.CastExpr{
+							typ:  ast.Ident{
+								name: 'voidptr'
+							}
+							expr: ast.Ident{
+								name: trampoline_name
+							}
+						}),
+						ast.Expr(ast.CastExpr{
+							typ:  ast.Ident{
+								name: 'voidptr'
+							}
+							expr: ast.Ident{
+								name: '_args_ptr'
+							}
+						}),
+						ast.Expr(ast.KeywordOperator{
+							op:    .key_sizeof
+							exprs: [
+								ast.Expr(ast.Ident{
+									name: struct_name
+								}),
+							]
+						}),
+					]
+				}
+			})
+		}
+		// Build params for the dispatch function (same as original function)
+		mut dispatch_params := []ast.Parameter{}
+		for i, pname in info.param_names {
+			dispatch_params << ast.Parameter{
+				name: pname
+				typ:  ast.Ident{
+					name: info.param_types[i]
+				}
+			}
+		}
+		result << ast.Stmt(ast.FnDecl{
+			name:  info.wrapper_name
+			typ:   ast.FnType{
+				params: dispatch_params
+			}
+			stmts: dispatch_stmts
+		})
+	}
+	return result
 }

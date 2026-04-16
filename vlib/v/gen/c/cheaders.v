@@ -101,6 +101,21 @@ const c_common_macros = '
 	#undef __V_architecture
 	#define __V_architecture 9
 #endif
+#if defined(__sparc__)
+	#define __V_sparc64  1
+	#undef __V_architecture
+	#define __V_architecture 10
+#endif
+#if defined(__powerpc64__) && defined(__BIG_ENDIAN__)
+	#define __V_ppc64  1
+	#undef __V_architecture
+	#define __V_architecture 11
+#endif
+#if (defined(__powerpc__) || defined(__powerpc) || defined(__POWERPC__) || defined(__ppc__) || defined(__ppc) || defined(__PPC__)) && !defined(__powerpc64__) && !defined(__ppc64__) && !defined(__PPC64__)
+	#define __V_ppc  1
+	#undef __V_architecture
+	#define __V_architecture 12
+#endif
 // Using just __GNUC__ for detecting gcc, is not reliable because other compilers define it too:
 #ifdef __GNUC__
 	#define __V_GCC__
@@ -122,13 +137,18 @@ const c_common_macros = '
 	#define E_STRUCT 0
 #endif
 #ifndef _WIN32
-	#if defined __has_include
-		#if __has_include (<execinfo.h>)
+	#if defined(__has_include) && !defined(__TINYC__)
+		#if __has_include(<execinfo.h>)
 			#include <execinfo.h>
 		#else
 			// On linux: int backtrace(void **__array, int __size);
 			// On BSD: size_t backtrace(void **, size_t);
 		#endif
+	#elif (defined(__linux__) && (defined(__GLIBC__) || defined(__GNU_LIBRARY__))) || defined(__APPLE__) || defined(__NetBSD__) || defined(__FreeBSD__) || defined(__DragonFly__)
+		#include <execinfo.h>
+	#else
+		// On linux: int backtrace(void **__array, int __size);
+		// On BSD: size_t backtrace(void **, size_t);
 	#endif
 #endif
 #ifdef __TINYC__
@@ -172,7 +192,7 @@ const c_common_macros = '
 		#else
 			#define VV_EXP  extern __attribute__((visibility("default")))
 		#endif
-		#if defined(__clang__) && (defined(_VUSECACHE) || defined(_VBUILDMODULE))
+		#if defined(__clang__) && (defined(_VUSECACHE) || defined(_VBUILDMODULE) || defined(_VOBJECTFILE))
 			#define VV_LOC static
 		#else
 			#define VV_LOC  __attribute__ ((visibility ("hidden")))
@@ -229,13 +249,21 @@ const c_common_hidden_attr = '
 #endif
 '
 
+const c_common_callconv_attr = '
+#if !defined(VCALLCONV)
+	#ifdef _MSC_VER
+		#define VCALLCONV(name) __##name
+	#else
+		#define VCALLCONV(name) __attribute__((name))
+	#endif
+#endif
+'
+
 const c_common_noreturn_attr = '
 #if !defined(VNORETURN)
 	#if defined(__TINYC__)
-		#include <stdnoreturn.h>
-		#define VNORETURN noreturn
-	#endif
-	# if !defined(__TINYC__) && defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
+		#define VNORETURN __attribute__((noreturn))
+	# elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
 	#  define VNORETURN _Noreturn
 	# elif !defined(VNORETURN) && defined(__GNUC__) && __GNUC__ >= 2
 	#  define VNORETURN __attribute__((noreturn))
@@ -281,6 +309,20 @@ static inline bool _us64_le(uint64_t a, int64_t b) { return a <= INT64_MAX && (i
 static inline bool _us64_lt(uint64_t a, int64_t b) { return a < INT64_MAX && (int64_t)a < b; }
 '
 
+const c_float_to_unsigned_conversion_functions = '
+// deterministic float -> u64 conversions for explicit V casts
+// direct C casts are undefined for out-of-range values
+static inline uint64_t _v_f64_to_u64(double x) {
+	if (!(x >= 0.0)) {
+		return 0;
+	}
+	if (x >= 18446744073709551616.0) {
+		return UINT64_MAX;
+	}
+	return (uint64_t)x;
+}
+'
+
 const c_helper_macros = '//============================== HELPER C MACROS =============================*/
 // _SLIT0 is used as NULL string for literal arguments
 // `"" s` is used to enforce a string literal argument
@@ -296,11 +338,12 @@ const c_helper_macros = '//============================== HELPER C MACROS ======
 #define HEAP(type, expr) ((type*)builtin__memdup((void*)&((type[]){expr}[0]), sizeof(type)))
 #define HEAP_noscan(type, expr) ((type*)builtin__memdup_noscan((void*)&((type[]){expr}[0]), sizeof(type)))
 #define HEAP_align(type, expr, align) ((type*)builtin__memdup_align((void*)&((type[]){expr}[0]), sizeof(type), align))
+#define HEAP_vgc(type, expr, ptrmap, nptrs) ((type*)builtin__vgc_memdup_typed((void*)&((type[]){expr}[0]), sizeof(type), (ptrmap), (nptrs)))
 #define _PUSH_MANY(arr, val, tmp, tmp_typ) {tmp_typ tmp = (val); builtin__array_push_many(arr, tmp.data, tmp.len);}
 #define _PUSH_MANY_noscan(arr, val, tmp, tmp_typ) {tmp_typ tmp = (val); builtin__array_push_many_noscan(arr, tmp.data, tmp.len);}
 '
 
-const c_headers = c_helper_macros + c_common_macros +
+const c_headers = c_helper_macros + c_common_macros + c_common_callconv_attr +
 	r'
 // c_headers
 typedef int (*qsort_callback_func)(const void*, const void*);
@@ -313,14 +356,53 @@ typedef int (*qsort_callback_func)(const void*, const void*);
 // gnu headers use to #define __attribute__ to empty for non-gcc compilers
 #undef __attribute__
 #endif
+#if defined(_MSC_VER)
+// Ensure C99-like return semantics and NUL-termination for MSVC snprintf/vsnprintf.
+#ifndef va_copy
+	#define va_copy(dest, src) ((dest) = (src))
+#endif
+static int v__vsnprintf(char *s, size_t n, const char *fmt, va_list ap) {
+	va_list ap_copy;
+	va_copy(ap_copy, ap);
+	const int needed = _vscprintf(fmt, ap_copy);
+	va_end(ap_copy);
+	if (n > 0) {
+		const int written = _vsnprintf_s(s, n, _TRUNCATE, fmt, ap);
+		if (written < 0) {
+			s[n -
+	1] = 0;
+		}
+	}
+	return needed;
+}
+static int v__snprintf(char *s, size_t n, const char *fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	const int needed = v__vsnprintf(s, n, fmt, ap);
+	va_end(ap);
+	return needed;
+}
+#define vsnprintf v__vsnprintf
+#define snprintf v__snprintf
+#endif
 //================================== GLOBALS =================================*/
+#ifdef _VOBJECTFILE
+static void _vinit(int ___argc, voidptr ___argv);
+static void _vcleanup(void);
+#else
 void _vinit(int ___argc, voidptr ___argv);
 void _vcleanup(void);
+#endif
 #ifdef _WIN32
 	// workaround for windows, export _vinit_caller/_vcleanup_caller, let dl.open()/dl.close() call it
 	// NOTE: This is hardcoded in vlib/dl/dl_windows.c.v!
-	VV_EXP void _vinit_caller();
-	VV_EXP void _vcleanup_caller();
+	#ifdef _VOBJECTFILE
+		static void _vinit_caller();
+		static void _vcleanup_caller();
+	#else
+		VV_EXP void _vinit_caller();
+		VV_EXP void _vcleanup_caller();
+	#endif
 #endif
 #define sigaction_size sizeof(sigaction);
 #define _ARR_LEN(a) ( (sizeof(a)) / (sizeof(a[0])) )
@@ -373,7 +455,26 @@ void _vcleanup(void);
 void * aligned_alloc(size_t alignment, size_t size) { return malloc(size); }
 #endif
 #endif
+#ifdef __APPLE__
+	// macOS only exports aligned_alloc starting with 10.15.
+	#if !defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) || __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ < 101500
+static void *v__aligned_alloc_fallback(size_t alignment, size_t size) {
+	void *res = 0;
+	if (alignment < sizeof(void *)) {
+		alignment = sizeof(void *);
+	}
+	if (posix_memalign(&res, alignment, size) != 0) {
+		return 0;
+	}
+	return res;
+}
+		#define aligned_alloc v__aligned_alloc_fallback
+	#endif
+#endif
 #ifdef _WIN32
+	#ifdef WINVER
+		#undef WINVER
+	#endif
 	#define WINVER 0x0600
 	#ifdef _WIN32_WINNT
 		#undef _WIN32_WINNT
@@ -409,7 +510,7 @@ void * aligned_alloc(size_t alignment, size_t size) { return malloc(size); }
 #if defined(__CYGWIN__) && !defined(_WIN32)
 	#error Cygwin is not supported, please use MinGW or Visual Studio.
 #endif
-#if defined(__MINGW32__) || defined(__MINGW64__) || (defined(_WIN32) && defined(__TINYC__))
+#if defined(__MINGW32__) || defined(__MINGW64__) || (defined(_WIN32) && defined(__TINYC__)) || defined(_MSC_VER)
 	#undef PRId64
 	#undef PRIi64
 	#undef PRIo64
@@ -430,7 +531,7 @@ void * aligned_alloc(size_t alignment, size_t size) { return malloc(size); }
 
 const c_builtin_types = '
 //================================== builtin types ================================*/
-#if defined(__x86_64__) || defined(_M_AMD64) || defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64) || (defined(__riscv_xlen) && __riscv_xlen == 64) || defined(__s390x__) || (defined(__powerpc64__) && defined(__LITTLE_ENDIAN__)) || defined(__loongarch64)
+#if defined(__x86_64__) || defined(_M_AMD64) || defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64) || (defined(__riscv_xlen) && __riscv_xlen == 64) || defined(__s390x__) || (defined(__powerpc64__) && defined(__LITTLE_ENDIAN__)) || defined(__loongarch64) || defined(__sparc__) || (defined(__powerpc64__) && defined(__BIG_ENDIAN__))
 typedef int64_t vint_t;
 #else
 typedef int32_t vint_t;
@@ -467,6 +568,7 @@ typedef u8 array_fixed_byte_300 [300];
 typedef struct sync__Channel* chan;
 #ifndef CUSTOM_DEFINE_no_bool
 	#ifndef __cplusplus
+		#if !defined(__STDC_VERSION__) || __STDC_VERSION__ < 202311L
 		#ifndef bool
 			#ifdef CUSTOM_DEFINE_4bytebool
 				typedef int bool;
@@ -476,8 +578,52 @@ typedef struct sync__Channel* chan;
 			#define true 1
 			#define false 0
 		#endif
+		#endif
 	#endif
 #endif
+'
+
+const c_shift_helpers = '
+#define V_SAFE_SHIFT_BITS(type) ((u64)(sizeof(type) * 8))
+#define V_SAFE_LSHIFT_UNSIGNED(name, type) static inline type name(type x, u64 y) { return y >= V_SAFE_SHIFT_BITS(type) ? (type)0 : (type)(x << y); }
+#define V_SAFE_LSHIFT_SIGNED(name, type, unsigned_type) static inline type name(type x, u64 y) { return y >= V_SAFE_SHIFT_BITS(type) ? (type)0 : (type)(((unsigned_type)x) << y); }
+#define V_SAFE_RSHIFT_UNSIGNED(name, type) static inline type name(type x, u64 y) { return y >= V_SAFE_SHIFT_BITS(type) ? (type)0 : (type)(x >> y); }
+#define V_SAFE_RSHIFT_SIGNED(name, type) static inline type name(type x, u64 y) { return y >= V_SAFE_SHIFT_BITS(type) ? (type)(x < 0 ? -1 : 0) : (type)(x >> y); }
+V_SAFE_LSHIFT_SIGNED(v__lshift_char, char, u8)
+V_SAFE_RSHIFT_SIGNED(v__rshift_char, char)
+V_SAFE_LSHIFT_SIGNED(v__lshift_i8, i8, u8)
+V_SAFE_RSHIFT_SIGNED(v__rshift_i8, i8)
+V_SAFE_LSHIFT_SIGNED(v__lshift_i16, i16, u16)
+V_SAFE_RSHIFT_SIGNED(v__rshift_i16, i16)
+V_SAFE_LSHIFT_SIGNED(v__lshift_i32, i32, u32)
+V_SAFE_RSHIFT_SIGNED(v__rshift_i32, i32)
+V_SAFE_LSHIFT_SIGNED(v__lshift_int, int, unsigned int)
+V_SAFE_RSHIFT_SIGNED(v__rshift_int, int)
+V_SAFE_LSHIFT_SIGNED(v__lshift_vint_t, vint_t, u64)
+V_SAFE_RSHIFT_SIGNED(v__rshift_vint_t, vint_t)
+V_SAFE_LSHIFT_SIGNED(v__lshift_i64, i64, u64)
+V_SAFE_RSHIFT_SIGNED(v__rshift_i64, i64)
+V_SAFE_LSHIFT_SIGNED(v__lshift_isize, isize, usize)
+V_SAFE_RSHIFT_SIGNED(v__rshift_isize, isize)
+V_SAFE_LSHIFT_UNSIGNED(v__lshift_u8, u8)
+V_SAFE_RSHIFT_UNSIGNED(v__rshift_u8, u8)
+V_SAFE_LSHIFT_UNSIGNED(v__lshift_u16, u16)
+V_SAFE_RSHIFT_UNSIGNED(v__rshift_u16, u16)
+V_SAFE_LSHIFT_UNSIGNED(v__lshift_u32, u32)
+V_SAFE_RSHIFT_UNSIGNED(v__rshift_u32, u32)
+V_SAFE_LSHIFT_UNSIGNED(v__lshift_u64, u64)
+V_SAFE_RSHIFT_UNSIGNED(v__rshift_u64, u64)
+V_SAFE_LSHIFT_UNSIGNED(v__lshift_usize, usize)
+V_SAFE_RSHIFT_UNSIGNED(v__rshift_usize, usize)
+V_SAFE_LSHIFT_UNSIGNED(v__lshift_rune, rune)
+V_SAFE_RSHIFT_UNSIGNED(v__rshift_rune, rune)
+V_SAFE_LSHIFT_SIGNED(v__lshift_int_literal, int_literal, u64)
+V_SAFE_RSHIFT_SIGNED(v__rshift_int_literal, int_literal)
+#undef V_SAFE_RSHIFT_SIGNED
+#undef V_SAFE_RSHIFT_UNSIGNED
+#undef V_SAFE_LSHIFT_SIGNED
+#undef V_SAFE_LSHIFT_UNSIGNED
+#undef V_SAFE_SHIFT_BITS
 '
 
 const c_mapfn_callback_types = '
@@ -487,17 +633,16 @@ typedef void (*MapCloneFn)(voidptr, voidptr);
 typedef void (*MapFreeFn)(voidptr);
 '
 
-const c_bare_headers = c_helper_macros + c_common_macros +
+const c_bare_headers = c_helper_macros + c_common_macros + c_common_callconv_attr +
 	'
 #define _VFREESTANDING
-typedef long unsigned int size_t;
 // Memory allocation related headers
 void *malloc(size_t size);
 void *calloc(size_t nitems, size_t size);
 void *realloc(void *ptr, size_t size);
-void *memcpy(void *dest, void *src, size_t n);
+void *memcpy(void *dest, const void *src, size_t n);
 void *memset(void *s, int c, size_t n);
-void *memmove(void *dest, void *src, size_t n);
+void *memmove(void *dest, const void *src, size_t n);
 // varargs implementation, TODO: works on tcc and gcc, but is very unportable and hacky
 typedef __builtin_va_list va_list;
 #define va_start(a, b) __builtin_va_start(a, b)
@@ -505,8 +650,13 @@ typedef __builtin_va_list va_list;
 #define va_arg(a, b)   __builtin_va_arg(a, b)
 #define va_copy(a, b)  __builtin_va_copy(a, b)
 //================================== GLOBALS =================================*/
+#ifdef _VOBJECTFILE
+static void _vinit(int ___argc, voidptr ___argv);
+static void _vcleanup(void);
+#else
 void _vinit(int ___argc, voidptr ___argv);
 void _vcleanup();
+#endif
 #define sigaction_size sizeof(sigaction);
 #define _ARR_LEN(a) ( (sizeof(a)) / (sizeof(a[0])) )
 voidptr builtin__memdup(voidptr src, isize size);
@@ -601,7 +751,7 @@ static inline uint64_t _wymix(uint64_t A, uint64_t B){ _wymum(&A,&B); return A^B
 static inline uint64_t _wyr3(const uint8_t *p, size_t k) { return (((uint64_t)p[0])<<16)|(((uint64_t)p[k>>1])<<8)|p[k-1];}
 // wyhash main function
 static inline uint64_t wyhash(const void *key, size_t len, uint64_t seed, const uint64_t *secret){
-	const uint8_t *p=(const uint8_t *)key; seed^=_wymix(seed^secret[0],secret[1]);	uint64_t a, b;
+	const uint8_t *p=(const uint8_t *)key; seed^=_wymix(seed^secret[0]^len,secret[1]);	uint64_t a, b;
 	if (_likely_(len<=16)) {
 		if (_likely_(len>=4)) { a=(_wyr4(p)<<32)|_wyr4(p+((len>>3)<<2)); b=(_wyr4(p+len-4)<<32)|_wyr4(p+len-4-((len>>3)<<2)); }
 		else if (_likely_(len>0)) { a=_wyr3(p,len); b=0; }

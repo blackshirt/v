@@ -11,11 +11,11 @@ fn dead_code_elimination(mut m ssa.Module) bool {
 	mut changed := true
 	for changed {
 		changed = false
-		for func in m.funcs {
+		for fi in 0 .. m.funcs.len {
 			// Dead store elimination: find stores to local allocas that are never read
-			dead_stores := find_dead_stores(m, func)
+			dead_stores := find_dead_stores(m, &m.funcs[fi])
 
-			for blk_id in func.blocks {
+			for blk_id in m.funcs[fi].blocks {
 				// First pass: find dead instructions (don't modify yet)
 				mut dead_instrs := []int{}
 				for val_id in m.blocks[blk_id].instrs {
@@ -58,7 +58,10 @@ fn dead_code_elimination(mut m ssa.Module) bool {
 							new_instrs << val_id
 						}
 					}
-					m.blocks[blk_id].instrs = new_instrs
+					// Avoid m.blocks[X].instrs = ... -- chained field assign broken in ARM64 self-hosted
+					mut dce_blk := m.blocks[blk_id]
+					dce_blk.instrs = new_instrs
+					m.blocks[blk_id] = dce_blk
 					changed = true
 					any_changed = true
 				}
@@ -90,7 +93,7 @@ fn remove_use(mut m ssa.Module, val_id int, user_id int) {
 // We must be conservative: if the alloca pointer escapes (used by GEP, passed to
 // a function, etc.), we cannot eliminate stores because the value might be read
 // through the escaped pointer.
-fn find_dead_stores(m ssa.Module, func ssa.Function) map[int]bool {
+fn find_dead_stores(m &ssa.Module, func &ssa.Function) map[int]bool {
 	mut dead_stores := map[int]bool{}
 
 	// Find all local allocas

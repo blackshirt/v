@@ -6,6 +6,10 @@ module ssa
 
 pub type TypeID = int
 
+pub fn (id TypeID) str() string {
+	return int(id).str()
+}
+
 pub enum TypeKind {
 	void_t
 	int_t
@@ -16,6 +20,21 @@ pub enum TypeKind {
 	func_t
 	label_t
 	metadata_t
+}
+
+// str returns the symbolic name for an SSA type kind.
+pub fn (k TypeKind) str() string {
+	return match k {
+		.void_t { 'void_t' }
+		.int_t { 'int_t' }
+		.float_t { 'float_t' }
+		.ptr_t { 'ptr_t' }
+		.array_t { 'array_t' }
+		.struct_t { 'struct_t' }
+		.func_t { 'func_t' }
+		.label_t { 'label_t' }
+		.metadata_t { 'metadata_t' }
+	}
 }
 
 pub struct Type {

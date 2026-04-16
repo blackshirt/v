@@ -50,3 +50,27 @@ fn test_update_sym_by_idx() {
 	assert new_alias_size == b_new_size
 	assert new_alias_sym.size == b_new_size // make sure that `new_alias_sym` is now updated too (since it is a pointer to a symbol value stored in the table)
 }
+
+fn test_scoped_cname_prefers_escaped_cname_for_generic_scoped_names() {
+	sym := ast.TypeSymbol{
+		cname: 'x__json2__Node_T_x__json2__ValueInfo'
+		info:  ast.Struct{
+			scoped_name: 'x.json2.Node[x.json2.ValueInfo]'
+		}
+	}
+	assert sym.scoped_cname() == 'x__json2__Node_T_x__json2__ValueInfo'
+}
+
+fn test_fully_unaliased_type_preserves_nested_c_alias_pointers() {
+	source := 'type C.WCHAR = u16\ntype C.PWSTR = &C.WCHAR\ntype C.FILE_SHARE_MODE = u32'
+	mut t := ast.new_table()
+	parser.parse_text(source, '', mut t, .parse_comments, pref.new_preferences())
+
+	wchar_typ := t.type_idxs['C.WCHAR']!
+	pwide_typ := t.type_idxs['C.PWSTR']!
+	share_mode_typ := t.type_idxs['C.FILE_SHARE_MODE']!
+
+	assert t.fully_unaliased_type(wchar_typ) == ast.u16_type
+	assert t.fully_unaliased_type(pwide_typ) == ast.u16_type.ref()
+	assert t.fully_unaliased_type(share_mode_typ) == ast.u32_type
+}

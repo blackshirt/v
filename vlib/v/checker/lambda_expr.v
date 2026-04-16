@@ -4,6 +4,22 @@ import v.ast
 
 pub fn (mut c Checker) lambda_expr(mut node ast.LambdaExpr, exp_typ ast.Type) ast.Type {
 	if node.is_checked {
+		if c.table.cur_concrete_types.len == 0 || node.typ == exp_typ {
+			return node.typ
+		}
+		// Re-checking with different concrete types: don't recreate the AnonFn
+		// (which would mutate the shared AST and corrupt params for other
+		// instantiations). Just update the scope variable types and return.
+		// The cgen handles per-instantiation code generation via g.cur_concrete_types.
+		exp_sym := c.table.sym(exp_typ)
+		if exp_sym.info is ast.FnType {
+			for idx, mut x in node.params {
+				if idx < exp_sym.info.func.params.len {
+					eparam_type := exp_sym.info.func.params[idx].typ
+					c.lambda_expr_fix_type_of_param(mut node, mut x, eparam_type)
+				}
+			}
+		}
 		return node.typ
 	}
 	if exp_typ in [0, ast.void_type] {
@@ -149,8 +165,7 @@ pub fn (mut c Checker) support_lambda_expr_in_sort(param_type ast.Type, return_t
 		]
 		return_type: return_type
 	}
-	expected_fn_type := ast.new_type(c.table.find_or_register_fn_type(expected_fn, true,
-		false))
+	expected_fn_type := ast.new_type(c.table.find_or_register_fn_type(expected_fn, true, false))
 	c.lambda_expr(mut expr, expected_fn_type)
 }
 

@@ -1,10 +1,20 @@
 import os
-import time
 
 // tfolder will contain all the temporary files/subfolders made by
 // the different tests. It would be removed in testsuite_end(), so
 // individual os tests do not need to clean up after themselves.
 const tfolder = os.join_path(os.vtmp_dir(), 'os_tests')
+const utf16le_stdout_source_code = '
+module main
+
+import os
+
+fn main() {
+	payload := [u8(`O`), 0, `K`, 0, u8(10), 0]
+	mut out := os.stdout()
+	out.write(payload) or { panic(err) }
+}
+'
 
 // os.args has to be *already initialized* with the program's argc/argv at this point
 // thus it can be used for other consts too:
@@ -289,7 +299,8 @@ fn test_walk_with_context() {
 		remove_tree()
 	}
 	mut res := []string{}
-	os.walk_with_context('myfolder', &res, fn (mut res []string, fpath string) {
+	os.walk_with_context('myfolder', &res, fn (ctx voidptr, fpath string) {
+		mut res := unsafe { &[]string(ctx) }
 		res << fpath
 	})
 	res = normalise_paths(res)
@@ -1001,9 +1012,9 @@ fn test_utime() {
 		os.rm(filename) or { panic(err) }
 	}
 	f.write_string(hello) or { panic(err) }
-	atime := time.now().add_days(2).unix()
-	mtime := time.now().add_days(4).unix()
-	os.utime(filename, int(atime), int(mtime)) or { panic(err) }
+	atime := i64(2_147_483_648)
+	mtime := i64(2_306_102_495)
+	os.utime(filename, atime, mtime) or { panic(err) }
 	assert os.file_last_mod_unix(filename) == mtime
 }
 
@@ -1033,7 +1044,8 @@ fn test_execute_with_stderr_redirection() {
 	assert result.output.contains('unknown command `wrong_command`')
 
 	stderr_path := os.join_path_single(tfolder, 'stderr.txt')
-	result2 := os.execute('${os.quoted_path(@VEXE)} wrong_command 2> ${os.quoted_path(stderr_path)}')
+	result2 :=
+		os.execute('${os.quoted_path(@VEXE)} wrong_command 2> ${os.quoted_path(stderr_path)}')
 	assert result2.exit_code == 1
 	assert result2.output == ''
 	assert os.exists(stderr_path)
@@ -1049,6 +1061,27 @@ fn test_execute_with_linefeeds() {
 	assert result2.exit_code == 1
 }
 
+fn test_execute_with_semicolon_inside_quoted_string_on_windows() {
+	if os.user_os() != 'windows' {
+		return
+	}
+	result := os.execute('echo "hello;"')
+	assert result.exit_code == 0, result.output
+	assert result.output.trim_space() == '"hello;"'
+}
+
+fn test_execute_pipe_into_vfmt() {
+	producer_script := os.join_path_single(tfolder, 'pipe_into_vfmt.v')
+	os.write_file(producer_script, "fn main() {\n\tprint('fn main(){println(1)}\\n')\n}\n")!
+	defer {
+		os.rm(producer_script) or {}
+	}
+	result :=
+		os.execute('${os.quoted_path(@VEXE)} run ${os.quoted_path(producer_script)} | ${os.quoted_path(@VEXE)} fmt')
+	assert result.exit_code == 0, result.output
+	assert result.output.replace('\r\n', '\n') == 'fn main() {\n\tprintln(1)\n}\n'
+}
+
 fn test_execute_fc_get_output() {
 	if os.user_os() != 'windows' {
 		return
@@ -1056,6 +1089,20 @@ fn test_execute_fc_get_output() {
 	result := os.execute('c:\\windows\\system32\\fc.exe /?')
 	assert result.output.contains('filename')
 	assert result.exit_code == -1
+}
+
+fn test_execute_decodes_utf16le_output() {
+	if os.user_os() != 'windows' {
+		return
+	}
+	source_path := os.join_path_single(tfolder, 'utf16le_stdout.v')
+	os.write_file(source_path, utf16le_stdout_source_code)!
+	defer {
+		os.rm(source_path) or {}
+	}
+	result := os.execute('${os.quoted_path(@VEXE)} run ${os.quoted_path(source_path)}')
+	assert result.exit_code == 0, result.output
+	assert result.output == 'OK\n', result.output
 }
 
 fn test_reading_from_proc_cpuinfo() {

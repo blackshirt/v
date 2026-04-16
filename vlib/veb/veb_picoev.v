@@ -8,6 +8,8 @@ $if !new_veb ? {
 	import net.http
 	import io
 	import net.urllib
+	import strconv
+	import strings
 }
 
 $if !new_veb ? {
@@ -18,23 +20,29 @@ $if !new_veb ? {
 		if params.port <= 0 || params.port > 65535 {
 			return error('invalid port number `${params.port}`, it should be between 1 and 65535')
 		}
+		maybe_init_server[A](mut global_app, new_server_without_lifecycle())
+		if ssl_enabled(params) {
+			run_at_with_ssl[A, X](mut global_app, params)!
+			return
+		}
 		routes := generate_routes[A, X](global_app)!
 		controllers_sorted := check_duplicate_routes_in_controllers[A](global_app, routes)!
 		if params.show_startup_message {
-			host := if params.host == '' { 'localhost' } else { params.host }
-			println('[veb] Running app on http://${host}:${params.port}/')
+			println('[veb] Running app on ${server_protocol(params)}://${startup_host(params)}:${params.port}/')
 		}
 		flush_stdout()
+		routes_ptr := &routes
 		mut pico_context := &RequestParams{
-			global_app:         unsafe { global_app }
+			global_app:         unsafe { voidptr(&global_app) }
 			controllers:        controllers_sorted
-			routes:             &routes
+			routes:             routes_ptr
 			timeout_in_seconds: params.timeout_in_seconds
 		}
 		pico_context.idx = []int{len: picoev.max_fds}
 		// reserve space for read and write buffers
 		pico_context.buf = unsafe { malloc_noscan(picoev.max_fds * max_read + 1) }
 		defer { unsafe { free(pico_context.buf) } }
+		pico_context.body_buffers = [][]u8{len: picoev.max_fds}
 		pico_context.incomplete_requests = []http.Request{len: picoev.max_fds}
 		pico_context.file_responses = []FileResponse{len: picoev.max_fds}
 		pico_context.string_responses = []StringResponse{len: picoev.max_fds}
@@ -96,8 +104,99 @@ $if !new_veb ? {
 			is_blocking: false
 		}
 		fast_send_resp(mut conn, http_408) or {}
+		if params.file_responses[fd].open {
+			params.file_responses[fd].done()
+		}
+		if params.string_responses[fd].open {
+			params.string_responses[fd].done()
+		}
 		pv.close_conn(fd)
 		params.request_done(fd)
+	}
+
+	struct IncompleteChunkedRequestBodyError {
+		Error
+	}
+
+	fn (err IncompleteChunkedRequestBodyError) msg() string {
+		return 'incomplete chunked request body'
+	}
+
+	fn decode_chunked_request_body(encoded_body string) !string {
+		mut sb := strings.new_builder(encoded_body.len)
+		mut idx := 0
+		for {
+			chunk_line_end := encoded_body.index_after('\r\n', idx) or {
+				return IncompleteChunkedRequestBodyError{}
+			}
+			mut chunk_size_line := encoded_body[idx..chunk_line_end].trim_space()
+			if chunk_size_line.len == 0 {
+				return error('invalid chunk size line')
+			}
+			if semicolon_idx := chunk_size_line.index(';') {
+				chunk_size_line = chunk_size_line[..semicolon_idx].trim_space()
+			}
+			if chunk_size_line.len == 0 {
+				return error('invalid chunk size line')
+			}
+			chunk_size_u64 := strconv.parse_uint(chunk_size_line, 16, 64) or {
+				return error('invalid chunk size line')
+			}
+			if chunk_size_u64 > u64(max_int) {
+				return error('chunk size too large')
+			}
+			chunk_size := int(chunk_size_u64)
+			idx = chunk_line_end + 2
+			if chunk_size == 0 {
+				if idx + 2 > encoded_body.len {
+					return IncompleteChunkedRequestBodyError{}
+				}
+				if encoded_body[idx] == `\r` && encoded_body[idx + 1] == `\n` {
+					idx += 2
+					if idx != encoded_body.len {
+						return error('invalid chunk trailer')
+					}
+					return sb.str()
+				}
+				trailer_end := encoded_body.index_after('\r\n\r\n', idx) or {
+					return IncompleteChunkedRequestBodyError{}
+				}
+				if trailer_end + 4 != encoded_body.len {
+					return error('invalid chunk trailer')
+				}
+				return sb.str()
+			}
+			if idx + chunk_size + 2 > encoded_body.len {
+				return IncompleteChunkedRequestBodyError{}
+			}
+			sb.write_string(encoded_body[idx..idx + chunk_size])
+			idx += chunk_size
+			if encoded_body[idx] != `\r` || encoded_body[idx + 1] != `\n` {
+				return error('invalid chunk delimiter')
+			}
+			idx += 2
+		}
+		return error('invalid chunked body')
+	}
+
+	@[inline]
+	fn append_request_body(mut params RequestParams, fd int, chunk []u8, expected_len int) {
+		if chunk.len == 0 {
+			return
+		}
+		if params.body_buffers[fd].cap == 0 {
+			initial_cap := if expected_len > 0 { expected_len } else { chunk.len }
+			params.body_buffers[fd] = []u8{cap: initial_cap}
+		}
+		params.body_buffers[fd] << chunk
+	}
+
+	@[inline; manualfree]
+	fn finalize_request_body(mut params RequestParams, fd int) string {
+		body := params.body_buffers[fd].bytestr()
+		unsafe { params.body_buffers[fd].free() }
+		params.body_buffers[fd] = []u8{}
+		return body
 	}
 
 	// handle_write_file reads data from a file and sends that data over the socket.
@@ -141,9 +240,27 @@ $if !new_veb ? {
 		if params.file_responses[fd].pos == params.file_responses[fd].total {
 			// file is done writing
 			params.file_responses[fd].done()
-			handle_complete_request(params.file_responses[fd].should_close_conn, mut pv,
-				fd)
+			handle_complete_request(params.file_responses[fd].should_close_conn, mut pv, fd)
 			return
+		}
+	}
+
+	@[manualfree]
+	fn send_file_inline(mut conn net.TcpConn, mut file os.File, total i64, timeout_in_seconds int) ! {
+		conn.write_timeout = timeout_in_seconds * time.second
+		data := unsafe { malloc(max_write) }
+		defer {
+			unsafe { free(data) }
+		}
+		mut remaining := total
+		for remaining > 0 {
+			bytes_to_write := if remaining > max_write { max_write } else { int(remaining) }
+			bytes_read := file.read_into_ptr(data, bytes_to_write)!
+			if bytes_read <= 0 {
+				return error('unexpected EOF while sending file response')
+			}
+			send_string_ptr(mut conn, data, bytes_read)!
+			remaining -= bytes_read
 		}
 	}
 
@@ -172,8 +289,7 @@ $if !new_veb ? {
 			// done writing
 			params.string_responses[fd].done()
 			pv.close_conn(fd)
-			handle_complete_request(params.string_responses[fd].should_close_conn, mut
-				pv, fd)
+			handle_complete_request(params.string_responses[fd].should_close_conn, mut pv, fd)
 			return
 		}
 	}
@@ -235,57 +351,50 @@ $if !new_veb ? {
 				eprintln('>>>>> fd: ${fd} | continuation of request, where the first part contained headers')
 			}
 		}
-		// check if the request has a body
-		content_length := req.header.get(.content_length) or { '0' }
-		content_length_i := content_length.int()
-		if content_length_i > 0 {
+		if transfer_encoding_is_chunked(req.header) {
 			mut max_bytes_to_read := max_read - reader.total_read
-			mut bytes_to_read := content_length_i - params.idx[fd]
-			// cap the bytes to read to 8KB for the body, including the request headers if any
-			if bytes_to_read > max_read - reader.total_read {
-				bytes_to_read = max_read - reader.total_read
+			if max_bytes_to_read > 0 {
+				mut buf_ptr := params.buf
+				unsafe {
+					buf_ptr += fd * max_read // pointer magic
+				}
+				// convert to []u8 for BufferedReader
+				mut buf := unsafe { buf_ptr.vbytes(max_bytes_to_read) }
+				n := reader.read(mut buf) or {
+					if reader.total_read > 0 {
+						// The headers were parsed in this cycle, but the body has not been sent yet. No need to error.
+						params.idx[fd] = -1 // avoid reparsing the headers on the next call.
+						params.incomplete_requests[fd] = req
+						$if trace_handle_read ? {
+							eprintln('>>>>> fd: ${fd} | request headers were parsed, but the chunked body has not been parsed yet')
+						}
+						return
+					}
+					eprintln('[veb] error reading chunked request body: ${err}')
+					pv.close_conn(fd)
+					params.request_done(fd)
+					return
+				}
+				if n > 0 {
+					req.data += buf[0..n].bytestr()
+					params.idx[fd] += n
+				}
 			}
-			mut buf_ptr := params.buf
-			unsafe {
-				buf_ptr += fd * max_read // pointer magic
-			}
-			// convert to []u8 for BufferedReader
-			mut buf := unsafe { buf_ptr.vbytes(max_bytes_to_read) }
-			n := reader.read(mut buf) or {
-				if reader.total_read > 0 {
-					// The headers were parsed in this cycle, but the body has not been sent yet. No need to error.
-					params.idx[fd] = -1 // avoid reparsing the headers on the next call.
+			req.data = decode_chunked_request_body(req.data) or {
+				if err is IncompleteChunkedRequestBodyError {
+					if params.idx[fd] == 0 {
+						params.idx[fd] = -1
+					}
 					params.incomplete_requests[fd] = req
 					$if trace_handle_read ? {
-						eprintln('>>>>> fd: ${fd} | request headers were parsed, but the body has not been parsed yet | params.idx[fd]: ${params.idx[fd]} | content_length_i: ${content_length_i}')
+						eprintln('>>>>> request is NOT complete (chunked), fd: ${fd} | req.data.len: ${req.data.len} | params.idx[fd]: ${params.idx[fd]}')
 					}
 					return
 				}
-				eprintln('[veb] error reading request body: ${err}')
-				if err is io.Eof {
-					// we expect more data to be send, but an Eof error occurred, meaning
-					// that there is no more data to be read from the socket.
-					// And at this point we expect that there is data to be read for the body.
-					fast_send_resp(mut conn, http.new_response(
-						status: .bad_request
-						body:   'Mismatch of body length and Content-Length header'
-						header: http.new_header(
-							key:   .content_type
-							value: 'text/plain'
-						).join(headers_close)
-					)) or {}
-				}
-				pv.close_conn(fd)
-				params.request_done(fd)
-				return
-			}
-			// there is no more data to be sent, but it is less than the Content-Length header
-			// so it is a mismatch of body length and content length.
-			// Or if there is more data received then the Content-Length header specified
-			if (n == 0 && params.idx[fd] != 0) || params.idx[fd] + n > content_length_i {
+				eprintln('[veb] error decoding chunked request body: ${err}')
 				fast_send_resp(mut conn, http.new_response(
 					status: .bad_request
-					body:   'Mismatch of body length and Content-Length header'
+					body:   'Invalid chunked request body'
 					header: http.new_header(
 						key:   .content_type
 						value: 'text/plain'
@@ -294,22 +403,84 @@ $if !new_veb ? {
 				pv.close_conn(fd)
 				params.request_done(fd)
 				return
-			} else if n < bytes_to_read || params.idx[fd] + n < content_length_i {
-				// request is incomplete wait until the socket becomes ready to read again
-				// TODO: change this to a memcpy function?
-				req.data += buf[0..n].bytestr()
-				params.incomplete_requests[fd] = req
-				params.idx[fd] += n
-				$if trace_handle_read ? {
-					eprintln('>>>>> request is NOT complete, fd: ${fd} | n: ${n} | req.data.len: ${req.data.len} | params.idx[fd]: ${params.idx[fd]}')
+			}
+		} else {
+			// check if the request has a body
+			content_length := req.header.get(.content_length) or { '0' }
+			content_length_i := content_length.int()
+			if content_length_i > 0 {
+				mut max_bytes_to_read := max_read - reader.total_read
+				mut bytes_to_read := content_length_i - params.idx[fd]
+				// cap the bytes to read to 8KB for the body, including the request headers if any
+				if bytes_to_read > max_read - reader.total_read {
+					bytes_to_read = max_read - reader.total_read
 				}
-				return
-			} else {
-				// request is complete: n = bytes_to_read
-				req.data += buf[0..n].bytestr()
-				params.idx[fd] += n
-				$if trace_handle_read ? {
-					eprintln('>>>>> request is NOW COMPLETE, fd: ${fd} | n: ${n} | req.data.len: ${req.data.len}')
+				mut buf_ptr := params.buf
+				unsafe {
+					buf_ptr += fd * max_read // pointer magic
+				}
+				// convert to []u8 for BufferedReader
+				mut buf := unsafe { buf_ptr.vbytes(max_bytes_to_read) }
+				n := reader.read(mut buf) or {
+					if reader.total_read > 0 {
+						// The headers were parsed in this cycle, but the body has not been sent yet. No need to error.
+						params.idx[fd] = -1 // avoid reparsing the headers on the next call.
+						params.incomplete_requests[fd] = req
+						$if trace_handle_read ? {
+							eprintln('>>>>> fd: ${fd} | request headers were parsed, but the body has not been parsed yet | params.idx[fd]: ${params.idx[fd]} | content_length_i: ${content_length_i}')
+						}
+						return
+					}
+					eprintln('[veb] error reading request body: ${err}')
+					if err is io.Eof {
+						// we expect more data to be send, but an Eof error occurred, meaning
+						// that there is no more data to be read from the socket.
+						// And at this point we expect that there is data to be read for the body.
+						fast_send_resp(mut conn, http.new_response(
+							status: .bad_request
+							body:   'Mismatch of body length and Content-Length header'
+							header: http.new_header(
+								key:   .content_type
+								value: 'text/plain'
+							).join(headers_close)
+						)) or {}
+					}
+					pv.close_conn(fd)
+					params.request_done(fd)
+					return
+				}
+				// there is no more data to be sent, but it is less than the Content-Length header
+				// so it is a mismatch of body length and content length.
+				// Or if there is more data received then the Content-Length header specified
+				if (n == 0 && params.idx[fd] != 0) || params.idx[fd] + n > content_length_i {
+					fast_send_resp(mut conn, http.new_response(
+						status: .bad_request
+						body:   'Mismatch of body length and Content-Length header'
+						header: http.new_header(
+							key:   .content_type
+							value: 'text/plain'
+						).join(headers_close)
+					)) or {}
+					pv.close_conn(fd)
+					params.request_done(fd)
+					return
+				} else if n < bytes_to_read || params.idx[fd] + n < content_length_i {
+					// request is incomplete wait until the socket becomes ready to read again
+					append_request_body(mut params, fd, buf[0..n], content_length_i)
+					params.incomplete_requests[fd] = req
+					params.idx[fd] += n
+					$if trace_handle_read ? {
+						eprintln('>>>>> request is NOT complete, fd: ${fd} | n: ${n} | body_buffer.len: ${params.body_buffers[fd].len} | params.idx[fd]: ${params.idx[fd]}')
+					}
+					return
+				} else {
+					// request is complete: n = bytes_to_read
+					append_request_body(mut params, fd, buf[0..n], content_length_i)
+					req.data = finalize_request_body(mut params, fd)
+					params.idx[fd] += n
+					$if trace_handle_read ? {
+						eprintln('>>>>> request is NOW COMPLETE, fd: ${fd} | n: ${n} | req.data.len: ${req.data.len}')
+					}
 				}
 			}
 		}
@@ -329,8 +500,7 @@ $if !new_veb ? {
 					// See Context.send_file for why we use max_read instead of max_write.
 					if completed_context.res.body.len < max_read {
 						fast_send_resp(mut conn, completed_context.res) or {}
-						handle_complete_request(completed_context.client_wants_to_close, mut
-							pv, fd)
+						handle_complete_request(completed_context.client_wants_to_close, mut pv, fd)
 					} else {
 						params.string_responses[fd].open = true
 						params.string_responses[fd].str = completed_context.res.body
@@ -355,28 +525,50 @@ $if !new_veb ? {
 						fast_send_resp(mut conn, http_500) or {}
 						return
 					}
-					params.file_responses[fd].total = length.i64()
-					params.file_responses[fd].file = os.open(completed_context.return_file) or {
-						// Context checks if the file is valid, so this should never happen
-						fast_send_resp(mut conn, http_500) or {}
-						params.file_responses[fd].done()
-						pv.close_conn(fd)
-						return
-					}
-					params.file_responses[fd].open = true
+					$if termux {
+						mut file := os.open(completed_context.return_file) or {
+							// Context checks if the file is valid, so this should never happen
+							fast_send_resp(mut conn, http_500) or {}
+							pv.close_conn(fd)
+							return
+						}
+						defer { file.close() }
+						fast_send_resp_header(mut conn, completed_context.res) or {
+							pv.close_conn(fd)
+							return
+						}
+						// Termux file responses are sent inline because deferred write events can
+						// leave static responses stalled.
+						send_file_inline(mut conn, mut file, length.i64(),
+							params.timeout_in_seconds) or {
+							pv.close_conn(fd)
+							return
+						}
+						handle_complete_request(completed_context.client_wants_to_close, mut pv, fd)
+					} $else {
+						params.file_responses[fd].total = length.i64()
+						params.file_responses[fd].file = os.open(completed_context.return_file) or {
+							// Context checks if the file is valid, so this should never happen
+							fast_send_resp(mut conn, http_500) or {}
+							params.file_responses[fd].done()
+							pv.close_conn(fd)
+							return
+						}
+						params.file_responses[fd].open = true
 
-					res := pv.add(fd, picoev.picoev_write, params.timeout_in_seconds,
-						picoev.raw_callback)
-					// picoev error
-					if res == -1 {
-						// should not happen
-						fast_send_resp(mut conn, http_500) or {}
-						params.file_responses[fd].done()
-						pv.close_conn(fd)
-						return
+						res := pv.add(fd, picoev.picoev_write, params.timeout_in_seconds,
+							picoev.raw_callback)
+						// picoev error
+						if res == -1 {
+							// should not happen
+							fast_send_resp(mut conn, http_500) or {}
+							params.file_responses[fd].done()
+							pv.close_conn(fd)
+							return
+						}
+						// no errors we can send the HTTP headers
+						fast_send_resp_header(mut conn, completed_context.res) or {}
 					}
-					// no errors we can send the HTTP headers
-					fast_send_resp_header(mut conn, completed_context.res) or {}
 				}
 			}
 		} else {
@@ -405,7 +597,7 @@ $if !new_veb ? {
 			dump(req.url)
 		}
 		// parse the URL, query and form data
-		mut url := urllib.parse(req.url) or {
+		mut url := urllib.parse_request_uri(req.url) or {
 			eprintln('[veb] error parsing path "${req.url}": ${err}')
 			return none
 		}
@@ -440,9 +632,7 @@ $if !new_veb ? {
 		}
 		// match controller paths
 		$if A is ControllerInterface {
-			if completed_context := handle_controllers[X](params.controllers, ctx, mut
-				url, host)
-			{
+			if completed_context := handle_controllers[X](params.controllers, ctx, mut url, host) {
 				return completed_context
 			}
 		}

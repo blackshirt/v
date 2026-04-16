@@ -1,10 +1,14 @@
 module builtin
 
+import strings
+
 pub struct string {
 pub:
 	str JS.String
 	len int
 }
+
+interface TosSource {}
 
 pub fn (s string) runes() []rune {
 	ret := JS.makeEmptyArray()
@@ -772,6 +776,65 @@ pub fn (s string) replace_each(vals []string) string {
 	return b
 }
 
+// format replaces positional placeholders like `{0}` and `{1}` in `s`
+// with the corresponding values from `args`.
+// Use `{{` and `}}` to output literal braces.
+@[direct_array_access]
+pub fn (s string) format(args ...string) string {
+	if s.len == 0 {
+		return ''
+	}
+	mut out := strings.new_builder(s.len)
+	mut i := 0
+	for i < s.len {
+		ch := s[i]
+		if ch == `{` {
+			if i + 1 < s.len && s[i + 1] == `{` {
+				out.write_byte(`{`)
+				i += 2
+				continue
+			}
+			mut j := i + 1
+			if j >= s.len || !s[j].is_digit() {
+				out.write_byte(ch)
+				i++
+				continue
+			}
+			mut idx := 0
+			mut overflowed := false
+			for j < s.len && s[j].is_digit() {
+				digit := int(s[j] - `0`)
+				if idx > (max_int - digit) / 10 {
+					overflowed = true
+					break
+				}
+				idx = idx * 10 + digit
+				j++
+			}
+			if !overflowed && j < s.len && s[j] == `}` {
+				if idx < args.len {
+					out.write_string(args[idx])
+				} else {
+					out.write_string(s[i..j + 1])
+				}
+				i = j + 1
+				continue
+			}
+			out.write_byte(ch)
+			i++
+			continue
+		}
+		if ch == `}` && i + 1 < s.len && s[i + 1] == `}` {
+			out.write_byte(`}`)
+			i += 2
+			continue
+		}
+		out.write_byte(ch)
+		i++
+	}
+	return out.str()
+}
+
 // last_index returns the position of the last occurrence of the input string.
 fn (s string) index_last_(p string) int {
 	if p.len > s.len || p.len == 0 {
@@ -1061,9 +1124,43 @@ pub fn (_rune string) utf32_code() int {
 	return res
 }
 
-pub fn tos(jsstr JS.String) string {
-	res := ''
-	#res.str = jsstr
+// tos converts a JS string or an addressable byte range into a V string.
+pub fn tos(source TosSource, lens ...int) string {
+	mut res := ''
+	#const source_value = source instanceof $ref ? source.valueOf() : source
+	if lens.len == 0 {
+		#if (source_value instanceof string) {
+		#res.str = source_value.str
+		#} else if (typeof source_value === 'string' || source_value instanceof String) {
+		#res.str = source_value.toString()
+		#} else {
+		panic('tos(): unsupported source in JS backend')
+		#}
+
+		return res
+	}
+	if lens.len != 1 {
+		panic('tos(): expected exactly one length argument')
+	}
+	len := lens[0]
+	if len < 0 {
+		panic('tos(): negative length')
+	}
+	#if (source_value === null || source_value === undefined) {
+	panic('tos(): nil string')
+	#}
+	#if (source && source._v_array !== undefined && source._v_index !== undefined) {
+	#const start = source._v_index.valueOf()
+	#for (let i = 0; i < len.valueOf(); ++i) res.str += String.fromCharCode(source._v_array.arr.get(new int(start + i)).valueOf())
+	#} else if (source_value.arr !== undefined && typeof source_value.arr.get === 'function') {
+	#for (let i = 0; i < len.valueOf(); ++i) res.str += String.fromCharCode(source_value.arr.get(new int(i)).valueOf())
+	#} else if (source_value instanceof string) {
+	#res.str = source_value.str.slice(0, len.valueOf())
+	#} else if (typeof source_value === 'string' || source_value instanceof String) {
+	#res.str = source_value.toString().slice(0, len.valueOf())
+	#} else {
+	panic('tos(): unsupported source in JS backend')
+	#}
 
 	return res
 }

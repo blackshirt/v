@@ -220,11 +220,17 @@ Otherwise, follow these instructions:
 > you the effort to type in the full path to your v executable every time.
 > V provides a convenience `v symlink` command to do that more easily.
 
-On Unix systems, it creates a `/usr/local/bin/v` symlink to your
-executable. To do that, run:
+On Unix systems, it creates a `v` symlink in `/usr/local/bin` by
+default. To do that, run:
 
 ```bash
 sudo ./v symlink
+```
+
+You can also pass a different directory, for example:
+
+```bash
+./v symlink ~/.local/bin
 ```
 
 On Windows, start a new shell with administrative privileges, for example by pressing the
@@ -237,6 +243,9 @@ v symlink
 ```
 
 (or `.\v symlink` in PowerShell)
+
+You can pass a different directory there too, for example
+`v symlink C:\Users\you\bin`.
 
 That will make V available everywhere, by adding it to your PATH. Please restart your
 shell/editor after that, so that it can pick up the new PATH variable.
@@ -253,6 +262,7 @@ shell/editor after that, so that it can pick up the new PATH variable.
 - [JetBrains](https://plugins.jetbrains.com/plugin/20287-vlang/docs/syntax-highlighting.html)
 - [Sublime Text 3](https://github.com/vlang/awesome-v#sublime-text-3)
 - [Vim](https://github.com/vlang/awesome-v#vim)
+- [Vim/Neovim Runtime Files](editors/vim)
 - [VS Code](https://marketplace.visualstudio.com/items?itemName=VOSCA.vscode-v-analyzer)
 - [zed](https://github.com/lv37/zed-v)
 
@@ -286,6 +296,10 @@ v run word_counter/word_counter.v word_counter/cinderella.txt
 v run news_fetcher.v
 v run tetris/tetris.v
 ```
+
+When a project has a `.vvmrc` file, `v <project>` and `v run <project>` try
+to use the requested V binary (for example `v0.4.6`) before falling back to
+the current compiler.
 
 
 <img src='https://raw.githubusercontent.com/vlang/v/master/examples/tetris/screenshot.png' width=300 alt='tetris screenshot'>
@@ -411,6 +425,9 @@ Note the TCC website is old; the current TCC repository can be found
 [here](https://repo.or.cz/w/tinycc.git).
 V utilizes pre-built TCC binaries located at
 [https://github.com/vlang/tccbin/](https://github.com/vlang/tccbin/).
+To rebuild the bundled `thirdparty/tcc` in place from upstream TinyCC on the
+platforms that have an in-tree build script, run `make latest_tcc_source`.
+Pass `TCC_COMMIT=<hash-or-branch>` to pin a specific upstream revision.
 
 ### PVS-Studio
 

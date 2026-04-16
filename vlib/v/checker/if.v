@@ -7,6 +7,60 @@ import v.token
 import v.util
 import strings
 
+fn (c &Checker) simple_expr_name_for_dead_branch_check(expr ast.Expr) string {
+	mut current_expr := expr
+	current_expr = current_expr.remove_par()
+	if current_expr !in [ast.Ident, ast.SelectorExpr] {
+		return ''
+	}
+	return current_expr.str()
+}
+
+fn (mut c Checker) is_always_true_self_comparison(cond ast.Expr) bool {
+	mut cond_expr := cond
+	cond_expr = cond_expr.remove_par()
+	if mut cond_expr is ast.InfixExpr {
+		if cond_expr.op != .eq {
+			return false
+		}
+		left_name := c.simple_expr_name_for_dead_branch_check(cond_expr.left)
+		right_name := c.simple_expr_name_for_dead_branch_check(cond_expr.right)
+		if left_name == '' || left_name != right_name {
+			return false
+		}
+		mut left_type := if cond_expr.left_type == ast.no_type {
+			c.get_expr_type(cond_expr.left)
+		} else {
+			cond_expr.left_type
+		}
+		mut right_type := if cond_expr.right_type == ast.no_type {
+			c.get_expr_type(cond_expr.right)
+		} else {
+			cond_expr.right_type
+		}
+		left_type = c.table.unaliased_type(left_type)
+		right_type = c.table.unaliased_type(right_type)
+		if left_type.is_float() || right_type.is_float() {
+			// `NaN == NaN` is always false.
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+fn (c &Checker) is_interface_smartcast_sumtype_variant(expr ast.Expr, expected_type ast.Type, got_type ast.Type) bool {
+	sum_type := expected_type.clear_option_and_result()
+	if c.table.type_kind(sum_type) != .sum_type || !got_type.is_ptr() {
+		return false
+	}
+	if expr is ast.Ident && expr.obj is ast.Var {
+		return c.table.is_interface_var(expr.obj)
+			&& c.table.is_sumtype_or_in_variant(sum_type, got_type.deref())
+	}
+	return false
+}
+
 // gen_branch_context_string generate current branches context string.
 // context include generic types, `$for`.
 fn (mut c Checker) gen_branch_context_string() string {
@@ -98,6 +152,10 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 	comptime_branch_context_str := if node.is_comptime { c.gen_branch_context_string() } else { '' }
 
 	for i, mut branch in node.branches {
+		if node.is_comptime {
+			c.push_new_comptime_info()
+		}
+		orig_branch_cond := branch.cond
 		mut comptime_remove_curr_branch_stmts := false
 		if branch.cond is ast.ParExpr && !c.pref.translated && !c.file.is_translated {
 			c.warn('unnecessary `()` in `${if_kind}` condition, use `${if_kind} expr {` instead of `${if_kind} (expr) {`.',
@@ -121,8 +179,8 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 				}
 				c.comptime.inside_comptime_if = true
 				mut sb := strings.new_builder(256)
-				comptime_if_result, comptime_if_multi_pass_branch = c.comptime_if_cond(mut branch.cond, mut
-					sb)
+				comptime_if_result, comptime_if_multi_pass_branch =
+					c.comptime_if_cond(mut branch.cond, mut sb)
 				if comptime_if_multi_pass_branch {
 					comptime_if_has_multi_pass_branch = true
 				}
@@ -170,6 +228,11 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 							c.note('condition is always false', branch.cond.pos())
 						}
 					}
+				}
+				if !c.pref.translated && !c.file.is_translated && !c.inside_unsafe
+					&& c.is_always_true_self_comparison(orig_branch_cond) {
+					c.warn('self-comparison in `if` condition is always true; following branches may be unreachable',
+						branch.cond.pos())
 				}
 			}
 		} else {
@@ -228,11 +291,39 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 					if var.name == '_' {
 						continue
 					}
+					unwrapped_guard_typ := branch.cond.expr_type.clear_option_and_result()
 					if w := branch.scope.find_var(var.name) {
+						$if trace_vweb_guard ? {
+							if var.name == 'params' {
+								expr_type_str := if branch.cond.expr_type == 0 {
+									'<none>'
+								} else {
+									c.table.type_to_str(branch.cond.expr_type)
+								}
+								clear_type := branch.cond.expr_type.clear_option_and_result()
+								clear_type_str := if clear_type == 0 {
+									'<none>'
+								} else {
+									c.table.type_to_str(clear_type)
+								}
+								old_type_str := if w.typ == 0 {
+									'<none>'
+								} else {
+									c.table.type_to_str(w.typ)
+								}
+								eprintln('if_guard scope name=${var.name} expr_type=${expr_type_str} clear=${clear_type_str} old=${old_type_str} file=${c.file.path}')
+							}
+						}
 						if var.name !in branch.scope.objects {
 							branch.scope.objects[var.name] = w
 						}
-						branch.scope.update_var_type(var.name, branch.cond.expr_type.clear_option_and_result())
+						branch.scope.update_var_type(var.name, unwrapped_guard_typ)
+						resolved_guard_typ := c.unwrap_generic(unwrapped_guard_typ)
+						if !resolved_guard_typ.is_ptr() && c.table.sym(resolved_guard_typ).is_heap() {
+							if mut guard_var := branch.scope.find_var(var.name) {
+								guard_var.is_auto_heap = true
+							}
+						}
 					}
 				}
 			}
@@ -351,11 +442,12 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 							goto end_if
 						}
 					}
-					if !c.check_types(stmt.typ, node.typ) {
+					if !c.check_types(stmt.typ, node.typ)
+						&& !c.check_types(c.unwrap_generic(stmt.typ), c.unwrap_generic(node.typ)) {
 						if node.typ == ast.void_type {
 							// first branch of if expression
 							node.is_expr = true
-							if stmt.expr.is_auto_deref_var() {
+							if stmt.expr.is_auto_deref_var() && stmt.typ.is_ptr() {
 								node.typ = stmt.typ.deref()
 							} else {
 								node.typ = stmt.typ
@@ -394,6 +486,15 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 										goto end_if
 									}
 								}
+							}
+						}
+						if c.is_interface_smartcast_sumtype_variant(stmt.expr,
+							former_expected_type, stmt.typ)
+						{
+							node.is_expr = true
+							node.typ = former_expected_type.clear_option_and_result()
+							unsafe {
+								goto end_if
 							}
 						}
 						if node.is_expr && c.table.sym(former_expected_type).kind == .sum_type {
@@ -438,7 +539,8 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 					} else {
 						if !node.typ.has_option_or_result() && !node.typ.has_flag(.shared_f)
 							&& stmt.typ != ast.voidptr_type
-							&& stmt.typ.nr_muls() != node.typ.nr_muls() {
+							&& stmt.typ.nr_muls() != node.typ.nr_muls()
+							&& !c.is_interface_smartcast_sumtype_variant(stmt.expr, node.typ, stmt.typ) {
 							c.error('mismatched types `${c.table.type_to_str(node.typ)}` and `${c.table.type_to_str(stmt.typ)}`',
 								node.pos)
 						}
@@ -447,7 +549,8 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 							node.is_expr = true
 						}
 						if c.inside_assign && node.is_expr && !node.typ.has_flag(.shared_f)
-							&& stmt.typ != ast.voidptr_type {
+							&& stmt.typ != ast.voidptr_type
+							&& !c.is_interface_smartcast_sumtype_variant(stmt.expr, node.typ, stmt.typ) {
 							if stmt.typ.is_ptr() != node.typ.is_ptr() {
 								c.error('mismatched types `${c.table.type_to_str(node.typ)}` and `${c.table.type_to_str(stmt.typ)}`',
 									node.pos)
@@ -485,6 +588,9 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 			// remove the branch statements since they may contain OS-specific code.
 			branch.stmts = []
 		}
+		if node.is_comptime {
+			c.pop_comptime_info()
+		}
 	}
 	if nbranches_with_return > 0 {
 		if nbranches_with_return == node.branches.len {
@@ -500,9 +606,14 @@ fn (mut c Checker) if_expr(mut node ast.IfExpr) ast.Type {
 			c.returns = false
 		}
 	}
+	if !node.is_comptime && node.branches.len > 0 && has_top_return(node.branches[0].stmts)
+		&& node.branches[0].scope != unsafe { nil }
+		&& node.branches[0].scope.parent != unsafe { nil } {
+		mut continuation_scope := node.branches[0].scope.parent
+		c.smartcast_none_guard_fallthrough(node.branches[0].cond, mut continuation_scope)
+	}
 	if node.typ == ast.none_type {
-		c.error('invalid if expression, must supply at least one value other than `none`',
-			node.pos)
+		c.error('invalid if expression, must supply at least one value other than `none`', node.pos)
 	}
 	// if only untyped literals were given default to int/f64
 	node.typ = ast.mktyp(node.typ)
@@ -548,10 +659,10 @@ fn (mut c Checker) smartcast_if_conds(mut node ast.Expr, mut scope ast.Scope, co
 				if node.left is ast.Ident && c.comptime.get_ct_type_var(node.left) == .smartcast {
 					node.left_type = c.type_resolver.get_type(node.left)
 					c.smartcast(mut node.left, node.left_type, node.left_type.clear_flag(.option), mut
-						scope, true, true)
+						scope, true, true, false)
 				} else {
 					c.smartcast(mut node.left, node.left_type, node.left_type.clear_flag(.option), mut
-						scope, false, true)
+						scope, false, true, false)
 				}
 			}
 		} else if node.op == .key_is {
@@ -585,6 +696,25 @@ fn (mut c Checker) smartcast_if_conds(mut node ast.Expr, mut scope ast.Scope, co
 				}
 			}
 			if right_type != ast.no_type {
+				$if trace_ci_fixes ? {
+					source_path := if node.pos.file_idx >= 0
+						&& node.pos.file_idx < c.table.filelist.len {
+						c.table.filelist[node.pos.file_idx]
+					} else {
+						c.file.path
+					}
+					if source_path.contains('decode_sumtype.v')
+						&& node.pos.line_nr + 1 in [12, 111, 138, 215] {
+						right_kind := match right_expr {
+							ast.Ident { 'ident:${right_expr.name}' }
+							ast.TypeNode { 'typenode:${c.table.type_to_str(right_expr.typ)}' }
+							ast.None { 'none' }
+							else { typeof(right_expr).name }
+						}
+						eprintln('if is left=${node.left} left_type=${c.table.type_to_str(node.left_type)} right_kind=${right_kind} right_type=${c.table.type_to_str(right_type)} variant_var=${c.comptime.comptime_for_variant_var} file=${c.file.path} source=${source_path} line=${
+							node.pos.line_nr + 1}')
+					}
+				}
 				right_sym := c.table.sym(right_type)
 				mut expr_type := c.unwrap_generic(node.left_type)
 				left_sym := c.table.sym(expr_type)
@@ -617,7 +747,7 @@ fn (mut c Checker) smartcast_if_conds(mut node ast.Expr, mut scope ast.Scope, co
 						if mut node.left is ast.Ident
 							&& (left_sym.kind == .interface && right_sym.kind != .interface) {
 							v := scope.find_var(node.left.name) or { &ast.Var{} }
-							if v.is_mut && !node.left.is_mut {
+							if v.is_mut && !node.left.is_mut && !c.implicit_mutability_enabled() {
 								c.error('smart casting a mutable interface value requires `if mut ${node.left.name} is ...`',
 									node.left.pos)
 							}
@@ -629,8 +759,8 @@ fn (mut c Checker) smartcast_if_conds(mut node ast.Expr, mut scope ast.Scope, co
 							&& (node.left as ast.Ident).name == c.comptime.comptime_for_field_var
 						if !skip_smartcast
 							&& (left_final_sym.kind in [.interface, .sum_type] || is_option_unwrap) {
-							c.smartcast(mut node.left, node.left_type, right_type, mut
-								scope, is_comptime, is_option_unwrap)
+							c.smartcast(mut node.left, node.left_type, right_type, mut scope,
+								is_comptime, is_option_unwrap, false)
 						}
 					}
 				}
@@ -642,19 +772,69 @@ fn (mut c Checker) smartcast_if_conds(mut node ast.Expr, mut scope ast.Scope, co
 		if control_expr.branches.len != 2 {
 			return
 		}
-		mut first_cond := control_expr.branches[0].cond
-		// handles unwrapping on if var == none { /**/ } else { /*unwrapped var*/ }
-		if mut first_cond is ast.InfixExpr {
-			if first_cond.left in [ast.Ident, ast.SelectorExpr] && first_cond.op == .eq
-				&& first_cond.right is ast.None {
-				if c.comptime.get_ct_type_var(first_cond.left) == .smartcast {
-					first_cond.left_type = c.type_resolver.get_type(first_cond.left)
-					c.smartcast(mut first_cond.left, first_cond.left_type, first_cond.left_type.clear_flag(.option), mut
-						scope, true, true)
-				} else {
-					c.smartcast(mut first_cond.left, first_cond.left_type, first_cond.left_type.clear_flag(.option), mut
-						scope, false, true)
+		first_cond := control_expr.branches[0].cond
+		// `if x !is Type { ... } else { /* smartcast x to Type here */ }`
+		if first_cond is ast.InfixExpr && first_cond.op == .not_is
+			&& first_cond.left in [ast.Ident, ast.SelectorExpr] {
+			right_type := first_cond.right_type
+			left_type := first_cond.left_type
+			left_sym := c.table.final_sym(left_type)
+			is_option_unwrap := left_type.has_flag(.option) && !right_type.has_flag(.option)
+			if left_sym.kind in [.interface, .sum_type] || is_option_unwrap {
+				mut left_expr := first_cond.left
+				c.smartcast(mut left_expr, left_type, right_type, mut scope, false,
+					is_option_unwrap, false)
+			}
+		}
+		c.smartcast_none_guard_unwrap(control_expr.branches[0].cond, mut scope)
+	}
+}
+
+fn (mut c Checker) smartcast_none_guard_unwrap(cond ast.Expr, mut scope ast.Scope) {
+	mut cond_expr := cond
+	cond_expr = cond_expr.remove_par()
+	// Handles unwrapping on `if var == none { return }` fallthroughs and on
+	// `if var == none { ... } else { /* unwrapped var */ }` branches.
+	if mut cond_expr is ast.InfixExpr {
+		if cond_expr.left !in [ast.Ident, ast.SelectorExpr] || cond_expr.op != .eq
+			|| cond_expr.right !is ast.None {
+			return
+		}
+		to_type := cond_expr.left_type.clear_flag(.option)
+		if c.comptime.get_ct_type_var(cond_expr.left) == .smartcast {
+			cond_expr.left_type = c.type_resolver.get_type(cond_expr.left)
+			c.smartcast(mut cond_expr.left, cond_expr.left_type, to_type, mut scope, true, true,
+				false)
+		} else {
+			c.smartcast(mut cond_expr.left, cond_expr.left_type, to_type, mut scope, false, true,
+				false)
+		}
+	}
+}
+
+fn (mut c Checker) smartcast_none_guard_fallthrough(cond ast.Expr, mut scope ast.Scope) {
+	mut cond_expr := cond
+	cond_expr = cond_expr.remove_par()
+	if mut cond_expr is ast.InfixExpr {
+		if mut cond_expr.left is ast.Ident && cond_expr.op == .eq && cond_expr.right is ast.None {
+			to_type := cond_expr.left_type.clear_flag(.option)
+			if mut cond_expr.left.obj is ast.Var && cond_expr.left.name in scope.objects {
+				if scope_var := scope.find_var(cond_expr.left.name) {
+					if scope_var.pos.pos == cond_expr.left.obj.pos.pos {
+						cond_expr.left.obj.smartcasts = [to_type]
+						cond_expr.left.obj.is_unwrapped = true
+						scope.update_smartcasts(cond_expr.left.name, to_type, true)
+						return
+					}
 				}
+			}
+			if c.comptime.get_ct_type_var(cond_expr.left) == .smartcast {
+				cond_expr.left_type = c.type_resolver.get_type(cond_expr.left)
+				c.smartcast(mut cond_expr.left, cond_expr.left_type, to_type, mut scope, true,
+					true, false)
+			} else {
+				c.smartcast(mut cond_expr.left, cond_expr.left_type, to_type, mut scope, false,
+					true, false)
 			}
 		}
 	}

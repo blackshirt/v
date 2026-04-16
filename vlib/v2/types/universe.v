@@ -4,9 +4,6 @@
 // [has_globals]
 module types
 
-// __global universe = init_universe()
-const universe = init_universe()
-
 // primitives
 pub const bool_ = Primitive{
 	props: .boolean
@@ -58,7 +55,7 @@ const f32_ = Primitive{
 	props: .float
 	size:  32
 }
-const f64_ = Primitive{
+pub const f64_ = Primitive{
 	props: .float
 	size:  64
 }
@@ -66,7 +63,9 @@ const f64_ = Primitive{
 // String struct is defined in cmd/v2/builtin/string.v:
 // pub struct string { str &u8, len int, is_lit int }
 pub const string_ = String(0)
-const chan_ = Channel{}
+const chan_ = Channel{
+	elem_type: none
+}
 const char_ = Char(0)
 const isize_ = ISize(0)
 const usize_ = USize(0)
@@ -101,10 +100,16 @@ const float_literal_ = Primitive{
 // int_literal_   = IntLiteral(0)
 // float_literal_ = FloatLiteral(0)
 // TODO: is this what thread should be?
-const thread_ = Thread{}
+const thread_ = Thread{
+	elem_type: none
+}
+
+// NOTE: universe MUST be declared AFTER all primitive/alias/type constants above.
+// For SSA-based backends (arm64, x64), struct literal consts need runtime init.
+// init_universe() references bool_, int_, u8_, etc., so they must be initialized first.
+const universe = init_universe()
 
 pub fn init_universe() &Scope {
-	// universe scope
 	mut universe_ := new_scope(unsafe { nil })
 	universe_.insert('bool', Type(bool_))
 	universe_.insert('i8', Type(i8_))

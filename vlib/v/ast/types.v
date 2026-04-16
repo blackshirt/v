@@ -54,6 +54,8 @@ pub enum Language {
 	s390x
 	ppc64le
 	loongarch64
+	sparc64
+	ppc64
 	wasm32
 }
 
@@ -87,6 +89,15 @@ pub fn pref_arch_to_table_language(pref_arch pref.Arch) Language {
 		.loongarch64 {
 			.loongarch64
 		}
+		.sparc64 {
+			.sparc64
+		}
+		.ppc64 {
+			.ppc64
+		}
+		.ppc {
+			.v
+		}
 		.js_node, .js_browser, .js_freestanding {
 			.js
 		}
@@ -106,6 +117,7 @@ pub fn pref_arch_to_table_language(pref_arch pref.Arch) Language {
 // * Table.type_kind(typ) not TypeSymbol.kind.
 // Each TypeSymbol is entered into `Table.type_symbols`.
 // See also: Table.sym.
+@[minify]
 pub struct TypeSymbol {
 pub mut:
 	parent_idx    int
@@ -168,6 +180,7 @@ pub mut:
 	func     Fn
 }
 
+@[minify]
 pub struct Struct {
 pub:
 	attrs       []Attr
@@ -197,6 +210,7 @@ pub mut:
 	concrete_types []Type // concrete types, e.g. [int, string]
 }
 
+@[minify]
 pub struct Interface {
 pub mut:
 	types   []Type // all types that implement this interface
@@ -219,12 +233,14 @@ pub:
 	vals             []string
 	is_flag          bool
 	is_multi_allowed bool
+	is_typedef       bool
 	uses_exprs       bool
 	typ              Type
 	attrs            map[string][]Attr
 	name_pos         token.Pos
 }
 
+@[minify]
 pub struct Alias {
 pub mut:
 	parent_type Type
@@ -249,6 +265,7 @@ pub mut:
 	elem_type Type
 }
 
+@[minify]
 pub struct ArrayFixed {
 pub:
 	size      int
@@ -276,6 +293,7 @@ pub mut:
 	name_pos   token.Pos
 }
 
+@[minify]
 pub struct SumType {
 pub mut:
 	fields       []StructField
@@ -459,17 +477,53 @@ pub fn (t Type) has_option_or_result() bool {
 
 @[inline]
 pub fn (ts &TypeSymbol) scoped_name() string {
-	return if ts.info is Struct && ts.info.scoped_name != '' {
-		ts.info.scoped_name
-	} else {
-		ts.name
-	}
+	return if ts.info is Struct && ts.info.scoped_name != '' { ts.info.scoped_name } else { ts.name }
 }
 
 @[inline]
 pub fn (ts &TypeSymbol) scoped_cname() string {
 	return if ts.info is Struct && ts.info.scoped_name != '' {
-		ts.info.scoped_name.replace('.', '__')
+		if ts.language == .v && ts.info.scoped_name.contains('[') {
+			ts.info.scoped_name.replace('.', '__').replace_each([
+				'[',
+				'_T_',
+				']',
+				'',
+				', ',
+				'_T_',
+				',',
+				'_T_',
+				' ',
+				'',
+				'&',
+				'__ptr__',
+				'(',
+				'_',
+				')',
+				'_',
+			])
+		} else {
+			ts.info.scoped_name.replace('.', '__')
+		}
+	} else if ts.language == .v && ts.kind in [.placeholder, .generic_inst] && ts.name.contains('[') {
+		ts.name.replace('.', '__').replace_each([
+			'[',
+			'_T_',
+			']',
+			'',
+			', ',
+			'_T_',
+			',',
+			'_T_',
+			' ',
+			'',
+			'&',
+			'__ptr__',
+			'(',
+			'_',
+			')',
+			'_',
+		])
 	} else {
 		ts.cname
 	}
@@ -530,6 +584,10 @@ pub fn (t Type) str() string {
 }
 
 pub fn (t &Table) type_str(typ Type) string {
+	idx := typ.idx()
+	if idx == 0 || idx >= t.type_symbols.len {
+		return 'unknown'
+	}
 	return t.sym(typ).name
 }
 
@@ -1306,11 +1364,56 @@ pub fn (t &Table) type_size(typ Type) (int, int) {
 		.alias {
 			size, align = t.type_size((sym.info as Alias).parent_type)
 		}
-		.struct, .string, .multi_return {
+		.struct {
+			info := sym.info as Struct
+			is_packed := info.attrs.contains('packed')
+			if info.is_union {
+				mut max_alignment := if is_packed { 1 } else { 0 }
+				mut max_size := 0
+				for field in info.fields {
+					field_size, alignment := t.type_size(field.typ)
+					if field_size > max_size {
+						max_size = field_size
+					}
+					if !is_packed && alignment > max_alignment {
+						max_alignment = alignment
+					}
+				}
+				if is_packed {
+					size = max_size
+					align = 1
+				} else {
+					size = round_up(max_size, max_alignment)
+					align = max_alignment
+				}
+			} else {
+				mut max_alignment := if is_packed { 1 } else { 0 }
+				mut total_size := 0
+				for field in info.fields {
+					field_size, alignment := t.type_size(field.typ)
+					if is_packed {
+						total_size += field_size
+					} else {
+						if alignment > max_alignment {
+							max_alignment = alignment
+						}
+						total_size = round_up(total_size, alignment) + field_size
+					}
+				}
+				if is_packed {
+					size = total_size
+					align = 1
+				} else {
+					size = round_up(total_size, max_alignment)
+					align = max_alignment
+				}
+			}
+		}
+		.string, .multi_return {
 			mut max_alignment := 0
 			mut total_size := 0
-			types := if mut sym.info is Struct {
-				sym.info.fields.map(it.typ)
+			types := if sym.kind == .string {
+				(sym.info as Struct).fields.map(it.typ)
 			} else {
 				(sym.info as MultiReturn).types
 			}
@@ -1331,11 +1434,13 @@ pub fn (t &Table) type_size(typ Type) (int, int) {
 					align = t.pointer_size
 				}
 				Interface {
-					size = (sym.info.fields.len + 2) * t.pointer_size
+					interface_header_size := round_up(t.pointer_size + 4, t.pointer_size) +
+						t.pointer_size
+					size = interface_header_size + sym.info.fields.len * t.pointer_size
 					align = t.pointer_size
 					for etyp in sym.info.embeds {
 						esize, _ := t.type_size(etyp)
-						size += esize - 2 * t.pointer_size
+						size += esize - interface_header_size
 					}
 				}
 				else {
@@ -1502,12 +1607,18 @@ pub fn (t &Table) delete_cached_type_to_str(typ Type, import_aliases_len int) {
 // import_aliases is a map of imported symbol aliases 'module.Type' => 'Type'
 pub fn (t &Table) type_to_str_using_aliases(typ Type, import_aliases map[string]string) string {
 	cache_key := (u64(import_aliases.len) << 32) | u64(typ)
-	if cached_res := t.cached_type_to_str[cache_key] {
-		return cached_res
+	mut mt := unsafe { &Table(t) }
+	rlock mt.cached_type_to_str {
+		if cached_res := mt.cached_type_to_str[cache_key] {
+			return cached_res
+		}
+	}
+	idx := typ.idx()
+	if idx == 0 || idx >= t.type_symbols.len {
+		return 'unknown'
 	}
 	sym := t.sym(typ)
 	mut res := sym.name
-	mut mt := unsafe { &Table(t) }
 	defer {
 		lock mt.cached_type_to_str {
 			// Note, that this relies on `res = value return res` if you want to return early!
@@ -1614,10 +1725,21 @@ pub fn (t &Table) type_to_str_using_aliases(typ Type, import_aliases map[string]
 			if typ.has_flag(.generic) {
 				match sym.info {
 					Struct, Interface, SumType {
+						base_name := if sym.ngname == '' {
+							strip_extra_struct_types(res)
+						} else {
+							sym.ngname
+						}
+						res = t.shorten_user_defined_typenames(base_name, import_aliases)
+						generic_types := if sym.generic_types.len > 0 {
+							sym.generic_types
+						} else {
+							sym.info.generic_types
+						}
 						res += '['
-						for i, gtyp in sym.info.generic_types {
-							res += t.sym(gtyp).name
-							if i != sym.info.generic_types.len - 1 {
+						for i, gtyp in generic_types {
+							res += t.type_to_str_using_aliases(gtyp, import_aliases)
+							if i != generic_types.len - 1 {
 								res += ', '
 							}
 						}
@@ -1730,6 +1852,7 @@ fn (t &Table) shorten_user_defined_typenames(original_name string, import_aliase
 	return '${mod}.${typ}'
 }
 
+@[minify]
 pub struct FnSignatureOpts {
 pub:
 	skip_receiver bool
@@ -1854,43 +1977,96 @@ pub fn (t &TypeSymbol) find_method(name string) ?Fn {
 	return none
 }
 
+fn specialize_method_with_concrete_types(method Fn, generic_names []string, concrete_types []Type) Fn {
+	mut table := global_table
+	mut resolved := method
+	return_sym := table.sym(resolved.return_type)
+	if return_sym.kind in [.struct, .interface, .sum_type] {
+		resolved.return_type = table.unwrap_generic_type(resolved.return_type, generic_names,
+			concrete_types)
+	} else if rt := table.convert_generic_type(resolved.return_type, generic_names, concrete_types) {
+		resolved.return_type = rt
+	}
+	resolved.params = resolved.params.clone()
+	for mut param in resolved.params {
+		if pt := table.convert_generic_type(param.typ, generic_names, concrete_types) {
+			param.typ = pt
+		}
+	}
+	return resolved
+}
+
 pub fn (t &TypeSymbol) find_method_with_generic_parent(name string) ?Fn {
+	mut table := global_table
+	mut generic_names := []string{}
+	mut concrete_types := []Type{}
+	mut generic_inst_parent_idx := 0
+	match t.info {
+		Struct, Interface, SumType {
+			generic_names = t.info.generic_types.map(table.sym(it).name)
+			if t.info.concrete_types.len == generic_names.len {
+				concrete_types = t.info.concrete_types.clone()
+			} else if t.generic_types.len == generic_names.len
+				&& t.generic_types != t.info.generic_types {
+				concrete_types = t.generic_types.clone()
+			}
+		}
+		GenericInst {
+			generic_inst_parent_idx = t.info.parent_idx
+			parent_sym := table.sym(new_type(generic_inst_parent_idx))
+			match parent_sym.info {
+				Struct, Interface, SumType {
+					generic_names = parent_sym.info.generic_types.map(table.sym(it).name)
+					concrete_types = t.info.concrete_types.clone()
+				}
+				FnType {
+					generic_names = parent_sym.info.func.generic_names.clone()
+					concrete_types = t.info.concrete_types.clone()
+				}
+				else {}
+			}
+		}
+		else {}
+	}
 	if m := t.find_method(name) {
+		if generic_names.len == concrete_types.len && concrete_types.len > 0 {
+			return specialize_method_with_concrete_types(m, generic_names, concrete_types)
+		}
 		return m
 	}
-	mut table := global_table
+	if generic_inst_parent_idx != 0 {
+		mut psym := table.sym(new_type(generic_inst_parent_idx))
+		for {
+			if m := psym.find_method(name) {
+				if generic_names.len == concrete_types.len && concrete_types.len > 0 {
+					return specialize_method_with_concrete_types(m, generic_names, concrete_types)
+				}
+				return m
+			}
+			if psym.parent_idx == 0 {
+				break
+			}
+			psym = table.type_symbols[psym.parent_idx]
+		}
+	}
 	match t.info {
 		Struct, Interface, SumType {
 			if t.info.parent_type.has_flag(.generic) {
-				parent_sym := table.sym(t.info.parent_type)
-				if x := parent_sym.find_method(name) {
-					match parent_sym.info {
-						Struct, Interface, SumType {
-							mut method := x
-							generic_names := parent_sym.info.generic_types.map(table.sym(it).name)
-							return_sym := table.sym(method.return_type)
-							if return_sym.kind in [.struct, .interface, .sum_type] {
-								method.return_type = table.unwrap_generic_type(method.return_type,
-									generic_names, t.info.concrete_types)
-							} else {
-								if rt := table.convert_generic_type(method.return_type,
-									generic_names, t.info.concrete_types)
-								{
-									method.return_type = rt
-								}
+				mut psym2 := table.sym(t.info.parent_type)
+				for {
+					if x := psym2.find_method(name) {
+						match psym2.info {
+							Struct, Interface, SumType {
+								return specialize_method_with_concrete_types(x, generic_names,
+									concrete_types)
 							}
-							method.params = method.params.clone()
-							for mut param in method.params {
-								if pt := table.convert_generic_type(param.typ, generic_names,
-									t.info.concrete_types)
-								{
-									param.typ = pt
-								}
-							}
-							return method
+							else {}
 						}
-						else {}
 					}
+					if psym2.parent_idx == 0 {
+						break
+					}
+					psym2 = table.type_symbols[psym2.parent_idx]
 				}
 			}
 		}
@@ -2078,23 +2254,39 @@ pub fn (i Interface) get_methods() []string {
 pub fn (t &TypeSymbol) get_methods() []Fn {
 	mut methods := t.methods.filter(it.attrs.len == 0) // methods without attrs first
 	mut methods_with_attrs := t.methods.filter(it.attrs.len > 0) // methods with attrs second
+	mut existing_method_names := map[string]bool{}
+	for method in t.methods {
+		existing_method_names[method.name] = true
+	}
+	mut inherited_methods := []Fn{}
 	match t.info {
 		Struct, Interface, SumType {
 			if t.info.parent_type.has_flag(.generic) {
 				parent_sym := global_table.sym(t.info.parent_type)
 				match parent_sym.info {
-					Struct, Interface, SumType {
-						parent_methods := parent_sym.methods
-						if parent_methods.len > 0 {
-							methods << parent_methods.filter(it.attrs.len == 0)
-							methods_with_attrs << parent_methods.filter(it.attrs.len > 0)
-						}
+					Struct, Interface, SumType, Alias {
+						inherited_methods = parent_sym.get_methods()
 					}
 					else {}
 				}
 			}
 		}
+		Alias {
+			parent_sym := global_table.sym(t.info.parent_type)
+			inherited_methods = parent_sym.get_methods()
+		}
 		else {}
+	}
+	for method in inherited_methods {
+		if method.name in existing_method_names {
+			continue
+		}
+		existing_method_names[method.name] = true
+		if method.attrs.len == 0 {
+			methods << method
+		} else {
+			methods_with_attrs << method
+		}
 	}
 	methods << methods_with_attrs
 	return methods

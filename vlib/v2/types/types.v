@@ -83,7 +83,8 @@ pub:
 	elem_type Type
 }
 
-struct Channel {
+pub struct Channel {
+pub:
 	elem_type ?Type
 }
 
@@ -175,6 +176,15 @@ pub fn (f &FnType) is_variadic_fn() bool {
 	return f.is_variadic
 }
 
+// get_generic_types returns the concrete generic instantiations inferred for this function.
+pub fn (f &FnType) get_generic_types() []map[string]Type {
+	mut out := []map[string]Type{cap: f.generic_types.len}
+	for generic_types in f.generic_types {
+		out << generic_types.clone()
+	}
+	return out
+}
+
 pub struct Interface {
 pub:
 	name string
@@ -221,12 +231,14 @@ pub struct Struct {
 pub:
 	name           string
 	generic_params []string
+	implements     []string
 pub mut:
 	embedded []Struct
 	// embedded       []Type
 	fields []Field
 	// fields	 map[string]Type
 	// methods 	   []Method
+	is_soa bool // @[soa] - Structure of Arrays layout for better cache performance
 }
 
 // TODO:
@@ -274,11 +286,17 @@ pub fn (t Type) base_type() Type {
 	match t {
 		// TODO: add base_type method
 		Alias {
+			if type_data_ptr_is_nil(t) {
+				return Type(void_)
+			}
 			return t.base_type
 			// should we fully resolve all aliases, or just one level here?
 			// return t.base_type.base_type()
 		}
 		OptionType, ResultType, Pointer {
+			if type_data_ptr_is_nil(t) {
+				return Type(void_)
+			}
 			return t.base_type
 		}
 		// TODO: why as I doing this instead of else? to make it easy to find unhandled cases?
@@ -292,26 +310,93 @@ pub fn (t Type) base_type() Type {
 	}
 }
 
+pub fn (t Type) channel_elem_type() ?Type {
+	mut cur := t
+	for {
+		match cur {
+			Alias {
+				cur = Type(cur).base_type()
+			}
+			Pointer {
+				cur = Type(cur).base_type()
+			}
+			Channel {
+				channel_type := cur as Channel
+				if elem_type := channel_type.elem_type {
+					return elem_type
+				}
+				return none
+			}
+			else {
+				return none
+			}
+		}
+	}
+	return none
+}
+
+fn type_data_ptr_is_nil(t Type) bool {
+	p := unsafe { &u8(&t) + 8 }
+	return unsafe { *(&voidptr(p)) } == unsafe { nil }
+}
+
+// Safely unwrap all Alias layers, guarding against null data pointers
+// from ARM64 codegen corruption.
+pub fn resolve_alias(t Type) Type {
+	mut cur := t
+	for cur is Alias {
+		if type_data_ptr_is_nil(cur) {
+			return Type(void_)
+		}
+		cur = (cur as Alias).base_type
+	}
+	return cur
+}
+
 // return the key type used with for in loops
 pub fn (t Type) key_type() Type {
 	match t {
-		Alias { return t.base_type.key_type() }
-		Map { return t.key_type }
-		Pointer { return t.base_type.key_type() }
+		Alias {
+			if type_data_ptr_is_nil(t) {
+				return int_
+			}
+			return t.base_type.key_type()
+		}
+		Map {
+			return t.key_type
+		}
+		Pointer {
+			if type_data_ptr_is_nil(t) {
+				return int_
+			}
+			return t.base_type.key_type()
+		}
 		// TODO: struct here is 'struct string', need to fix this.
 		// we could use an alias? remove once fixed.
 		// Array, ArrayFixed, String, Struct { return int_ }
 		// else { panic('TODO: should never be called on ${t.type_name()}') }
 		// TODO: see checker ForStmt -> ForInStmt when value is pointer
-		else { return int_ }
+		else {
+			return int_
+		}
 	}
 }
 
 // return the value type used with for in loops
 pub fn (t Type) value_type() Type {
+	return value_type_with_depth(t, 0)
+}
+
+fn value_type_with_depth(t Type, depth int) Type {
+	if depth > 64 {
+		return t.base_type()
+	}
+	if type_data_ptr_is_nil(t) {
+		return Type(void_)
+	}
 	match t {
 		Alias {
-			return t.base_type.value_type()
+			return value_type_with_depth(t.base_type, depth + 1)
 		}
 		Array, ArrayFixed {
 			return t.elem_type
@@ -320,7 +405,7 @@ pub fn (t Type) value_type() Type {
 			if elem_type := t.elem_type {
 				return elem_type
 			}
-			return Type(t)
+			return Type(empty_channel())
 		} // TODO: ?
 		Map {
 			return t.value_type
@@ -331,7 +416,14 @@ pub fn (t Type) value_type() Type {
 				// Indexing it should yield `string`, not `u8`.
 				return string_
 			}
-			return t.base_type.value_type()
+			if t.base_type is Struct
+				&& (t.base_type.name == 'string' || t.base_type.name.ends_with('__string')) {
+				return string_
+			}
+			return value_type_with_depth(t.base_type, depth + 1)
+		}
+		Struct {
+			return Type(t)
 		}
 		String {
 			return u8_
@@ -340,10 +432,10 @@ pub fn (t Type) value_type() Type {
 			if elem_type := t.elem_type {
 				return elem_type
 			}
-			return Type(t)
+			return Type(empty_thread())
 		} // TODO: ?
 		OptionType, ResultType {
-			return t.base_type.value_type()
+			return value_type_with_depth(t.base_type, depth + 1)
 		}
 		else {
 			return t.base_type()
@@ -418,6 +510,9 @@ fn (t Type) is_float() bool {
 }
 
 fn (t Type) is_integer() bool {
+	if t is Char || t is Rune || t is ISize || t is USize {
+		return true
+	}
 	if t is Primitive {
 		return t.is_integer()
 	}
@@ -425,7 +520,7 @@ fn (t Type) is_integer() bool {
 }
 
 fn (t Type) is_number() bool {
-	if t is ISize {
+	if t is Char || t is Rune || t is ISize || t is USize {
 		return true
 	}
 	if t is Primitive {
@@ -481,7 +576,21 @@ fn (t Primitive) is_int_literal() bool {
 	return t.props.has(.untyped) && t.props.has(.integer)
 }
 
-pub fn (t Type) name() string {
+pub fn type_name(t Type) string {
+	// Guard against corrupted sumtype values from ARM64 codegen.
+	// SSA sumtype layout: {i64 _tag, i64 _data}. For large variants, _data
+	// is a heap pointer. If _data is null, the match dispatch will crash.
+	data := unsafe { *(&u64(&u8(&t) + 8)) }
+	if data == 0 {
+		tag := unsafe { *(&u64(&t)) }
+		// Small inline variants where zero _data is valid:
+		// Char(4), ISize(7), Nil(11), None(12), Primitive(15),
+		// Rune(17), String(18), USize(23), Void(24)
+		if tag != 4 && tag != 7 && tag != 11 && tag != 12 && tag != 15 && tag != 17 && tag != 18
+			&& tag != 23 && tag != 24 {
+			return '' // corrupted: large variant with null data pointer
+		}
+	}
 	match t {
 		Primitive, Alias, Array, ArrayFixed, Channel, Char, Enum, FnType, Interface, ISize, Map,
 		OptionType, Pointer, ResultType, Rune, String, Struct, SumType, Thread, Tuple, USize, Void,
@@ -489,6 +598,21 @@ pub fn (t Type) name() string {
 			return t.name()
 		}
 	}
+}
+
+pub fn alias_base_type_name(t Type) ?string {
+	return match t {
+		Alias {
+			type_name(t.base_type)
+		}
+		else {
+			none
+		}
+	}
+}
+
+pub fn (t Type) name() string {
+	return type_name(t)
 }
 
 // TODO: clean up :0
@@ -514,8 +638,8 @@ fn (t Primitive) name() string {
 	} else if t.props.has(.float) {
 		return 'f${t.size}'
 	}
-	panic(t.props.str())
-	return 'malformed primitive' // lol
+	// Fallback for zero-initialized Primitive (shouldn't happen after const ordering fix).
+	return 'int'
 	// TODO: match seems broke when multuple flags are set
 	// actually it was not broken, it matches the bits for flags
 	// matches single only, if multiple are set it will not match.

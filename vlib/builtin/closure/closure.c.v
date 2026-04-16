@@ -5,13 +5,16 @@ module closure
 // https://nullprogram.com/blog/2017/01/08/
 
 const assumed_page_size = int(0x4000)
+const ppc64_architecture = int(11)
+
+type ClosureGetDataFn = fn () voidptr
 
 @[heap]
 struct Closure {
 	ClosureMutex
 mut:
 	closure_ptr      voidptr
-	closure_get_data fn () voidptr = unsafe { nil }
+	closure_get_data ClosureGetDataFn = unsafe { nil }
 	closure_cap      int
 	v_page_size      int = int(0x4000)
 }
@@ -23,9 +26,50 @@ enum MemoryProtectAtrr {
 	read_write
 }
 
+// Keep this runtime check bootstrap-compatible. Older compilers can not parse `$if ppc64` yet.
+@[inline]
+fn is_ppc64() bool {
+	$if big_endian {
+		return C.__V_architecture == ppc64_architecture
+	} $else {
+		return false
+	}
+}
+
 // refer to https://godbolt.org/z/r7P3EYv6c for a complete assembly
+//
+// NOTE: Keep the first branch as the longest byte sequence. In translated/bootstrap C mode
+// (`vc/v.c`), V emits a fixed C array whose size is inferred from the first branch.
+// The final `big_endian` branch maps to ppc64 here, since the supported big-endian
+// closure targets handled above are s390x and sparc64.
 // vfmt off
-pub const closure_thunk = $if amd64 {
+pub const closure_thunk = $if ppc64le {
+    [
+    u8(0xa6), 0x02, 0x08, 0x7c,	// mflr   %r0
+        0x05, 0x00, 0x00, 0x48,	// bl     here
+        0xa6, 0x02, 0xc8, 0x7d,	// here:  mflr %r14
+        0xf8, 0xbf, 0xce, 0x39,	// addi   %r14, %r14, -16392
+        0x00, 0x00, 0xce, 0xc9,	// lfd    %f14, 0(%r14)
+        0x08, 0x00, 0xce, 0xe9,	// ld     %r14, 8(%r14)
+        0x78, 0x73, 0xcc, 0x7d,	// mr     %r12, %r14
+        0xa6, 0x03, 0x08, 0x7c,	// mtlr   %r0
+        0xa6, 0x03, 0xc9, 0x7d,	// mtctr  %r14
+        0x20, 0x04, 0x80, 0x4e,	// bctr
+    ]!
+} $else $if !ppc64le && !amd64 && !i386 && !arm64 && !arm32 && !rv64 && !rv32 && !s390x && !loongarch64 {
+    // ppc (32-bit PowerPC) - expressed as negation of all other arches for bootstrap compat
+    [
+    u8(0x7c), 0x08, 0x02, 0xa6,	// mflr   %r0
+        0x48, 0x00, 0x00, 0x05,	// bl     here
+        0x7d, 0x88, 0x02, 0xa6,	// here:  mflr %r12
+        0x39, 0x8c, 0xbf, 0xf8,	// addi   %r12, %r12, -16392
+        0xc9, 0xcc, 0x00, 0x00,	// lfd    %f14, 0(%r12)
+        0x81, 0x8c, 0x00, 0x04,	// lwz    %r12, 4(%r12)
+        0x7c, 0x08, 0x03, 0xa6,	// mtlr   %r0
+        0x7d, 0x89, 0x03, 0xa6,	// mtctr  %r12
+        0x4e, 0x80, 0x04, 0x20,	// bctr
+    ]!
+} $else $if amd64 {
     [
     u8(0xF3), 0x44, 0x0F, 0x7E, 0x3D, 0xF7, 0xBF, 0xFF, 0xFF,  // movq  xmm15, QWORD PTR [rip - userdata]
         0xFF, 0x25, 0xF9, 0xBF, 0xFF, 0xFF                     // jmp  QWORD PTR [rip - fn]
@@ -74,19 +118,6 @@ pub const closure_thunk = $if amd64 {
         0xE3, 0x10, 0x10, 0x08, 0x00, 0x04,  // lg   %r1, 8(%r1)
         0x07, 0xF1,                          // br   %r1
     ]!
-} $else $if ppc64le {
-    [
-    u8(0xa6), 0x02, 0x08, 0x7c,	// mflr   %r0
-        0x05, 0x00, 0x00, 0x48,	// bl     here
-        0xa6, 0x02, 0xc8, 0x7d,	// here:  mflr %r14
-        0xf8, 0xbf, 0xce, 0x39,	// addi   %r14, %r14, -16392
-        0x00, 0x00, 0xce, 0xc9,	// lfd    %f14, 0(%r14)
-        0x08, 0x00, 0xce, 0xe9,	// ld     %r14, 8(%r14)
-        0x78, 0x73, 0xcc, 0x7d,	// mr     %r12, %r14
-        0xa6, 0x03, 0x08, 0x7c,	// mtlr   %r0
-        0xa6, 0x03, 0xc9, 0x7d,	// mtctr  %r14
-        0x20, 0x04, 0x80, 0x4e,	// bctr
-    ]!
 } $else $if loongarch64 {
     [
     u8(0x92), 0xFF, 0xFF, 0x1D,  // pcaddu12i t6, -4
@@ -94,11 +125,53 @@ pub const closure_thunk = $if amd64 {
         0x51, 0x22, 0xC0, 0x28,  // ld.d      t5, t6, 8
         0x20, 0x02, 0x00, 0x4C,  // jr        t5
     ]!
+} $else $if sparc64 {
+    [
+    u8(0x83), 0x41, 0x40, 0x00,  // rd  %pc, %g1
+        0x05, 0x00, 0x00, 0x10,  // sethi  %hi(0x4000), %g2
+        0x84, 0x10, 0xa0, 0x00,  // mov  %g2, %g2   ! 4000 <main>
+        0x82, 0x20, 0x40, 0x02,  // sub  %g1, %g2, %g1
+        0xff, 0x18, 0x60, 0x00,  // ldd  [ %l1 ], %d62
+        0xc2, 0x58, 0x60, 0x08,  // ldx  [ %g1 + 8 ], %g1
+        0x81, 0xc0, 0x40, 0x00,  // jmp  %g1
+        0x01, 0x00, 0x00, 0x00   // nop
+    ]!
+} $else $if big_endian {
+    [
+    u8(0x7C), 0x08, 0x02, 0xA6,  // mflr   %r0
+        0x48, 0x00, 0x00, 0x05,  // bl     here
+        0x7D, 0xC8, 0x02, 0xA6,  // here:  mflr %r14
+        0x39, 0xCE, 0xC0, 0x08,  // addi   %r14, %r14, -16376
+        0xC9, 0xCE, 0x00, 0x00,  // lfd    %f14, 0(%r14)      // userdata
+        0xE9, 0xCE, 0x00, 0x08,  // ld     %r14, 8(%r14)      // func descriptor ptr
+        0xE9, 0x8E, 0x00, 0x00,  // ld     %r12, 0(%r14)      // code addr from descriptor
+        0xE8, 0x4E, 0x00, 0x08,  // ld     %r2,  8(%r14)      // TOC from descriptor
+        0x7C, 0x08, 0x03, 0xA6,  // mtlr   %r0
+        0x7D, 0x89, 0x03, 0xA6,  // mtctr  %r12
+        0x4E, 0x80, 0x04, 0x20,  // bctr
+    ]!
 } $else {
     [u8(0)]!
 }
 
-const closure_get_data_bytes = $if amd64 {
+// NOTE: Keep the first branch as the longest byte sequence. In translated/bootstrap C mode
+// (`vc/v.c`), V emits a fixed C array whose size is inferred from the first branch.
+const closure_get_data_bytes = $if !ppc64le && !amd64 && !i386 && !arm64 && !arm32 && !rv64 && !rv32 && !s390x && !loongarch64 {
+    // ppc (32-bit PowerPC) - expressed as negation of all other arches for bootstrap compat
+    [
+    u8(0x94), 0x21, 0xff, 0xf0,	// stwu   %r1, -16(%r1)
+        0xd9, 0xc1, 0x00, 0x08,	// stfd   %f14, 8(%r1)
+        0x80, 0x61, 0x00, 0x08,	// lwz    %r3, 8(%r1)
+        0x38, 0x21, 0x00, 0x10,	// addi   %r1, %r1, 16
+        0x4e, 0x80, 0x00, 0x20,	// blr
+    ]!
+} $else $if arm32 {
+    [
+    u8(0x90), 0x0A, 0x17, 0xEE,  // vmov r0, s15
+        0x04, 0x00, 0x10, 0xE5,  // ldr r0, [r0, #-4]
+        0x1E, 0xFF, 0x2F, 0xE1   // bx lr
+    ]!
+} $else $if amd64 {
     [
     u8(0x66), 0x4C, 0x0F, 0x7E, 0xF8,  // movq rax, xmm15
         0xC3                           // ret
@@ -113,12 +186,6 @@ const closure_get_data_bytes = $if amd64 {
     [
     u8(0x20), 0x02, 0x66, 0x9E,  // fmov x0, d17
         0xC0, 0x03, 0x5F, 0xD6   // ret
-    ]!
-} $else $if arm32 {
-    [
-    u8(0x90), 0x0A, 0x17, 0xEE,  // vmov r0, s15
-        0x04, 0x00, 0x10, 0xE5,  // ldr r0, [r0, #-4]
-        0x1E, 0xFF, 0x2F, 0xE1   // bx lr
     ]!
 } $else $if rv64 {
     [
@@ -145,9 +212,21 @@ const closure_get_data_bytes = $if amd64 {
     u8(0x04), 0xB9, 0x14, 0x01,  // movfr2gr.d a0, f8
         0x20, 0x00, 0x00, 0x4C,  // ret
     ]!
+} $else $if sparc64 {
+    [
+    u8(0x91), 0xb0, 0x22, 0x1f,  // movdtox %f62, %o0
+        0x81, 0xc3, 0xe0, 0x08,  // retl
+        0x01, 0x00, 0x00, 0x00   // nop
+    ]!
+} $else $if big_endian {
+    [
+    u8(0x7d), 0xc3, 0x00, 0x66,  // mfvsrd %r3, %f14
+        0x4e, 0x80, 0x00, 0x20   // blr
+    ]!
 } $else {
     [u8(0)]!
 }
+
 // vfmt on
 
 // equal to `max(2*sizeof(void*), sizeof(__closure_thunk))`, rounded up to the next multiple of `sizeof(void*)`
@@ -200,11 +279,20 @@ fn closure_init() {
 		closure_memory_protect_platform(g_closure.closure_ptr, page_size, .read_write)
 		// Copy closure entry stub code
 		vmemcpy(g_closure.closure_ptr, &closure_get_data_bytes[0], closure_get_data_bytes.len)
-		// Re-enormalize execution protection
+		// Re-normalize execution protection
 		closure_memory_protect_platform(g_closure.closure_ptr, page_size, .read_exec)
 	}
 	// Setup global closure handler pointer
-	g_closure.closure_get_data = g_closure.closure_ptr
+	if is_ppc64() {
+		mut desc := unsafe { &voidptr(&u8(g_closure.closure_ptr) - assumed_page_size) }
+		unsafe {
+			desc[0] = g_closure.closure_ptr
+			desc[1] = nil
+		}
+		g_closure.closure_get_data = unsafe { ClosureGetDataFn(desc) }
+	} else {
+		g_closure.closure_get_data = g_closure.closure_ptr
+	}
 
 	// Advance allocation pointer past header
 	unsafe {
@@ -225,18 +313,47 @@ fn closure_create(func voidptr, data voidptr) voidptr {
 	g_closure.closure_cap-- // Decrement slot counter
 
 	// Claim current closure slot
-	mut curr_closure := g_closure.closure_ptr
+	curr_closure := g_closure.closure_ptr
 	unsafe {
 		// Move to next available slot
 		g_closure.closure_ptr = &u8(g_closure.closure_ptr) + closure_size
 
 		// Write closure metadata (data + function pointer)
 		mut p := &voidptr(&u8(curr_closure) - assumed_page_size)
-		p[0] = data // Stored closure context
-		p[1] = func // Target function to execute
+		if is_ppc64() {
+			// ELFv1: guard page layout per slot:
+			//   [0] desc[0] = thunk code address  <- returned as ELFv1 function pointer
+			//   [1] desc[1] = nil (TOC unused; thunk loads real TOC from func descriptor)
+			//   [2] userdata
+			//   [3] func (V function descriptor pointer into .opd)
+			p[0] = curr_closure
+			p[1] = nil
+			p[2] = data
+			p[3] = func
+		} else {
+			p[0] = data // Stored closure context
+			p[1] = func // Target function to execute
+		}
 	}
 	closure_mtx_unlock_platform()
 
 	// Return executable closure object
+	if is_ppc64() {
+		// ELFv1: return descriptor address (guard page), not raw code address
+		return unsafe { &u8(curr_closure) - assumed_page_size }
+	}
 	return curr_closure
+}
+
+// closure_data returns the userdata pointer associated with a closure object.
+@[direct_array_access]
+fn closure_data(closure voidptr) voidptr {
+	unsafe {
+		mut p := &voidptr(&u8(closure) - assumed_page_size)
+		$if ppc64 {
+			return p[2]
+		} $else {
+			return p[0]
+		}
+	}
 }

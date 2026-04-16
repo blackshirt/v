@@ -14,6 +14,7 @@ import term
 struct Readme {
 	frontmatter map[string]string
 	content     string
+	path        string
 }
 
 enum OutputType {
@@ -244,7 +245,8 @@ fn (vd &VDoc) get_readme(path string) Readme {
 	mut readme_frontmatter := map[string]string{}
 	if readme_contents.starts_with('---\n') {
 		if frontmatter_lines_end_idx := readme_contents.index('\n---\n') {
-			front_matter_lines := readme_contents#[4..frontmatter_lines_end_idx].trim_space().split_into_lines()
+			front_matter_lines :=
+				readme_contents#[4..frontmatter_lines_end_idx].trim_space().split_into_lines()
 			for line in front_matter_lines {
 				x := line.split(': ')
 				if x.len == 2 {
@@ -257,6 +259,7 @@ fn (vd &VDoc) get_readme(path string) Readme {
 	return Readme{
 		frontmatter: readme_frontmatter
 		content:     readme_contents
+		path:        readme_path
 	}
 }
 
@@ -341,6 +344,7 @@ fn (mut vd VDoc) generate_docs_from_file() {
 				head:           doc.DocNode{
 					is_readme:   true
 					name:        readme_name
+					file_path:   readme.path
 					frontmatter: readme.frontmatter
 					comments:    [comment]
 				}
@@ -364,17 +368,17 @@ fn (mut vd VDoc) generate_docs_from_file() {
 				exit(1)
 			}
 		}
-		if dcs.contents.len == 0 {
-			continue
-		}
 		if cfg.is_multi || (!cfg.is_multi && cfg.include_readme) {
 			readme := vd.get_readme(dirpath)
-			comment := doc.DocComment{
-				is_readme:   true
-				frontmatter: readme.frontmatter
-				text:        readme.content
+			if readme.path != '' {
+				comment := doc.DocComment{
+					is_readme:   true
+					frontmatter: readme.frontmatter
+					text:        readme.content
+				}
+				dcs.head.comments = [comment]
+				dcs.head.file_path = readme.path
 			}
-			dcs.head.comments = [comment]
 		}
 		if cfg.pub_only {
 			for name, dc in dcs.contents {

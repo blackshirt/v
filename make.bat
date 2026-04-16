@@ -15,11 +15,12 @@ set V_EXE=./v.exe
 set V_BOOTSTRAP=./v_win_bootstrap.exe
 set V_OLD=./v_old.exe
 set V_UPDATED=./v_up.exe
+set V_C_FILE=./vc/v_win.c
 
 REM TCC variables
 set tcc_url=https://github.com/vlang/tccbin
-set tcc_dir=thirdparty/tcc
-set tcc_exe=thirdparty/tcc/tcc.exe
+set tcc_dir=%~dp0thirdparty\tcc
+set tcc_exe=%tcc_dir%\tcc.exe
 if "%PROCESSOR_ARCHITECTURE%" == "x86" ( set tcc_branch="thirdparty-windows-i386" ) else ( set tcc_branch="thirdparty-windows-amd64" )
 if "%~1" == "-tcc32" set tcc_branch="thirdparty-windows-i386"
 
@@ -115,14 +116,18 @@ exit /b %ERRORLEVEL%
 if !flag_local! NEQ 1 (
 	call :download_tcc
 	if %ERRORLEVEL% NEQ 0 goto :error
-	pushd "%vc_dir%" && (
-		echo Updating vc...
-		echo  ^> Sync with remote !vc_url!
-		cd %vc_dir%
-		git pull --quiet
-		cd ..
-		popd
-	) || call :cloning_vc
+	if exist "%vc_dir%" (
+		pushd "%vc_dir%" && (
+			echo Updating vc...
+			echo  ^> Sync with remote !vc_url!
+			cd %vc_dir%
+			git pull --quiet
+			cd ..
+			popd
+		)
+	) else (
+		call :cloning_vc
+	)
 	echo.
 )
 
@@ -133,10 +138,12 @@ if not [!compiler!] == [] goto :!compiler!_strap
 REM By default, use tcc, since we have it prebuilt:
 :tcc_strap
 :tcc32_strap
-echo  ^> Attempting to build "%V_BOOTSTRAP%" (from v_win.c) with "!tcc_exe!"
-"!tcc_exe!" -Bthirdparty/tcc -bt10 -g -w -o "%V_BOOTSTRAP%" ./vc/v_win.c -ladvapi32 -lws2_32
+echo  ^> Attempting to build "%V_BOOTSTRAP%" (from %V_C_FILE%) with "!tcc_exe!"
+"!tcc_exe!" -B"%tcc_dir%" -bt10 -g -w -o "%V_BOOTSTRAP%" "%V_C_FILE%" -ladvapi32 -lws2_32 -Wl,-stack=33554432
 if %ERRORLEVEL% NEQ 0 goto :compile_error
 echo  ^> Compiling "%V_EXE%" with "%V_BOOTSTRAP%"
+REM Keep the TCC root relative here; V forwards -cflags through a response file.
+REM An absolute -B path breaks there when the checkout path contains spaces.
 "%V_BOOTSTRAP%" -keepc -g -showcc -cc "!tcc_exe!" -cflags -Bthirdparty/tcc -o "%V_UPDATED%" cmd/v
 if %ERRORLEVEL% NEQ 0 goto :clang_strap
 call :move_updated_to_v
@@ -150,8 +157,8 @@ if %ERRORLEVEL% NEQ 0 (
 	goto :gcc_strap
 )
 
-echo  ^> Attempting to build "%V_BOOTSTRAP%" (from v_win.c) with Clang
-clang -std=c99 -municode -g -w -o "%V_BOOTSTRAP%" ./vc/v_win.c -ladvapi32 -lws2_32
+echo  ^> Attempting to build "%V_BOOTSTRAP%" (from %V_C_FILE%) with Clang
+clang -std=c99 -municode -g -w -o "%V_BOOTSTRAP%" "%V_C_FILE%" -ladvapi32 -lws2_32 -Wl,-stack=33554432
 if %ERRORLEVEL% NEQ 0 (
 	echo In most cases, compile errors happen because the version of Clang installed is too old
 	clang --version
@@ -172,8 +179,8 @@ if %ERRORLEVEL% NEQ 0 (
 	goto :msvc_strap
 )
 
-echo  ^> Attempting to build "%V_BOOTSTRAP%" (from v_win.c) with GCC
-gcc -std=c99 -municode -g -w -o "%V_BOOTSTRAP%" ./vc/v_win.c -ladvapi32 -lws2_32
+echo  ^> Attempting to build "%V_BOOTSTRAP%" (from %V_C_FILE%) with GCC
+gcc -std=c99 -municode -g -w -o "%V_BOOTSTRAP%" "%V_C_FILE%" -ladvapi32 -lws2_32 -Wl,-stack=33554432
 if %ERRORLEVEL% NEQ 0 (
 	echo In most cases, compile errors happen because the version of GCC installed is too old
 	gcc --version
@@ -213,30 +220,42 @@ if exist "%InstallDir%/Common7/Tools/vsdevcmd.bat" (
 
 set ObjFile=.v.c.obj
 
-echo  ^> Attempting to build "%V_BOOTSTRAP%" (from v_win.c) with MSVC
-cl.exe /volatile:ms /Fo%ObjFile% /W0 /MD /D_VBOOTSTRAP /F33554432 "vc/v_win.c" user32.lib kernel32.lib advapi32.lib shell32.lib ws2_32.lib /link /nologo /out:"%V_BOOTSTRAP%" /incremental:no
-if %ERRORLEVEL% NEQ 0 (
-	echo In some cases, compile errors happen because of the MSVC compiler version
-	cl.exe
-	goto :compile_error
+if not exist "%tcc_exe%" call :download_tcc
+if exist "%tcc_exe%" (
+	echo  ^> Bootstrapping "%V_BOOTSTRAP%" from %V_C_FILE% with "!tcc_exe!" before compiling "%V_EXE%" with MSVC
+	"!tcc_exe!" -B"%tcc_dir%" -bt10 -g -w -o "%V_BOOTSTRAP%" "%V_C_FILE%" -ladvapi32 -lws2_32 -Wl,-stack=33554432
+	if %ERRORLEVEL% NEQ 0 goto :compile_error
+) else (
+	echo  ^> Attempting to build "%V_BOOTSTRAP%" from %V_C_FILE% with MSVC
+	cl.exe /volatile:ms /Fo%ObjFile% /W0 /MD /D_VBOOTSTRAP /F33554432 "%V_C_FILE%" user32.lib kernel32.lib advapi32.lib shell32.lib ws2_32.lib /link /nologo /out:"%V_BOOTSTRAP%" /incremental:no
+	if %ERRORLEVEL% NEQ 0 (
+		echo In some cases, compile errors happen because of the MSVC compiler version
+		cl.exe
+		if exist %ObjFile% del %ObjFile%
+		goto :compile_error
+	)
 )
 
 echo  ^> Compiling "%V_EXE%" with "%V_BOOTSTRAP%"
 "%V_BOOTSTRAP%" -keepc -g -showcc -cc msvc -o "%V_UPDATED%" cmd/v
-del %ObjFile%
+if exist %ObjFile% del %ObjFile%
 if %ERRORLEVEL% NEQ 0 goto :compile_error
 call :move_updated_to_v
 goto :success
 
 :download_tcc
-pushd "%tcc_dir%" && (
-	echo Updating TCC
-	echo  ^> Syncing TCC from !tcc_url!
-	git pull --quiet
-	popd
-) || call :bootstrap_tcc
+if exist "%tcc_dir%" (
+	pushd "%tcc_dir%" && (
+		echo Updating TCC
+		echo  ^> Syncing TCC from !tcc_url!
+		git pull --quiet
+		popd
+	)
+) else (
+	call :bootstrap_tcc
+)
 
-if [!tcc_exe!] == [] echo  ^> TCC not found, even after cloning& goto :error
+if not exist "%tcc_exe%" echo  ^> TCC not found, even after cloning& goto :error
 echo.
 exit /b 0
 

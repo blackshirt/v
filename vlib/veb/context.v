@@ -2,6 +2,7 @@ module veb
 
 import compress.gzip
 import compress.zstd
+import hash
 import json
 import net
 import net.http
@@ -35,14 +36,18 @@ mut:
 	// If the `Connection: close` header is present the connection should always be closed
 	client_wants_to_close bool
 	// Configuration for static file compression (set by serve_if_static)
-	enable_static_gzip          bool
-	enable_static_zstd          bool
-	enable_static_compression   bool
-	static_compression_max_size int
+	enable_static_gzip            bool
+	enable_static_zstd            bool
+	enable_static_compression     bool
+	static_compression_max_size   int
+	static_compression_mime_types []string
 	// if true the response should not be sent and the connection should be closed
 	// manually.
 	takeover    bool
 	return_file string
+	// raw client file descriptor, used by the fasthttp backend to create a TcpConn
+	// on demand when takeover_conn() is called
+	client_fd int = -1
 	// already_compressed indicates that the response body is already compressed (zstd/gzip)
 	// and the compression middlewares should skip it
 	already_compressed bool
@@ -103,15 +108,19 @@ pub fn (mut ctx Context) send_response_to_client(mimetype string, response strin
 	ctx.done = true
 	$if veb_livereload ? {
 		if mimetype == 'text/html' {
-			ctx.res.body = response.replace('</html>', '<script src="/veb_livereload/${veb_livereload_server_start}/script.js"></script>\n</html>')
+			ctx.res.body = response.replace('</html>',
+				'<script src="/veb_livereload/${veb_livereload_server_start}/script.js"></script>\n</html>')
 		} else {
 			ctx.res.body = response.clone()
 		}
 	} $else {
 		ctx.res.body = response.clone()
 	}
-	// set Content-Type and Content-Length headers
-	mut custom_mimetype := if ctx.content_type.len == 0 { mimetype } else { ctx.content_type }
+	// Prefer explicit overrides from Context state or a pre-set response header.
+	mut custom_mimetype := ctx.content_type
+	if custom_mimetype.len == 0 {
+		custom_mimetype = ctx.res.header.get(.content_type) or { mimetype }
+	}
 	if custom_mimetype != '' {
 		ctx.res.header.set(.content_type, custom_mimetype)
 	}
@@ -130,7 +139,7 @@ pub fn (mut ctx Context) send_response_to_client(mimetype string, response strin
 	if ctx.res.status_code == 0 {
 		ctx.res.set_status(.ok)
 	}
-	if ctx.takeover {
+	if ctx.takeover && ctx.conn != unsafe { nil } {
 		fast_send_resp(mut ctx.conn, ctx.res) or {}
 	}
 	// result is send in `veb.v`, `handle_route`
@@ -145,6 +154,14 @@ pub fn (mut ctx Context) html(s string) Result {
 // Response with `s` as payload and content-type `text/plain`
 pub fn (mut ctx Context) text(s string) Result {
 	return ctx.send_response_to_client('text/plain', s)
+}
+
+fn (mut ctx Context) set_static_compression_config(enable_gzip bool, enable_zstd bool, enable_compression bool, max_size int, mime_types []string) {
+	ctx.enable_static_gzip = enable_gzip
+	ctx.enable_static_zstd = enable_zstd
+	ctx.enable_static_compression = enable_compression
+	ctx.static_compression_max_size = max_size
+	ctx.static_compression_mime_types = mime_types
 }
 
 // Response with json_s as payload and content-type `application/json`
@@ -202,11 +219,12 @@ fn (mut ctx Context) send_file(content_type string, file_path string) Result {
 	client_accepts_zstd := accept_encoding.contains('zstd')
 	client_accepts_gzip := accept_encoding.contains('gzip')
 	max_size_bytes := ctx.static_compression_max_size
+	should_use_static_compression := ctx.should_use_static_compression_for_mime(content_type)
 	// Determine which compression modes are enabled
-	use_zstd := (ctx.enable_static_zstd && client_accepts_zstd)
-		|| (ctx.enable_static_compression && client_accepts_zstd)
-	use_gzip := (ctx.enable_static_gzip && client_accepts_gzip)
-		|| (ctx.enable_static_compression && client_accepts_gzip)
+	use_zstd := should_use_static_compression && ((ctx.enable_static_zstd && client_accepts_zstd)
+		|| (ctx.enable_static_compression && client_accepts_zstd))
+	use_gzip := should_use_static_compression && ((ctx.enable_static_gzip && client_accepts_gzip)
+		|| (ctx.enable_static_compression && client_accepts_gzip))
 	// Try to serve pre-compressed files if any compression is enabled
 	if use_zstd || use_gzip {
 		orig_mtime := os.file_last_mod_unix(file_path)
@@ -230,16 +248,12 @@ fn (mut ctx Context) send_file(content_type string, file_path string) Result {
 			}
 			// Try zstd first if enabled, then gzip
 			if use_zstd {
-				if result := ctx.serve_compressed_static(content_type, file_path, data,
-					.zstd)
-				{
+				if result := ctx.serve_compressed_static(content_type, file_path, data, .zstd) {
 					return result
 				}
 			}
 			if use_gzip {
-				if result := ctx.serve_compressed_static(content_type, file_path, data,
-					.gzip)
-				{
+				if result := ctx.serve_compressed_static(content_type, file_path, data, .gzip) {
 					return result
 				}
 			}
@@ -265,10 +279,48 @@ fn (mut ctx Context) send_file(content_type string, file_path string) Result {
 	return ctx.send_response_to_client(content_type, '')
 }
 
-// serve_precompressed_file serves an existing pre-compressed file (.zst or .gz) if it exists and is fresh.
-// Returns true if the file was served, false otherwise.
-fn (mut ctx Context) serve_precompressed_file(content_type string, file_path string, ext string, encoding_name string, orig_mtime i64) bool {
-	compressed_path := '${file_path}${ext}'
+fn normalize_static_compression_mime_type(mime_type string) string {
+	return mime_type.all_before(';').trim_space().to_lower()
+}
+
+fn (ctx &Context) should_use_static_compression_for_mime(content_type string) bool {
+	if ctx.static_compression_mime_types.len == 0 {
+		return true
+	}
+	normalized_content_type := normalize_static_compression_mime_type(content_type)
+	if normalized_content_type == '' {
+		return false
+	}
+	for mime_type in ctx.static_compression_mime_types {
+		if normalize_static_compression_mime_type(mime_type) == normalized_content_type {
+			return true
+		}
+	}
+	return false
+}
+
+fn sanitize_cache_path_component(component string) string {
+	mut sanitized := component.trim_space()
+	if sanitized == '' {
+		return 'unknown'
+	}
+	for invalid_char in ['/', '\\', ':', '*', '?', '"', '<', '>', '|'] {
+		sanitized = sanitized.replace(invalid_char, '_')
+	}
+	return sanitized
+}
+
+fn static_compression_cache_path(file_path string, ext string) string {
+	real_file_path := os.real_path(file_path)
+	path_hash := hash.sum64_string(real_file_path, 0).hex_full()
+	app_dir_name := sanitize_cache_path_component(os.base(os.getwd()))
+	static_dir_name := sanitize_cache_path_component(os.base(os.dir(real_file_path)))
+	file_name := sanitize_cache_path_component(os.file_name(real_file_path))
+	return os.join_path(os.cache_dir(), 'veb', 'static_compression', app_dir_name, static_dir_name,
+		'${file_name}.${path_hash}${ext}')
+}
+
+fn (mut ctx Context) serve_compressed_path_if_fresh(content_type string, compressed_path string, encoding_name string, orig_mtime i64) bool {
 	if !os.exists(compressed_path) {
 		return false
 	}
@@ -288,6 +340,21 @@ fn (mut ctx Context) serve_precompressed_file(content_type string, file_path str
 	return true
 }
 
+// serve_precompressed_file serves an existing pre-compressed file (.zst or .gz) if it exists and is fresh.
+// Returns true if the file was served, false otherwise.
+fn (mut ctx Context) serve_precompressed_file(content_type string, file_path string, ext string, encoding_name string, orig_mtime i64) bool {
+	// First prefer manually pre-compressed files beside the original static file.
+	side_by_side_path := '${file_path}${ext}'
+	if ctx.serve_compressed_path_if_fresh(content_type, side_by_side_path, encoding_name,
+		orig_mtime)
+	{
+		return true
+	}
+	// Then try veb-managed cache files under os.cache_dir().
+	cached_path := static_compression_cache_path(file_path, ext)
+	return ctx.serve_compressed_path_if_fresh(content_type, cached_path, encoding_name, orig_mtime)
+}
+
 // serve_compressed_static compresses data and serves it, optionally caching to disk.
 // Returns Result on success, none on compression failure.
 fn (mut ctx Context) serve_compressed_static(content_type string, file_path string, data string, encoding ContentEncoding) ?Result {
@@ -301,12 +368,19 @@ fn (mut ctx Context) serve_compressed_static(content_type string, file_path stri
 			c, '.gz', 'gzip'
 		}
 	}
-	compressed_path := '${file_path}${ext}'
+	compressed_path := static_compression_cache_path(file_path, ext)
 	// Try to save compressed version for future requests
 	mut write_success := true
-	os.write_file(compressed_path, compressed.bytestr()) or {
-		eprintln('[veb] warning: could not save ${ext} file (readonly filesystem?): ${err.msg()}')
+	cache_dir := os.dir(compressed_path)
+	os.mkdir_all(cache_dir) or {
+		eprintln('[veb] warning: could not create static compression cache dir `${cache_dir}`: ${err.msg()}')
 		write_success = false
+	}
+	if write_success {
+		os.write_file(compressed_path, compressed.bytestr()) or {
+			eprintln('[veb] warning: could not save ${ext} file in static compression cache: ${err.msg()}')
+			write_success = false
+		}
 	}
 	ctx.already_compressed = true
 	if write_success {
@@ -417,6 +491,41 @@ pub fn (mut ctx Context) set_content_type(mime string) {
 // send multiple responses. Like with the SSE.
 pub fn (mut ctx Context) takeover_conn() {
 	ctx.takeover = true
+	if ctx.conn == unsafe { nil } && ctx.client_fd >= 0 {
+		// For the fasthttp backend: create a TcpConn from the raw fd on demand.
+		// Set the fd to blocking mode — fasthttp uses non-blocking sockets,
+		// but TcpConn.write() expects blocking behavior for reliable writes.
+		$if !windows {
+			flags := C.fcntl(ctx.client_fd, C.F_GETFL, 0)
+			if flags != -1 {
+				C.fcntl(ctx.client_fd, C.F_SETFL, flags & ~C.O_NONBLOCK)
+			}
+		}
+		ctx.conn = &net.TcpConn{
+			sock:          net.TcpSocket{
+				Socket: net.Socket{
+					handle: ctx.client_fd
+				}
+			}
+			handle:        ctx.client_fd
+			is_blocking:   true
+			read_timeout:  30 * time.second
+			write_timeout: 30 * time.second
+		}
+	} else if ctx.conn != unsafe { nil } {
+		// For the picoev backend: the connection exists but uses non-blocking I/O.
+		// Switch to blocking mode for reliable SSE writes.
+		fd := ctx.conn.handle
+		$if !windows {
+			flags := C.fcntl(fd, C.F_GETFL, 0)
+			if flags != -1 {
+				C.fcntl(fd, C.F_SETFL, flags & ~C.O_NONBLOCK)
+			}
+		}
+		ctx.conn.is_blocking = true
+		ctx.conn.set_read_timeout(30 * time.second)
+		ctx.conn.set_write_timeout(30 * time.second)
+	}
 }
 
 // user_agent returns the user-agent header for the current client
@@ -439,7 +548,7 @@ pub fn (ctx &Context) ip() string {
 	if ip.contains(',') {
 		ip = ip.all_before(',')
 	}
-	if ip == '' {
+	if ip == '' && ctx.conn != unsafe { nil } {
 		ip = ctx.conn.peer_ip() or { '' }
 	}
 	return ip

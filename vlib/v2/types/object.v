@@ -16,8 +16,9 @@ mut:
 	// color_    color
 }
 
-struct Const {
+pub struct Const {
 	ObjectCommon
+pub:
 	int_val int
 }
 
@@ -26,7 +27,7 @@ struct Global {
 	typ  Type
 }
 
-struct Fn {
+pub struct Fn {
 	name string
 	// typ  FnType // signature
 	typ Type // signature

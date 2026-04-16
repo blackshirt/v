@@ -3,10 +3,6 @@ module builtin
 // eprintln prints a message with a line end, to stderr. Both stderr and stdout are flushed.
 @[if !noeprintln ?]
 pub fn eprintln(s string) {
-	if s.str == 0 || u64(s.str) <= 0xFFFF {
-		eprintln('eprintln(NIL)')
-		return
-	}
 	$if builtin_print_use_fprintf ? {
 		C.fprintf(C.stderr, c'%.*s\n', s.len, s.str)
 		return
@@ -32,10 +28,6 @@ pub fn eprintln(s string) {
 // eprint prints a message to stderr. Both stderr and stdout are flushed.
 @[if !noeprintln ?]
 pub fn eprint(s string) {
-	if s.str == 0 || u64(s.str) <= 0xFFFF {
-		eprint('eprint(NIL)')
-		return
-	}
 	$if builtin_print_use_fprintf ? {
 		C.fprintf(C.stderr, c'%.*s', s.len, s.str)
 		return
@@ -94,8 +86,8 @@ pub fn flush_stderr() {
 // Note 2: most libc implementations, have logic that use line buffering for stdout, when the output
 // stream is connected to an interactive device, like a terminal, and otherwise fully buffer it,
 // which is good for the output performance for programs that can produce a lot of output (like
-// filters, or cat etc), but bad for latency. Normally, it is usually what you want, so it is the
-// default for V programs too.
+// filters, or cat etc), but bad for latency. V uses unbuffered stdout by default on the common C
+// backends, to make print and println visible immediately even when stdout is redirected.
 // See https://www.gnu.org/software/libc/manual/html_node/Buffering-Concepts.html .
 // See https://pubs.opengroup.org/onlinepubs/9699919799/functions/V2_chap02.html#tag_15_05 .
 pub fn unbuffer_stdout() {
@@ -107,7 +99,7 @@ pub fn unbuffer_stdout() {
 	}
 }
 
-// print prints a message to stdout. Note that unlike `eprint`, stdout is not automatically flushed.
+// print prints a message to stdout.
 @[manualfree]
 pub fn print(s string) {
 	$if builtin_print_use_fprintf ? {
@@ -126,13 +118,9 @@ pub fn print(s string) {
 	}
 }
 
-// println prints a message with a line end, to stdout. Note that unlike `eprintln`, stdout is not automatically flushed.
+// println prints a message with a line end, to stdout.
 @[if !noprintln ?; manualfree]
 pub fn println(s string) {
-	if s.str == 0 || u64(s.str) <= 0xFFFF {
-		println('println(NIL)')
-		return
-	}
 	$if builtin_print_use_fprintf ? {
 		C.fprintf(C.stdout, c'%.*s\n', s.len, s.str)
 		return
@@ -185,6 +173,10 @@ fn _write_buf_to_fd(fd int, buf &u8, buf_len int) {
 		unsafe {
 			for remaining_bytes > 0 {
 				x = C.write(fd, ptr, remaining_bytes)
+				if x <= 0 {
+					// Detached/invalid stdio must not trap the process in an infinite loop.
+					break
+				}
 				ptr += x
 				remaining_bytes -= x
 			}
@@ -197,6 +189,10 @@ fn _write_buf_to_fd(fd int, buf &u8, buf_len int) {
 		unsafe {
 			for remaining_bytes > 0 {
 				x = isize(C.fwrite(ptr, 1, remaining_bytes, stream))
+				if x <= 0 {
+					// GUI programs on Windows may not have a writable stdout/stderr stream.
+					break
+				}
 				ptr += x
 				remaining_bytes -= x
 			}

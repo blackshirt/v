@@ -5,8 +5,24 @@ module type_resolver
 import v.ast
 
 pub fn (mut t TypeResolver) get_comptime_selector_var_type(node ast.ComptimeSelector) (ast.StructField, string) {
-	field_name := t.info.comptime_for_field_value.name
-	left_sym := t.table.sym(t.resolver.unwrap_generic(node.left_type))
+	mut field_name := if node.typ_key.contains('|') {
+		node.typ_key.all_after('|')
+	} else {
+		t.info.comptime_for_field_value.name
+	}
+	if node.field_expr is ast.SelectorExpr && t.info.comptime_for_field_var != ''
+		&& t.info.comptime_for_method_var == '' && node.field_expr.field_name == 'name' {
+		if node.field_expr.expr is ast.Ident
+			&& node.field_expr.expr.name == t.info.comptime_for_field_var {
+			field_name = t.info.comptime_for_field_value.name
+		}
+	}
+	mut left_type := node.left_type
+	resolved_left_type := t.get_type_or_default(node.left, node.left_type)
+	if resolved_left_type != ast.void_type {
+		left_type = resolved_left_type
+	}
+	left_sym := t.table.sym(t.resolver.unwrap_generic(left_type))
 	field := t.table.find_field_with_embeds(left_sym, field_name) or {
 		t.error('`${node.left}` has no field named `${field_name}`', node.left.pos())
 	}
@@ -72,6 +88,9 @@ pub fn (t &ResolverInfo) is_comptime_variant_var(node ast.Ident) bool {
 // typeof_type resolves type for typeof() expr where field.typ is resolved to real type instead of int type to make type(field.typ).name working
 pub fn (mut t TypeResolver) typeof_type(node ast.Expr, default_type ast.Type) ast.Type {
 	if node is ast.Ident {
+		if node.obj is ast.Var && node.obj.is_arg && node.obj.is_auto_deref && node.obj.typ.is_ptr() {
+			return node.obj.typ.deref().clear_flag(.option_mut_param_t)
+		}
 		if t.info.inside_comptime_for && t.info.comptime_for_field_var != '' {
 			if node.obj is ast.Var {
 				obj_typ := node.obj.typ
@@ -166,8 +185,7 @@ pub fn (t &ResolverInfo) get_ct_type_var(node ast.Expr) ast.ComptimeVarKind {
 pub fn (t &TypeResolver) get_type_from_comptime_var(var ast.Ident) ast.Type {
 	match var.name {
 		t.info.comptime_for_variant_var {
-			return t.get_ct_type_or_default('${t.info.comptime_for_variant_var}.typ',
-				ast.void_type)
+			return t.get_ct_type_or_default('${t.info.comptime_for_variant_var}.typ', ast.void_type)
 		}
 		t.info.comptime_for_method_param_var {
 			return t.get_ct_type_or_default('${t.info.comptime_for_method_param_var}.typ',
@@ -183,11 +201,39 @@ pub fn (t &TypeResolver) get_type_from_comptime_var(var ast.Ident) ast.Type {
 // get_comptime_selector_type retrieves the var.$(field.name) type when field_name is 'name' otherwise default_type is returned
 @[inline]
 pub fn (mut t TypeResolver) get_comptime_selector_type(node ast.ComptimeSelector, default_type ast.Type) ast.Type {
+	if node.is_method && t.info.comptime_for_method != unsafe { nil } {
+		mut method := *t.info.comptime_for_method
+		if method.params.len > 0 {
+			method.params = method.params[1..]
+		}
+		method.name = ''
+		return ast.new_type(t.table.find_or_register_fn_type(method, false, true))
+	}
 	if node.is_name && node.field_expr is ast.SelectorExpr
 		&& t.info.check_comptime_is_field_selector(node.field_expr) {
 		return t.resolver.unwrap_generic(t.info.comptime_for_field_type)
 	}
 	return default_type
+}
+
+// is_comptime_method_selector checks if the expression is a method loop variable or its `.name`.
+@[inline]
+pub fn (t &ResolverInfo) is_comptime_method_selector(node ast.Expr) bool {
+	if t.comptime_for_method_var == '' {
+		return false
+	}
+	match node {
+		ast.Ident {
+			return node.name == t.comptime_for_method_var
+		}
+		ast.SelectorExpr {
+			return node.field_name == 'name' && node.expr is ast.Ident
+				&& node.expr.name == t.comptime_for_method_var
+		}
+		else {
+			return false
+		}
+	}
 }
 
 // is_comptime_selector_field_name checks if the SelectorExpr is related to $for variable or generic letter accessing specific field name provided by `field_name`

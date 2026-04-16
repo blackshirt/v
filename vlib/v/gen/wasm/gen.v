@@ -551,12 +551,9 @@ pub fn (mut g Gen) infix_expr(node ast.InfixExpr, expected ast.Type) {
 	}
 	g.infix_from_typ(node.left_type, node.op)
 
-	res_typ := if node.op in [.eq, .ne, .gt, .lt, .ge, .le] {
-		ast.bool_type
-	} else {
-		node.left_type
-	}
-	g.func.cast(g.as_numtype(g.get_wasm_type(res_typ)), res_typ.is_signed(), g.as_numtype(g.get_wasm_type(expected)))
+	res_typ := if node.op in [.eq, .ne, .gt, .lt, .ge, .le] { ast.bool_type } else { node.left_type }
+	g.func.cast(g.as_numtype(g.get_wasm_type(res_typ)), res_typ.is_signed(),
+		g.as_numtype(g.get_wasm_type(expected)))
 }
 
 pub fn (mut g Gen) prefix_expr(node ast.PrefixExpr, expected ast.Type) {
@@ -686,8 +683,7 @@ fn (mut g Gen) match_branch(node ast.MatchExpr, expected ast.Type, unpacked_para
 	}
 
 	if branch.exprs.len > 0 {
-		g.match_branch_exprs(node, expected, unpacked_params, branch_idx, 0, existing_rvars,
-			branch)
+		g.match_branch_exprs(node, expected, unpacked_params, branch_idx, 0, existing_rvars, branch)
 	} else {
 		if branch.stmts.len > 0 {
 			g.rvar_expr_stmts(branch.stmts, expected, existing_rvars)
@@ -798,14 +794,10 @@ pub fn (mut g Gen) call_expr(node ast.CallExpr, expected ast.Type, existing_rvar
 	// {method self}
 	//
 	if node.is_method {
-		expr := if !node.left_type.is_ptr() && node.receiver_type.is_ptr() {
-			ast.Expr(ast.PrefixExpr{
+		expr := if !node.left_type.is_ptr() && node.receiver_type.is_ptr() { ast.Expr(ast.PrefixExpr{
 				op:    .amp
 				right: node.left
-			})
-		} else {
-			node.left
-		}
+			}) } else { node.left }
 		// hack alert!
 		if node.receiver_type == ast.int_literal_type && expr is ast.IntegerLiteral {
 			g.literal(expr.val, ast.i64_type)
@@ -966,7 +958,10 @@ pub fn (mut g Gen) expr(node ast.Expr, expected ast.Type) {
 
 			size, _ := g.pool.type_size(typ)
 
+			old_needs_address := g.needs_address
+			g.needs_address = false
 			g.expr(node.index, ast.int_type)
+			g.needs_address = old_needs_address
 
 			if !direct_array_access {
 				g.is_leaf_function = false // calls panic()
@@ -1145,7 +1140,8 @@ pub fn (mut g Gen) expr(node ast.Expr, expected ast.Type) {
 				}
 			}
 
-			g.func.cast(g.as_numtype(g.get_wasm_type(typ)), typ.is_signed(), g.as_numtype(g.get_wasm_type(node.typ)))
+			g.func.cast(g.as_numtype(g.get_wasm_type(typ)), typ.is_signed(),
+				g.as_numtype(g.get_wasm_type(node.typ)))
 		}
 		ast.CallExpr {
 			g.call_expr(node, expected, [])
@@ -1540,7 +1536,8 @@ pub fn (mut g Gen) expr_stmt(node ast.Stmt, expected ast.Type) {
 					right := node.right[0]
 					match right {
 						ast.IfExpr {
-							params := node.left_types.filter(!g.is_param_type(it)).map(g.get_wasm_type(it))
+							params :=
+								node.left_types.filter(!g.is_param_type(it)).map(g.get_wasm_type(it))
 							g.if_branch(right, right.typ, params, 0, rvars)
 							set = true
 						}
@@ -1762,7 +1759,8 @@ pub fn gen(files []&ast.File, mut table ast.Table, out_name string, w_pref &pref
 			exe := $if windows { 'wasm-opt.exe' } $else { 'wasm-opt' }
 			if rt := os.find_abs_path_of_executable(exe) {
 				// -lmu: low memory unused, very important optimisation
-				res := os.execute('${os.quoted_path(rt)} -all -lmu -c -O4 ${os.quoted_path(out_name)} -o ${os.quoted_path(out_name)}')
+				res :=
+					os.execute('${os.quoted_path(rt)} -all -lmu -c -O4 ${os.quoted_path(out_name)} -o ${os.quoted_path(out_name)}')
 				if res.exit_code != 0 {
 					eprintln(res.output)
 					g.w_error('${rt} failed, this should not happen. Report an issue with the above messages, the webassembly generated, and appropriate code.')

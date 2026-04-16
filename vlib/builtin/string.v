@@ -75,6 +75,11 @@ pub fn (s string) runes() []rune {
 	return runes
 }
 
+// graphemes returns the string split into Unicode grapheme clusters.
+pub fn (s string) graphemes() []string {
+	return string_graphemes_impl(s)
+}
+
 // cstring_to_vstring creates a new V string copy of the C style string,
 // pointed by `s`. This function is most likely what you want to use when
 // working with C style pointers to 0 terminated strings (i.e. `char*`).
@@ -84,7 +89,8 @@ pub fn (s string) runes() []rune {
 // It will panic, if the pointer `s` is 0.
 @[unsafe]
 pub fn cstring_to_vstring(const_s &char) string {
-	return unsafe { tos2(&u8(const_s)) }.clone()
+	s := unsafe { tos2(byteptr(const_s)) }
+	return s.clone()
 }
 
 // tos_clone creates a new V string copy of the C style string, pointed by `s`.
@@ -93,7 +99,8 @@ pub fn cstring_to_vstring(const_s &char) string {
 // It will panic, if the pointer `s` is 0.
 @[unsafe]
 pub fn tos_clone(const_s &u8) string {
-	return unsafe { tos2(&u8(const_s)) }.clone()
+	s := unsafe { tos2(&u8(const_s)) }
+	return s.clone()
 }
 
 // tos creates a V string, given a C style pointer to a 0 terminated block.
@@ -302,7 +309,7 @@ pub fn (s string) len_utf8() int {
 	mut i := 0
 	for i < s.len {
 		l++
-		i += ((0xe5000000 >> ((unsafe { s.str[i] } >> 3) & 0x1e)) & 3) + 1
+		i += int(((u32(0xe5000000) >> ((unsafe { s.str[i] } >> 3) & 0x1e)) & 3) + 1)
 	}
 	return l
 }
@@ -339,7 +346,7 @@ fn (a string) option_clone_static() ?string {
 
 // clone returns a copy of the V string `a`.
 pub fn (a string) clone() string {
-	if a.len <= 0 || u64(a.str) <= 0xFFFF {
+	if a.len <= 0 {
 		return ''
 	}
 	mut b := string{
@@ -527,6 +534,65 @@ pub fn (s string) replace_each(vals []string) string {
 		buf[new_len] = 0
 		return tos(buf, new_len)
 	}
+}
+
+// format replaces positional placeholders like `{0}` and `{1}` in `s`
+// with the corresponding values from `args`.
+// Use `{{` and `}}` to output literal braces.
+@[direct_array_access]
+pub fn (s string) format(args ...string) string {
+	if s.len == 0 {
+		return ''
+	}
+	mut out := strings.new_builder(s.len)
+	mut i := 0
+	for i < s.len {
+		ch := s[i]
+		if ch == `{` {
+			if i + 1 < s.len && s[i + 1] == `{` {
+				out.write_byte(`{`)
+				i += 2
+				continue
+			}
+			mut j := i + 1
+			if j >= s.len || !s[j].is_digit() {
+				out.write_byte(ch)
+				i++
+				continue
+			}
+			mut idx := 0
+			mut overflowed := false
+			for j < s.len && s[j].is_digit() {
+				digit := int(s[j] - `0`)
+				if idx > (max_int - digit) / 10 {
+					overflowed = true
+					break
+				}
+				idx = idx * 10 + digit
+				j++
+			}
+			if !overflowed && j < s.len && s[j] == `}` {
+				if idx < args.len {
+					out.write_string(args[idx])
+				} else {
+					out.write_string(s[i..j + 1])
+				}
+				i = j + 1
+				continue
+			}
+			out.write_byte(ch)
+			i++
+			continue
+		}
+		if ch == `}` && i + 1 < s.len && s[i + 1] == `}` {
+			out.write_byte(`}`)
+			i += 2
+			continue
+		}
+		out.write_byte(ch)
+		i++
+	}
+	return out.str()
 }
 
 // replace_char replaces all occurrences of the character `rep`, with `repeat` x the character passed in `with`.
@@ -833,8 +899,8 @@ fn (s string) < (a string) bool {
 
 @[direct_array_access]
 fn (s string) + (a string) string {
-	slen := if s.len > 0 && u64(s.str) > 0xFFFF { s.len } else { 0 }
-	alen := if a.len > 0 && u64(a.str) > 0xFFFF { a.len } else { 0 }
+	slen := if s.len > 0 { s.len } else { 0 }
+	alen := if a.len > 0 { a.len } else { 0 }
 	new_len := alen + slen
 	mut res := string{
 		str: unsafe { malloc_noscan(new_len + 1) }
@@ -852,12 +918,39 @@ fn (s string) + (a string) string {
 	return res
 }
 
+// string_plus_many concatenates several strings with a single allocation.
+@[direct_array_access; markused]
+fn string_plus_many(data_len int, input_base &string) string {
+	mut new_len := 0
+	for i := 0; i < data_len; i++ {
+		part := unsafe { input_base[i] }
+		new_len += if part.len > 0 { part.len } else { 0 }
+	}
+	mut res := string{
+		str: unsafe { malloc_noscan(new_len + 1) }
+		len: new_len
+	}
+	mut offset := 0
+	unsafe {
+		for i := 0; i < data_len; i++ {
+			part := input_base[i]
+			part_len := if part.len > 0 { part.len } else { 0 }
+			if part_len > 0 {
+				vmemcpy(res.str + offset, part.str, part_len)
+				offset += part_len
+			}
+		}
+		res.str[new_len] = 0 // V strings are not null terminated, but just in case
+	}
+	return res
+}
+
 // for `s + s2 + s3`, an optimization (faster than string_plus(string_plus(s1, s2), s3))
 @[direct_array_access]
 fn (s string) plus_two(a string, b string) string {
-	slen := if s.len > 0 && u64(s.str) > 0xFFFF { s.len } else { 0 }
-	alen := if a.len > 0 && u64(a.str) > 0xFFFF { a.len } else { 0 }
-	blen := if b.len > 0 && u64(b.str) > 0xFFFF { b.len } else { 0 }
+	slen := if s.len > 0 { s.len } else { 0 }
+	alen := if a.len > 0 { a.len } else { 0 }
+	blen := if b.len > 0 { b.len } else { 0 }
 	new_len := alen + blen + slen
 	mut res := string{
 		str: unsafe { malloc_noscan(new_len + 1) }
@@ -1698,21 +1791,26 @@ pub fn (s string) to_upper() string {
 	return runes.string()
 }
 
-// is_upper returns `true` if all characters in the string are uppercase.
+// is_upper returns `true` if all ASCII letters in the string are uppercase,
+// and the string contains at least one uppercase ASCII letter.
 // It only works when the input is composed entirely from ASCII characters.
 // See also: [`byte.is_capital`](#byte.is_capital)
 // Example: assert 'HELLO V'.is_upper() == true
 @[direct_array_access]
 pub fn (s string) is_upper() bool {
-	if s == '' || s[0].is_digit() {
+	if s == '' {
 		return false
 	}
+	mut has_upper := false
 	for i in 0 .. s.len {
 		if s[i] >= `a` && s[i] <= `z` {
 			return false
 		}
+		if s[i] >= `A` && s[i] <= `Z` {
+			has_upper = true
+		}
 	}
-	return true
+	return has_upper
 }
 
 // capitalize returns the string with the first character capitalized.
@@ -2058,6 +2156,11 @@ fn (s string) at(idx int) u8 {
 	return unsafe { s.str[idx] }
 }
 
+@[markused]
+fn (s string) at_ni(idx int) u8 {
+	return s.at(v_ni_index(idx, s.len))
+}
+
 // version of `at()` that is used in `a[i] or {`
 // return an error when the index is out of range
 fn (s string) at_with_check(idx int) ?u8 {
@@ -2067,6 +2170,11 @@ fn (s string) at_with_check(idx int) ?u8 {
 	unsafe {
 		return s.str[idx]
 	}
+}
+
+@[markused]
+fn (s string) at_with_check_ni(idx int) ?u8 {
+	return s.at_with_check(v_ni_index(idx, s.len))
 }
 
 // Check if a string is an octal value. Returns 'true' if it is, or 'false' if it is not
@@ -2307,6 +2415,7 @@ pub fn (s &string) free() {
 		free(s.str)
 		s.str = nil
 	}
+	s.len = 0
 	s.is_lit = -98761234
 }
 
@@ -2776,42 +2885,25 @@ pub fn (name string) match_glob(pattern string) bool {
 				`[` {
 					if nx < nlen {
 						wanted_c := name[nx]
-						mut bstart := px
 						mut is_inverted := false
 						mut inner_match := false
-						mut inner_idx := bstart + 1
-						mut inner_c := 0
-						if inner_idx < plen {
-							inner_c = pattern[inner_idx]
-							if inner_c == `^` {
-								is_inverted = true
-								inner_idx++
-							}
+						mut inner_idx := px + 1
+						if inner_idx < plen && pattern[inner_idx] == `^` {
+							is_inverted = true
+							inner_idx++
 						}
-						for ; inner_idx < plen; inner_idx++ {
-							inner_c = pattern[inner_idx]
-							if inner_c == `]` {
-								break
-							}
-							if inner_c == wanted_c {
+						for ; inner_idx < plen && pattern[inner_idx] != `]`; inner_idx++ {
+							if pattern[inner_idx] == wanted_c {
 								inner_match = true
-								for px < plen && pattern[px] != `]` {
-									px++
-								}
-								break
 							}
 						}
-						if is_inverted {
-							if inner_match {
-								return false
-							} else {
-								px = inner_idx
-							}
+						if inner_idx < plen && ((inner_match && !is_inverted)
+							|| (!inner_match && is_inverted)) {
+							px = inner_idx + 1
+							nx++
+							continue
 						}
 					}
-					px++
-					nx++
-					continue
 				}
 				else {
 					// an ordinary character
@@ -3039,7 +3131,7 @@ pub fn (s string) hex() string {
 	if s == '' {
 		return ''
 	}
-	return unsafe { data_to_hex_string(&u8(s.str), s.len) }
+	return unsafe { data_to_hex_string(s.str, s.len) }
 }
 
 @[unsafe]

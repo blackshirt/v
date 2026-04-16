@@ -72,21 +72,7 @@ fn decode_struct[T](doc Any, mut typ T) {
 			} $else $if field.typ is Any {
 				typ.$(field.name) = value
 			} $else $if field.is_array {
-				arr := value.array()
-				match field.typ {
-					[]string { typ.$(field.name) = arr.as_strings() }
-					[]int { typ.$(field.name) = arr.map(it.int()) }
-					[]i64 { typ.$(field.name) = arr.map(it.i64()) }
-					[]u64 { typ.$(field.name) = arr.map(it.u64()) }
-					[]f32 { typ.$(field.name) = arr.map(it.f32()) }
-					[]f64 { typ.$(field.name) = arr.map(it.f64()) }
-					[]bool { typ.$(field.name) = arr.map(it.bool()) }
-					[]DateTime { typ.$(field.name) = arr.map(it.datetime()) }
-					[]Date { typ.$(field.name) = arr.map(it.date()) }
-					[]Time { typ.$(field.name) = arr.map(it.time()) }
-					[]Any { typ.$(field.name) = arr }
-					else {}
-				}
+				typ.$(field.name) = decode_array(typ.$(field.name), value.array())
 			} $else $if field.is_map {
 				mut mmap := value.as_map()
 				match field.typ {
@@ -97,56 +83,47 @@ fn decode_struct[T](doc Any, mut typ T) {
 					// |k, v| k, v.int()
 					// Unfortunately lambdas have issues with multiple return at the time of writing
 					map[string]int {
-						typ.$(field.name) = maps.to_map[string, Any, string, int](mmap,
-							fn (k string, v Any) (string, int) {
+						typ.$(field.name) = maps.to_map[string, Any, string, int](mmap, fn (k string, v Any) (string, int) {
 							return k, v.int()
 						})
 					}
 					map[string]i64 {
-						typ.$(field.name) = maps.to_map[string, Any, string, i64](mmap,
-							fn (k string, v Any) (string, i64) {
+						typ.$(field.name) = maps.to_map[string, Any, string, i64](mmap, fn (k string, v Any) (string, i64) {
 							return k, v.i64()
 						})
 					}
 					map[string]u64 {
-						typ.$(field.name) = maps.to_map[string, Any, string, u64](mmap,
-							fn (k string, v Any) (string, u64) {
+						typ.$(field.name) = maps.to_map[string, Any, string, u64](mmap, fn (k string, v Any) (string, u64) {
 							return k, v.u64()
 						})
 					}
 					map[string]f32 {
-						typ.$(field.name) = maps.to_map[string, Any, string, f32](mmap,
-							fn (k string, v Any) (string, f32) {
+						typ.$(field.name) = maps.to_map[string, Any, string, f32](mmap, fn (k string, v Any) (string, f32) {
 							return k, v.f32()
 						})
 					}
 					map[string]f64 {
-						typ.$(field.name) = maps.to_map[string, Any, string, f64](mmap,
-							fn (k string, v Any) (string, f64) {
+						typ.$(field.name) = maps.to_map[string, Any, string, f64](mmap, fn (k string, v Any) (string, f64) {
 							return k, v.f64()
 						})
 					}
 					map[string]bool {
-						typ.$(field.name) = maps.to_map[string, Any, string, bool](mmap,
-							fn (k string, v Any) (string, bool) {
+						typ.$(field.name) = maps.to_map[string, Any, string, bool](mmap, fn (k string, v Any) (string, bool) {
 							return k, v.bool()
 						})
 					}
 					map[string]DateTime {
-						typ.$(field.name) = maps.to_map[string, Any, string, DateTime](mmap,
-							fn (k string, v Any) (string, DateTime) {
+						typ.$(field.name) = maps.to_map[string, Any, string, DateTime](mmap, fn (k string, v Any) (string, DateTime) {
 							return k, v.datetime()
 						})
 					}
 					map[string]Date {
-						typ.$(field.name) = maps.to_map[string, Any, string, Date](mmap,
-							fn (k string, v Any) (string, Date) {
+						typ.$(field.name) = maps.to_map[string, Any, string, Date](mmap, fn (k string, v Any) (string, Date) {
 							return k, v.date()
 						})
 					}
 					map[string]Time {
-						typ.$(field.name) = maps.to_map[string, Any, string, Time](mmap,
-							fn (k string, v Any) (string, Time) {
+						typ.$(field.name) = maps.to_map[string, Any, string, Time](mmap, fn (k string, v Any) (string, Time) {
 							return k, v.time()
 						})
 					}
@@ -161,6 +138,44 @@ fn decode_struct[T](doc Any, mut typ T) {
 				typ.$(field.name) = s
 			}
 		}
+	}
+}
+
+fn decode_array[T](current []T, values []toml.Any) []T {
+	$if T is string {
+		return values.map(it.string())
+	} $else $if T is bool {
+		return values.map(it.bool())
+	} $else $if T is int {
+		return values.map(it.int())
+	} $else $if T is i64 {
+		return values.map(it.i64())
+	} $else $if T is u64 {
+		return values.map(it.u64())
+	} $else $if T is f32 {
+		return values.map(it.f32())
+	} $else $if T is f64 {
+		return values.map(it.f64())
+	} $else $if T is DateTime {
+		return values.map(it.datetime())
+	} $else $if T is Date {
+		return values.map(it.date())
+	} $else $if T is Time {
+		return values.map(it.time())
+	} $else $if T is Any {
+		return values
+	} $else $if T is $struct {
+		mut decoded := []T{cap: values.len}
+		for value in values {
+			if value is map[string]Any {
+				mut item := T{}
+				decode_struct(value, mut item)
+				decoded << item
+			}
+		}
+		return decoded
+	} $else {
+		return current
 	}
 }
 
@@ -181,7 +196,7 @@ pub fn encode[T](typ T) string {
 	return ''
 }
 
-fn encode_struct[T](typ T) map[string]Any {
+fn encode_struct[T](typ T) map[string]toml.Any {
 	mut mp := map[string]Any{}
 	$for field in T.fields {
 		mut skip := false
@@ -202,6 +217,11 @@ fn encode_struct[T](typ T) map[string]Any {
 	return mp
 }
 
+fn voidptr_to_toml_string[T](value T) string {
+	ptr := unsafe { voidptr(&value) }
+	return unsafe { '0x${ptr_str(*(&voidptr(ptr)))}' }
+}
+
 fn to_any[T](value T) Any {
 	$if T is $enum {
 		return Any(int(value))
@@ -213,7 +233,9 @@ fn to_any[T](value T) Any {
 		return Any(value)
 	} $else $if T is bool {
 		return Any(value)
-	} $else $if T is $float {
+	} $else $if T is f32 {
+		return Any(value)
+	} $else $if T is f64 {
 		return Any(value)
 	} $else $if T is i64 {
 		return Any(value)
@@ -245,6 +267,9 @@ fn to_any[T](value T) Any {
 		}
 		return mmap
 	} $else {
+		if typeof(value).name == 'voidptr' {
+			return Any(voidptr_to_toml_string(value))
+		}
 		return Any('${value}')
 	}
 }
@@ -508,7 +533,7 @@ pub fn ast_to_any(value ast.Value) Any {
 			return Any(value.i64())
 		}
 		ast.Bool {
-			str := (value as ast.Bool).text
+			str := value.text
 			if str == 'true' {
 				return Any(true)
 			}

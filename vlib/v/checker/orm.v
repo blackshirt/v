@@ -23,14 +23,19 @@ fn (mut c Checker) sql_expr(mut node ast.SqlExpr) ast.Type {
 	if !c.ensure_type_exists(node.table_expr.typ, node.pos) {
 		return ast.void_type
 	}
-	// Resolve generic table type if we're inside a generic function context
-	mut table_type := node.table_expr.typ
-	if table_type.has_flag(.generic) && c.table.cur_fn != unsafe { nil }
-		&& c.table.cur_fn.generic_names.len > 0 && c.table.cur_concrete_types.len > 0 {
-		table_type = c.table.unwrap_generic_type(table_type, c.table.cur_fn.generic_names,
-			c.table.cur_concrete_types)
-		node.table_expr.typ = table_type
+	// Keep the SQL expression type aligned with the concretized ORM table type.
+	if c.table.cur_fn != unsafe { nil } && c.table.cur_fn.generic_names.len > 0
+		&& c.table.cur_concrete_types.len > 0 {
+		if c.needs_unwrap_generic_type(node.table_expr.typ) {
+			node.table_expr.typ = c.table.unwrap_generic_type(node.table_expr.typ,
+				c.table.cur_fn.generic_names, c.table.cur_concrete_types)
+		}
+		if c.needs_unwrap_generic_type(node.typ) {
+			node.typ = c.table.unwrap_generic_type(node.typ, c.table.cur_fn.generic_names,
+				c.table.cur_concrete_types)
+		}
 	}
+	table_type := node.table_expr.typ
 	table_sym := c.table.sym(table_type)
 
 	if !c.check_orm_table_expr_type(node.table_expr) {
@@ -69,7 +74,8 @@ fn (mut c Checker) sql_expr(mut node ast.SqlExpr) ast.Type {
 	}
 
 	for field in non_primitive_fields {
-		if c.table.sym(field.typ).kind == .array && !has_primary {
+		field_sym := c.table.sym(field.typ.clear_flag(.option))
+		if field_sym.kind == .array && !has_primary {
 			c.orm_error('a struct that has a field that holds an array must have a primary key',
 				field.pos)
 		}
@@ -152,7 +158,7 @@ fn (mut c Checker) sql_expr(mut node ast.SqlExpr) ast.Type {
 			or_block:    ast.OrExpr{}
 		}
 
-		if c.table.sym(field.typ).kind == .array {
+		if field_sym.kind == .array {
 			mut where_expr := subquery_expr.where_expr
 			if mut where_expr is ast.InfixExpr {
 				where_expr.left_type = primary_field.typ
@@ -176,17 +182,31 @@ fn (mut c Checker) sql_expr(mut node ast.SqlExpr) ast.Type {
 		sub_structs[int(field.typ)] = subquery_expr
 	}
 
-	if node.is_count {
-		fields = [
-			ast.StructField{
-				typ: ast.int_type
-			},
-		]
-	}
-
-	node.fields = fields
-	node.sub_structs = sub_structs.move()
 	field_names := fields.map(it.name)
+	if node.aggregate_kind != .none {
+		node.sub_structs = map[int]ast.SqlExpr{}
+		if node.aggregate_kind == .count {
+			node.fields = [
+				ast.StructField{
+					typ: ast.int_type
+				},
+			]
+			node.aggregate_field_type = ast.int_type
+			node.typ = ast.int_type.set_flag(.result)
+		} else {
+			aggregate_field := c.check_orm_aggregate_field(node.aggregate_kind,
+				node.aggregate_field, fields, table_sym.name, node.pos) or { return ast.void_type }
+			node.aggregate_field_type = aggregate_field.typ
+			node.fields = [
+				aggregate_field,
+			]
+			node.typ =
+				c.orm_aggregate_return_type(node.aggregate_kind, aggregate_field.typ).set_flag(.result)
+		}
+	} else {
+		node.fields = fields
+		node.sub_structs = sub_structs.move()
+	}
 
 	if node.has_where {
 		c.expr(mut node.where_expr)
@@ -269,14 +289,12 @@ fn (mut c Checker) sql_stmt_line(mut node ast.SqlStmtLine) ast.Type {
 	if !c.ensure_type_exists(node.table_expr.typ, node.pos) {
 		return ast.void_type
 	}
-	// Resolve generic table type if we're inside a generic function context
-	mut table_type := node.table_expr.typ
-	if table_type.has_flag(.generic) && c.table.cur_fn != unsafe { nil }
-		&& c.table.cur_fn.generic_names.len > 0 && c.table.cur_concrete_types.len > 0 {
-		table_type = c.table.unwrap_generic_type(table_type, c.table.cur_fn.generic_names,
-			c.table.cur_concrete_types)
-		node.table_expr.typ = table_type
+	if c.table.cur_fn != unsafe { nil } && c.table.cur_fn.generic_names.len > 0
+		&& c.table.cur_concrete_types.len > 0 && c.needs_unwrap_generic_type(node.table_expr.typ) {
+		node.table_expr.typ = c.table.unwrap_generic_type(node.table_expr.typ,
+			c.table.cur_fn.generic_names, c.table.cur_concrete_types)
 	}
+	table_type := node.table_expr.typ
 	table_sym := c.table.sym(table_type)
 
 	if !c.check_orm_table_expr_type(node.table_expr) {
@@ -302,9 +320,9 @@ fn (mut c Checker) sql_stmt_line(mut node ast.SqlStmtLine) ast.Type {
 			inserting_object_type = inserting_object.typ.deref()
 		}
 
-		// Resolve generic inserting object type if we're inside a generic function context
-		if inserting_object_type.has_flag(.generic) && c.table.cur_fn != unsafe { nil }
-			&& c.table.cur_fn.generic_names.len > 0 && c.table.cur_concrete_types.len > 0 {
+		if c.table.cur_fn != unsafe { nil } && c.table.cur_fn.generic_names.len > 0
+			&& c.table.cur_concrete_types.len > 0
+			&& c.needs_unwrap_generic_type(inserting_object_type) {
 			inserting_object_type = c.table.unwrap_generic_type(inserting_object_type,
 				c.table.cur_fn.generic_names, c.table.cur_concrete_types)
 		}
@@ -327,9 +345,18 @@ fn (mut c Checker) sql_stmt_line(mut node ast.SqlStmtLine) ast.Type {
 	info := table_sym.info as ast.Struct
 	mut fields := c.fetch_and_check_orm_fields(info, node.table_expr.pos, table_sym.name)
 
+	mut insert_fields := []ast.StructField{cap: fields.len}
 	for field in fields {
 		c.check_orm_struct_field_attrs(node, field)
+		// Preserve SQL NULL/default handling for omitted reference fields instead of
+		// inserting the V zero value and violating foreign key constraints.
+		if field.attrs.contains('references')
+			&& c.check_field_of_inserting_struct_is_uninitialized(node, field.name) {
+			continue
+		}
+		insert_fields << field
 	}
+	fields = insert_fields.clone()
 
 	mut sub_structs := map[int]ast.SqlStmtLine{}
 	non_primitive_fields := c.get_orm_non_primitive_fields(fields)
@@ -394,13 +421,14 @@ fn (mut c Checker) sql_stmt_line(mut node ast.SqlStmtLine) ast.Type {
 
 	if node.kind == .update {
 		for i, mut expr in node.update_exprs {
-			// set enum_col = .enum_val
-			if mut expr is ast.EnumVal {
-				column := node.updated_columns[i]
-				field := node.fields.filter(it.name == column)[0]
-				c.expected_type = field.typ
+			column := node.updated_columns[i]
+			matched_fields := node.fields.filter(it.name == column)
+			old_expected_type := c.expected_type
+			if matched_fields.len > 0 {
+				c.expected_type = matched_fields[0].typ
 			}
 			c.expr(mut expr)
+			c.expected_type = old_expected_type
 		}
 	}
 
@@ -421,7 +449,7 @@ fn (mut c Checker) check_orm_struct_field_attrs(node ast.SqlStmtLine, field ast.
 }
 
 fn (mut c Checker) check_orm_non_primitive_struct_field_attrs(field ast.StructField) {
-	field_type := c.table.sym(field.typ)
+	field_type := c.table.sym(field.typ.clear_flag(.option))
 	mut has_fkey_attr := false
 
 	for attr in field.attrs {
@@ -526,6 +554,11 @@ fn (mut c Checker) fetch_and_check_orm_fields(info ast.Struct, pos token.Pos, ta
 				field.pos)
 			continue
 		}
+		if c.orm_field_uses_anon_struct(field_typ) {
+			c.orm_error('field `${field.name}` uses an anonymous struct type, which ORM does not support; use a named struct, or skip it with `@[skip]` or `@[sql: \'-\']`',
+				field.pos)
+			continue
+		}
 		field_sym := c.table.sym(field_typ)
 		final_field_typ := c.table.final_type(field_typ)
 		is_primitive := final_field_typ.is_string() || final_field_typ.is_bool()
@@ -574,6 +607,21 @@ fn (mut c Checker) fetch_and_check_orm_fields(info ast.Struct, pos token.Pos, ta
 	return fields
 }
 
+fn (c &Checker) orm_field_uses_anon_struct(field_typ ast.Type) bool {
+	final_field_typ := c.table.final_type(field_typ.clear_flag(.option))
+	field_sym := c.table.sym(final_field_typ)
+	if field_sym.kind == .struct && field_sym.info is ast.Struct && field_sym.info.is_anon {
+		return true
+	}
+	if field_sym.kind != .array {
+		return false
+	}
+	array_info := field_sym.array_info()
+	elem_typ := c.table.final_type(array_info.elem_type.clear_flag(.option))
+	elem_sym := c.table.sym(elem_typ)
+	return elem_sym.kind == .struct && elem_sym.info is ast.Struct && elem_sym.info.is_anon
+}
+
 // check_sql_value_expr_is_comptime_with_natural_number_or_expr_with_int_type checks that an expression is compile-time
 // and contains an integer greater than or equal to zero or it is a runtime expression with an integer type.
 fn (mut c Checker) check_sql_value_expr_is_comptime_with_natural_number_or_expr_with_int_type(mut expr ast.Expr,
@@ -585,6 +633,67 @@ fn (mut c Checker) check_sql_value_expr_is_comptime_with_natural_number_or_expr_
 
 	if comptime_number < 0 {
 		c.orm_error('`${sql_keyword}` must be greater than or equal to zero', expr.pos())
+	}
+}
+
+fn (mut c Checker) check_orm_aggregate_field(kind ast.SqlAggregateKind, field_name string,
+	fields []ast.StructField, table_name string, pos token.Pos) ?ast.StructField {
+	field := fields.filter(it.name == field_name)
+	if field.len == 0 {
+		mut field_names := []string{cap: fields.len}
+		for item in fields {
+			field_names << item.name
+		}
+		c.orm_error(util.new_suggestion(field_name, field_names).say('`${table_name}` structure has no field with name `${field_name}`'),
+			pos)
+		return none
+	}
+	resolved_field := field[0]
+	field_type := c.table.final_type(resolved_field.typ.clear_flag(.option))
+	field_sym := c.table.sym(field_type)
+	is_time := field_sym.name == 'time.Time'
+	is_numeric := field_type.is_number()
+	is_string := field_type.is_string()
+
+	if field_sym.kind in [.array, .struct] && !is_time {
+		c.orm_error('ORM aggregate functions do not support array or sub-struct fields', pos)
+		return none
+	}
+
+	match kind {
+		.sum, .avg {
+			if !is_numeric {
+				msg := match kind {
+					.sum { '`sum` aggregate requires a numeric field' }
+					.avg { '`avg` aggregate requires a numeric field' }
+					else { 'aggregate requires a numeric field' }
+				}
+				c.orm_error(msg, pos)
+				return none
+			}
+		}
+		.min, .max {
+			if !(is_numeric || is_string || is_time) {
+				msg := match kind {
+					.min { '`min` aggregate requires a numeric, string, or time.Time field' }
+					.max { '`max` aggregate requires a numeric, string, or time.Time field' }
+					else { 'aggregate requires a numeric, string, or time.Time field' }
+				}
+				c.orm_error(msg, pos)
+				return none
+			}
+		}
+		else {}
+	}
+	return resolved_field
+}
+
+fn (_ &Checker) orm_aggregate_return_type(kind ast.SqlAggregateKind, field_type ast.Type) ast.Type {
+	return match kind {
+		.count { ast.int_type }
+		.avg { ast.f64_type.set_flag(.option) }
+		.sum, .min, .max { field_type.clear_flag(.option).set_flag(.option) }
+		.none { ast.void_type }
 	}
 }
 
@@ -666,6 +775,88 @@ fn (mut c Checker) check_expr_has_no_fn_calls_with_non_orm_return_type(expr &ast
 	}
 }
 
+// check_where_data_expr_has_no_struct_field_refs checks that expressions destined for ORM bind data
+// do not reference fields from the queried table, because ORM where clauses currently only support
+// comparing a table field with a V value, not with another table field.
+fn (mut c Checker) check_where_data_expr_has_no_struct_field_refs(table_type_symbol &ast.TypeSymbol, expr ast.Expr, op token.Kind) {
+	match expr {
+		ast.Ident {
+			if expr.kind == .unresolved && table_type_symbol.has_field(expr.name) {
+				c.orm_error('right side of the `${op}` expression cannot reference another `${table_type_symbol.name}` field; field-to-field comparisons are not supported',
+					expr.pos)
+			}
+		}
+		ast.ArrayInit {
+			for item in expr.exprs {
+				c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, item, op)
+			}
+		}
+		ast.CallExpr {
+			c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, expr.left, op)
+			for arg in expr.args {
+				c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, arg.expr, op)
+			}
+		}
+		ast.CastExpr {
+			c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, expr.expr, op)
+			c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, expr.arg, op)
+		}
+		ast.IndexExpr {
+			c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, expr.left, op)
+			c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, expr.index, op)
+		}
+		ast.InfixExpr {
+			c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, expr.left, op)
+			c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, expr.right, op)
+		}
+		ast.MapInit {
+			for key in expr.keys {
+				c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, key, op)
+			}
+			for val in expr.vals {
+				c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, val, op)
+			}
+		}
+		ast.ParExpr {
+			c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, expr.expr, op)
+		}
+		ast.PrefixExpr {
+			c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, expr.right, op)
+		}
+		ast.SelectorExpr {
+			table_name := util.strip_mod_name(table_type_symbol.name)
+			if table_type_symbol.has_field(expr.field_name) {
+				if expr.expr is ast.TypeNode
+					&& c.table.sym(expr.expr.typ).name == table_type_symbol.name {
+					c.orm_error('right side of the `${op}` expression cannot reference another `${table_type_symbol.name}` field; field-to-field comparisons are not supported',
+						expr.pos)
+				} else if expr.expr is ast.Ident && expr.expr.kind == .unresolved
+					&& expr.expr.name == table_name {
+					c.orm_error('right side of the `${op}` expression cannot reference another `${table_type_symbol.name}` field; field-to-field comparisons are not supported',
+						expr.pos)
+				}
+			}
+			c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, expr.expr, op)
+		}
+		ast.StringInterLiteral {
+			for interpolated in expr.exprs {
+				c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, interpolated,
+					op)
+			}
+		}
+		ast.StructInit {
+			for init_field in expr.init_fields {
+				c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol,
+					init_field.expr, op)
+			}
+		}
+		ast.UnsafeExpr {
+			c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, expr.expr, op)
+		}
+		else {}
+	}
+}
+
 // check_where_expr_has_no_pointless_exprs checks that an expression has no pointless expressions
 // which don't affect the result. For example, `where 3` is pointless.
 // Also, it checks that the left side of the infix expression is always the structure field.
@@ -689,16 +880,17 @@ fn (mut c Checker) check_where_expr_has_no_pointless_exprs(table_type_symbol &as
 			}
 		} else if expr.left is ast.InfixExpr || expr.left is ast.ParExpr
 			|| expr.left is ast.PrefixExpr {
-			c.check_where_expr_has_no_pointless_exprs(table_type_symbol, field_names,
-				expr.left)
+			c.check_where_expr_has_no_pointless_exprs(table_type_symbol, field_names, expr.left)
 		} else if !(expr.left is ast.SelectorExpr
 			&& c.comptime.is_comptime_selector_field_name(expr.left, 'name')) {
 			c.orm_error(has_no_field_error, expr.left.pos())
 		}
 
-		if expr.right is ast.InfixExpr || expr.right is ast.ParExpr || expr.right is ast.PrefixExpr {
-			c.check_where_expr_has_no_pointless_exprs(table_type_symbol, field_names,
-				expr.right)
+		if expr.op in [.ne, .eq, .lt, .gt, .ge, .le, .key_like, .key_ilike, .key_in, .not_in] {
+			c.check_where_data_expr_has_no_struct_field_refs(table_type_symbol, expr.right, expr.op)
+		} else if expr.right is ast.InfixExpr || expr.right is ast.ParExpr
+			|| expr.right is ast.PrefixExpr {
+			c.check_where_expr_has_no_pointless_exprs(table_type_symbol, field_names, expr.right)
 		}
 	} else if expr is ast.ParExpr {
 		c.check_where_expr_has_no_pointless_exprs(table_type_symbol, field_names, expr.expr)
@@ -737,8 +929,7 @@ fn (mut c Checker) check_orm_or_expr(mut expr ORMExpr) {
 
 	if expr.or_expr.kind == .absent {
 		if c.inside_defer {
-			c.error('ORM returns a result, so it should have an `or {}` block at the end',
-				expr.pos)
+			c.error('ORM returns a result, so it should have an `or {}` block at the end', expr.pos)
 		} else {
 			c.error('ORM returns a result, so it should have either an `or {}` block, or `!` at the end',
 				expr.pos)
@@ -798,10 +989,12 @@ fn (mut c Checker) check_orm_table_expr_type(type_node &ast.TypeNode) bool {
 // is referred to by the provided field.  For example, the `[]Child` field
 // refers to the foreign table `Child`.
 fn (c &Checker) get_field_foreign_table_type(table_field &ast.StructField) ast.Type {
-	if c.table.sym(table_field.typ).kind == .struct {
-		return table_field.typ
-	} else if c.table.sym(table_field.typ).kind == .array {
-		return c.table.sym(table_field.typ).array_info().elem_type
+	field_type := table_field.typ.clear_flag(.option)
+	field_sym := c.table.sym(field_type)
+	if field_sym.kind == .struct {
+		return field_type
+	} else if field_sym.kind == .array {
+		return field_sym.array_info().elem_type
 	} else {
 		return ast.no_type
 	}
@@ -813,10 +1006,11 @@ fn (c &Checker) get_orm_non_primitive_fields(fields []ast.StructField) []ast.Str
 	mut res := []ast.StructField{}
 	for field in fields {
 		type_with_no_option_flag := field.typ.clear_flag(.option)
-		is_struct := c.table.type_symbols[int(type_with_no_option_flag)].kind == .struct
-		is_array := c.table.sym(type_with_no_option_flag).kind == .array
+		field_sym := c.table.sym(type_with_no_option_flag)
+		is_struct := field_sym.kind == .struct
+		is_array := field_sym.kind == .array
 		is_array_with_struct_elements := is_array
-			&& c.table.sym(c.table.sym(type_with_no_option_flag).array_info().elem_type).kind == .struct
+			&& c.table.sym(field_sym.array_info().elem_type).kind == .struct
 		is_time := c.table.get_type_name(type_with_no_option_flag) == 'time.Time'
 
 		if (is_struct || is_array_with_struct_elements) && !is_time {

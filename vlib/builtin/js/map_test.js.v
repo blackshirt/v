@@ -391,9 +391,16 @@ fn test_postfix_op_directly() {
 
 fn test_map_push_directly() {
 	mut a := map[string][]string{}
+	a['aaa'] = []string{}
 	a['aaa'] << ['a', 'b', 'c']
 	assert a['aaa'].len == 3
 	assert a['aaa'] == ['a', 'b', 'c']
+}
+
+fn test_map_push_missing_key_does_not_insert() {
+	mut a := map[string][]string{}
+	a['aaa'] << 'a'
+	assert a == map[string][]string{}
 }
 
 fn test_assign_directly() {
@@ -759,6 +766,14 @@ fn test_in_map_literal() {
 	assert 1 in {
 		1: 'one'
 	}
+}
+
+fn test_in_int_keyed_map_var() {
+	my_map := {
+		1: 'A'
+	}
+	assert 1 in my_map
+	assert 2 !in my_map
 }
 
 fn test_byte_keys() {

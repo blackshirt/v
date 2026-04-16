@@ -1,6 +1,12 @@
+@[has_globals]
 module orm
 
 import time
+
+const default_tenant_filter_field_name = 'tenant_id'
+const tenant_filter_attr_name = 'tenant_filter'
+const tenant_field_attr_name = 'tenant_field'
+const ignore_tenant_filter_attr_name = 'ignore_tenant_filter'
 
 pub const num64 = [typeof[i64]().idx, typeof[u64]().idx]
 pub const nums = [
@@ -52,6 +58,20 @@ pub type Primitive = Null
 	| u64
 	| u8
 	| InfixType
+	| []bool
+	| []f32
+	| []f64
+	| []i16
+	| []i64
+	| []i8
+	| []int
+	| []string
+	| []time.Time
+	| []u16
+	| []u32
+	| []u64
+	| []u8
+	| []InfixType
 	| []Primitive
 
 pub struct Null {}
@@ -89,6 +109,15 @@ pub enum OrderType {
 	desc
 }
 
+pub enum AggregateKind {
+	none
+	count
+	sum
+	avg
+	min
+	max
+}
+
 // JoinType represents the type of SQL JOIN operation
 pub enum JoinType {
 	inner      // INNER JOIN - returns only matching rows
@@ -117,6 +146,7 @@ pub mut:
 
 pub enum SQLDialect {
 	default
+	h2
 	mysql
 	pg
 	sqlite
@@ -154,6 +184,17 @@ fn (kind OrderType) to_str() string {
 		.asc {
 			'ASC'
 		}
+	}
+}
+
+fn (kind AggregateKind) to_str() string {
+	return match kind {
+		.none { '' }
+		.count { 'COUNT(*)' }
+		.sum { 'SUM' }
+		.avg { 'AVG' }
+		.min { 'MIN' }
+		.max { 'MAX' }
 	}
 }
 
@@ -198,7 +239,7 @@ pub mut:
 }
 
 // table - Table struct
-// is_count - Either the data will be returned or an integer with the count
+// aggregate_kind - Select rows or return a single aggregate value
 // has_where - Select all or use a where expr
 // has_order - Order the results
 // order - Name of the column which will be ordered
@@ -211,19 +252,48 @@ pub mut:
 // joins - JOIN clauses for this query
 pub struct SelectConfig {
 pub mut:
-	table        Table
-	is_count     bool
-	has_where    bool
-	has_order    bool
-	order        string
-	order_type   OrderType
-	has_limit    bool
-	primary      string = 'id' // should be set if primary is different than 'id' and 'has_limit' is false
-	has_offset   bool
-	has_distinct bool
-	fields       []string
-	types        []int
-	joins        []JoinConfig // JOIN clauses for this query
+	table           Table
+	aggregate_kind  AggregateKind
+	aggregate_field string
+	has_where       bool
+	has_order       bool
+	order           string
+	order_type      OrderType
+	has_limit       bool
+	primary         string = 'id' // should be set if primary is different than 'id' and 'has_limit' is false
+	has_offset      bool
+	has_distinct    bool
+	fields          []string
+	select_exprs    []string
+	types           []int
+	joins           []JoinConfig // JOIN clauses for this query
+}
+
+struct TenantFilterState {
+mut:
+	enabled            bool
+	field_name         string
+	has_current_tenant bool
+	current_tenant     Primitive
+}
+
+struct TenantFilterScopeState {
+	enabled            bool
+	has_current_tenant bool
+	current_tenant     Primitive
+}
+
+pub struct TenantFilterConfig {
+pub:
+	enabled    bool   = true
+	field_name string = default_tenant_filter_field_name
+}
+
+__global tenant_filter_state = TenantFilterState{
+	enabled:            false
+	field_name:         default_tenant_filter_field_name
+	has_current_tenant: false
+	current_tenant:     null_primitive
 }
 
 // Interfaces gets called from the backend and can be implemented
@@ -243,6 +313,319 @@ mut:
 	create(table Table, fields []TableField) !
 	drop(table Table) !
 	last_id() int
+}
+
+// TransactionalConnection extends Connection with transaction primitives.
+pub interface TransactionalConnection {
+	Connection
+mut:
+	orm_begin() !
+	orm_commit() !
+	orm_rollback() !
+	orm_savepoint(name string) !
+	orm_rollback_to(name string) !
+	orm_release_savepoint(name string) !
+}
+
+// configure_tenant_filter configures the global ORM tenant filter behavior.
+pub fn configure_tenant_filter(config TenantFilterConfig) {
+	tenant_filter_state.enabled = config.enabled
+	tenant_filter_state.field_name = normalize_tenant_filter_field_name(config.field_name)
+}
+
+// set_tenant_filter_enabled enables or disables global tenant filtering.
+pub fn set_tenant_filter_enabled(enabled bool) {
+	tenant_filter_state.enabled = enabled
+}
+
+// set_current_tenant_id sets the current tenant id used by global tenant filtering.
+pub fn set_current_tenant_id(tenant_id Primitive) {
+	if tenant_id is Null {
+		clear_current_tenant_id()
+		return
+	}
+	tenant_filter_state.has_current_tenant = true
+	tenant_filter_state.current_tenant = tenant_id
+}
+
+// clear_current_tenant_id clears the current tenant id used by global tenant filtering.
+pub fn clear_current_tenant_id() {
+	tenant_filter_state.has_current_tenant = false
+	tenant_filter_state.current_tenant = null_primitive
+}
+
+// with_tenant executes `callback` with a temporary tenant id and enabled tenant filtering.
+pub fn with_tenant[T](tenant_id Primitive, callback fn () !T) !T {
+	saved := tenant_filter_scope_snapshot()
+	tenant_filter_state.enabled = true
+	tenant_filter_state.has_current_tenant = true
+	tenant_filter_state.current_tenant = tenant_id
+	defer {
+		tenant_filter_scope_restore(saved)
+	}
+	return callback()
+}
+
+// with_tenant_value executes `callback` with a temporary tenant id and enabled tenant filtering.
+pub fn with_tenant_value[T](tenant_id Primitive, callback fn () T) T {
+	saved := tenant_filter_scope_snapshot()
+	tenant_filter_state.enabled = true
+	tenant_filter_state.has_current_tenant = true
+	tenant_filter_state.current_tenant = tenant_id
+	defer {
+		tenant_filter_scope_restore(saved)
+	}
+	return callback()
+}
+
+// without_tenant_filter executes `callback` with tenant filtering temporarily disabled.
+pub fn without_tenant_filter[T](callback fn () !T) !T {
+	saved := tenant_filter_scope_snapshot()
+	tenant_filter_state.enabled = false
+	defer {
+		tenant_filter_scope_restore(saved)
+	}
+	return callback()
+}
+
+// without_tenant_filter_value executes `callback` with tenant filtering temporarily disabled.
+pub fn without_tenant_filter_value[T](callback fn () T) T {
+	saved := tenant_filter_scope_snapshot()
+	tenant_filter_state.enabled = false
+	defer {
+		tenant_filter_scope_restore(saved)
+	}
+	return callback()
+}
+
+// apply_tenant_filter appends the configured tenant filter condition to `where`.
+pub fn apply_tenant_filter(table Table, where QueryData) QueryData {
+	if !tenant_filter_state.enabled || !tenant_filter_state.has_current_tenant {
+		return where
+	}
+	if table_ignores_tenant_filter(table) {
+		return where
+	}
+	tenant_field_name := table_tenant_filter_field_name(table)
+	if tenant_field_name == '' || tenant_field_name in where.fields {
+		return where
+	}
+	mut where_with_tenant := clone_query_data(where)
+	original_fields_len := where_with_tenant.fields.len
+	if original_fields_len > 1 {
+		// Preserve original WHERE precedence before appending `AND tenant = ...`.
+		where_with_tenant.parentheses << [0, original_fields_len - 1]
+	}
+	if original_fields_len > 0 {
+		where_with_tenant.is_and << true
+	}
+	where_with_tenant.fields << tenant_field_name
+	where_with_tenant.data << tenant_filter_state.current_tenant
+	where_with_tenant.types << tenant_filter_primitive_type(tenant_filter_state.current_tenant)
+	where_with_tenant.kinds << .eq
+	return where_with_tenant
+}
+
+fn tenant_filter_scope_snapshot() TenantFilterScopeState {
+	return TenantFilterScopeState{
+		enabled:            tenant_filter_state.enabled
+		has_current_tenant: tenant_filter_state.has_current_tenant
+		current_tenant:     tenant_filter_state.current_tenant
+	}
+}
+
+fn tenant_filter_scope_restore(saved TenantFilterScopeState) {
+	tenant_filter_state.enabled = saved.enabled
+	tenant_filter_state.has_current_tenant = saved.has_current_tenant
+	tenant_filter_state.current_tenant = saved.current_tenant
+}
+
+fn normalize_tenant_filter_field_name(field_name string) string {
+	name := trim_attr_arg(field_name)
+	if name == '' {
+		return default_tenant_filter_field_name
+	}
+	return name
+}
+
+fn trim_attr_arg(arg string) string {
+	mut out := arg.trim_space()
+	if out.len >= 2 && ((out.starts_with("'") && out.ends_with("'"))
+		|| (out.starts_with('"') && out.ends_with('"'))) {
+		out = out[1..out.len - 1].trim_space()
+	}
+	return out
+}
+
+fn tenant_filter_array_primitive_type[T](value []T) int {
+	if value.len > 0 {
+		first := value[0]
+		return tenant_filter_primitive_type(Primitive(first))
+	}
+	return type_idx['int']
+}
+
+fn tenant_filter_primitive_type(value Primitive) int {
+	return match value {
+		bool {
+			type_idx['bool']
+		}
+		i8 {
+			type_idx['i8']
+		}
+		i16 {
+			type_idx['i16']
+		}
+		int {
+			type_idx['int']
+		}
+		i64 {
+			type_idx['i64']
+		}
+		u8 {
+			type_idx['u8']
+		}
+		u16 {
+			type_idx['u16']
+		}
+		u32 {
+			type_idx['u32']
+		}
+		u64 {
+			type_idx['u64']
+		}
+		f32 {
+			type_idx['f32']
+		}
+		f64 {
+			type_idx['f64']
+		}
+		string {
+			type_string
+		}
+		time.Time {
+			time_
+		}
+		Null {
+			type_idx['int']
+		}
+		InfixType {
+			tenant_filter_primitive_type(value.right)
+		}
+		[]Primitive {
+			if value.len > 0 {
+				tenant_filter_primitive_type(value[0])
+			} else {
+				type_idx['int']
+			}
+		}
+		[]bool {
+			tenant_filter_array_primitive_type(value)
+		}
+		[]f32 {
+			tenant_filter_array_primitive_type(value)
+		}
+		[]f64 {
+			tenant_filter_array_primitive_type(value)
+		}
+		[]i16 {
+			tenant_filter_array_primitive_type(value)
+		}
+		[]i64 {
+			tenant_filter_array_primitive_type(value)
+		}
+		[]i8 {
+			tenant_filter_array_primitive_type(value)
+		}
+		[]int {
+			tenant_filter_array_primitive_type(value)
+		}
+		[]string {
+			tenant_filter_array_primitive_type(value)
+		}
+		[]time.Time {
+			tenant_filter_array_primitive_type(value)
+		}
+		[]u16 {
+			tenant_filter_array_primitive_type(value)
+		}
+		[]u32 {
+			tenant_filter_array_primitive_type(value)
+		}
+		[]u64 {
+			tenant_filter_array_primitive_type(value)
+		}
+		[]u8 {
+			tenant_filter_array_primitive_type(value)
+		}
+		[]InfixType {
+			tenant_filter_array_primitive_type(value)
+		}
+	}
+}
+
+fn table_tenant_filter_field_name(table Table) string {
+	mut field_name := tenant_filter_state.field_name
+	for attr in table.attrs {
+		if attr_name_matches(attr.name, tenant_field_attr_name) && attr.has_arg {
+			override_field_name := trim_attr_arg(attr.arg)
+			if override_field_name != '' {
+				field_name = override_field_name
+			}
+		}
+	}
+	return normalize_tenant_filter_field_name(field_name)
+}
+
+fn table_ignores_tenant_filter(table Table) bool {
+	for attr in table.attrs {
+		if attr_name_matches(attr.name, ignore_tenant_filter_attr_name) {
+			if !attr.has_arg {
+				return true
+			}
+			if is_enabled := parse_bool_attr(attr.arg) {
+				return is_enabled
+			}
+			return true
+		}
+		if attr_name_matches(attr.name, tenant_filter_attr_name) && attr.has_arg {
+			if is_enabled := parse_bool_attr(attr.arg) {
+				return !is_enabled
+			}
+		}
+	}
+	return false
+}
+
+fn attr_name_matches(name string, expected string) bool {
+	return name == expected || name.ends_with('.${expected}')
+}
+
+fn parse_bool_attr(raw string) ?bool {
+	value := trim_attr_arg(raw).to_lower()
+	return match value {
+		'1', 'true', 'yes', 'on' {
+			true
+		}
+		'0', 'false', 'no', 'off' {
+			false
+		}
+		else {
+			none
+		}
+	}
+}
+
+fn clone_query_data(data QueryData) QueryData {
+	return QueryData{
+		fields:      data.fields.clone()
+		data:        data.data.clone()
+		types:       data.types.clone()
+		parentheses: data.parentheses.map(it.clone())
+		kinds:       data.kinds.clone()
+		auto_fields: data.auto_fields.clone()
+		is_and:      data.is_and.clone()
+	}
 }
 
 // Generates an sql stmt, from universal parameter
@@ -298,7 +681,7 @@ pub fn orm_stmt_gen(sql_dialect SQLDialect, table Table, q string, kind StmtKind
 
 			are_values_empty := values.len == 0
 
-			if sql_dialect == .sqlite && are_values_empty {
+			if sql_dialect in [.sqlite, .pg, .h2] && are_values_empty {
 				str += 'DEFAULT VALUES'
 			} else {
 				str += '('
@@ -382,11 +765,24 @@ pub fn orm_select_gen(cfg SelectConfig, q string, num bool, qm string, start_pos
 		str += 'DISTINCT '
 	}
 
-	if cfg.is_count {
-		str += 'COUNT(*)'
+	if cfg.aggregate_kind != .none {
+		if cfg.aggregate_kind == .count {
+			str += cfg.aggregate_kind.to_str()
+		} else {
+			str += '${cfg.aggregate_kind.to_str()}(${q}${cfg.aggregate_field}${q})'
+		}
 	} else {
 		for i, field in cfg.fields {
-			str += '${q}${field}${q}'
+			select_expr := if cfg.select_exprs.len > i && cfg.select_exprs[i] != '' {
+				cfg.select_exprs[i]
+			} else {
+				field
+			}
+			if select_expr == field {
+				str += '${q}${field}${q}'
+			} else {
+				str += select_expr
+			}
 			if i < cfg.fields.len - 1 {
 				str += ', '
 			}
@@ -503,6 +899,26 @@ fn gen_where_clause(where QueryData, q string, qm string, num bool, mut c &int) 
 // fields - See TableField
 // sql_from_v - Function which maps type indices to sql type names
 // alternative - Needed for msdb
+fn parse_table_attr_fields(table Table, attr VAttribute, valid_sql_field_names []string) ![]string {
+	if attr.arg == '' || attr.kind != .string {
+		return error("${attr.name} attribute needs to be in the format [${attr.name}: 'f1, f2, f3']")
+	}
+	mut attr_fields := []string{}
+	for raw_field_name in attr.arg.split(',') {
+		field_name := raw_field_name.trim_space()
+		if field_name == '' {
+			return error("${attr.name} attribute needs to be in the format [${attr.name}: 'f1, f2, f3']")
+		}
+		if field_name !in valid_sql_field_names {
+			return error("table `${table.name}` has no field's name: `${field_name}`")
+		}
+		if field_name !in attr_fields {
+			attr_fields << field_name
+		}
+	}
+	return attr_fields
+}
+
 pub fn orm_table_gen(sql_dialect SQLDialect, table Table, q string, defaults bool, def_unique_len int, fields []TableField, sql_from_v fn (int) !string,
 	alternative bool) !string {
 	mut str := 'CREATE TABLE IF NOT EXISTS ${q}${table.name}${q} ('
@@ -519,6 +935,7 @@ pub fn orm_table_gen(sql_dialect SQLDialect, table Table, q string, defaults boo
 	mut table_comment := ''
 	mut field_comments := map[string]string{}
 	mut index_fields := []string{}
+	mut unique_key_fields := [][]string{}
 
 	valid_sql_field_names := fields.map(sql_field_name(it))
 
@@ -530,19 +947,21 @@ pub fn orm_table_gen(sql_dialect SQLDialect, table Table, q string, defaults boo
 				}
 			}
 			'index' {
-				if attr.arg != '' && attr.kind == .string {
-					index_strings := attr.arg.split(',')
-					for i in index_strings {
-						x := i.trim_space()
-						if x !in valid_sql_field_names {
-							return error("table `${table.name}` has no field's name: `${x}`")
-						}
-						if x.len > 0 && x !in index_fields {
-							index_fields << x
-						}
+				attr_fields := parse_table_attr_fields(table, attr, valid_sql_field_names) or {
+					return err
+				}
+				for field_name in attr_fields {
+					if field_name !in index_fields {
+						index_fields << field_name
 					}
-				} else {
-					return error("index attribute needs to be in the format [index: 'f1, f2, f3']")
+				}
+			}
+			'unique_key' {
+				attr_fields := parse_table_attr_fields(table, attr, valid_sql_field_names) or {
+					return err
+				}
+				if attr_fields.len > 0 {
+					unique_key_fields << attr_fields
 				}
 			}
 			else {}
@@ -554,6 +973,7 @@ pub fn orm_table_gen(sql_dialect SQLDialect, table Table, q string, defaults boo
 			continue
 		}
 		mut default_val := field.default_val
+		mut has_default := default_val != ''
 		mut nullable := field.nullable
 		mut is_unique := false
 		mut is_skip := false
@@ -585,6 +1005,9 @@ pub fn orm_table_gen(sql_dialect SQLDialect, table Table, q string, defaults boo
 				'unique' {
 					if attr.arg != '' {
 						if attr.kind == .string {
+							if attr.arg !in unique {
+								unique[attr.arg] = []string{}
+							}
 							unique[attr.arg] << field_name
 							continue
 						} else if attr.kind == .number {
@@ -602,11 +1025,13 @@ pub fn orm_table_gen(sql_dialect SQLDialect, table Table, q string, defaults boo
 					col_typ = attr.arg.str()
 				}
 				'default' {
+					has_default = true
 					if default_val == '' {
 						default_val = attr.arg.str()
 					}
 				}
 				'references' {
+					nullable = true
 					if attr.arg == '' {
 						if field.name.ends_with('_id') {
 							references_table = field.name.trim_right('_id')
@@ -654,8 +1079,13 @@ pub fn orm_table_gen(sql_dialect SQLDialect, table Table, q string, defaults boo
 			return error('Unknown type (${field.typ}) for field ${field.name} in struct ${table.name}')
 		}
 		stmt = '${q}${field_name}${q} ${col_typ}'
-		if defaults && default_val != '' {
-			stmt += ' DEFAULT ${default_val}'
+		if defaults && has_default {
+			if default_val != '' {
+				stmt += ' DEFAULT ${default_val}'
+			} else {
+				// Handle @[default: ''] - explicitly set DEFAULT '' for the column
+				stmt += " DEFAULT ''"
+			}
 		}
 		if sql_dialect == .mysql && field_comment != '' {
 			stmt += " COMMENT '${field_comment}'"
@@ -690,6 +1120,13 @@ pub fn orm_table_gen(sql_dialect SQLDialect, table Table, q string, defaults boo
 			fs << '/* ${k} */UNIQUE(${tmp.join(', ')})'
 		}
 	}
+	for key_fields in unique_key_fields {
+		mut tmp := []string{}
+		for field_name in key_fields {
+			tmp << '${q}${field_name}${q}'
+		}
+		fs << 'UNIQUE(${tmp.join(', ')})'
+	}
 
 	if primary != '' {
 		fs << 'PRIMARY KEY(${q}${primary}${q})'
@@ -709,7 +1146,7 @@ pub fn orm_table_gen(sql_dialect SQLDialect, table Table, q string, defaults boo
 	}
 	str += ';'
 
-	if sql_dialect == .pg {
+	if sql_dialect in [.pg, .h2] {
 		if table_comment != '' {
 			str += "\nCOMMENT ON TABLE \"${table.name}\" IS '${table_comment}';"
 		}
@@ -717,7 +1154,7 @@ pub fn orm_table_gen(sql_dialect SQLDialect, table Table, q string, defaults boo
 			str += "\nCOMMENT ON COLUMN \"${table.name}\".\"${f}\" IS '${c}';"
 		}
 	}
-	if (sql_dialect == .pg || sql_dialect == .sqlite) && index_fields.len > 0 {
+	if sql_dialect in [.pg, .sqlite, .h2] && index_fields.len > 0 {
 		str += '\nCREATE INDEX "idx_${table.name}" ON "${table.name}" ("'
 		str += index_fields.join('","')
 		str += '");'
@@ -765,6 +1202,16 @@ fn sql_field_name(field TableField) string {
 		}
 	}
 	return name
+}
+
+// Get's the SQL select expression for a field.
+fn sql_field_select_expr(field TableField) string {
+	for attr in field.attrs {
+		if attr.name == 'sql_select' && attr.has_arg {
+			return trim_attr_arg(attr.arg)
+		}
+	}
+	return sql_field_name(field)
 }
 
 // needed for backend functions

@@ -1,6 +1,7 @@
 module compress
 
 #flag -I @VEXEROOT/thirdparty/zip
+#define MINIZ_NO_ZLIB_COMPATIBLE_NAMES
 #include "miniz.h"
 
 pub const max_size = u64(1 << 31)
@@ -69,8 +70,8 @@ pub fn decompress_with_callback(data []u8, cb ChunkCallback, userdata voidptr, f
 		cb:       cb
 		userdata: userdata
 	}
-	status := C.tinfl_decompress_mem_to_callback(cbdata.data, &cbdata.size, c_cb_for_decompress_mem,
-		&cbdata, flags)
+	status := C.tinfl_decompress_mem_to_callback(cbdata.data, &cbdata.size,
+		c_cb_for_decompress_mem, &cbdata, flags)
 	if status == 0 {
 		return error('decompression error')
 	}

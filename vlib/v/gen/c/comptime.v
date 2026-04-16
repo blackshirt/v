@@ -8,13 +8,46 @@ import v.ast
 import v.util
 import v.type_resolver
 
+fn (g &Gen) veb_context_html_arg() string {
+	if g.fn_decl.params.len < 2 {
+		return 'ctx'
+	}
+	ctx_param := g.fn_decl.params[1]
+	ctx_sym := g.table.final_sym(ctx_param.typ)
+	if ctx_sym.name == 'veb.Context' {
+		return ctx_param.name
+	}
+	if ctx_sym.info is ast.Struct {
+		for embed in ctx_sym.info.embeds {
+			embed_sym := g.table.sym(embed)
+			if embed_sym.name == 'veb.Context' {
+				dot := if ctx_param.typ.is_ptr() { '->' } else { '.' }
+				return '&${ctx_param.name}${dot}${embed_sym.embed_name()}'
+			}
+		}
+	}
+	return ctx_param.name
+}
+
 fn (mut g Gen) comptime_selector(node ast.ComptimeSelector) {
-	is_interface_field := g.table.sym(node.left_type).kind == .interface
+	left_type := g.resolved_expr_type(node.left, node.left_type)
+	if node.is_method && g.comptime.comptime_for_method != unsafe { nil } {
+		g.selector_expr(ast.SelectorExpr{
+			pos:                 node.pos
+			expr:                node.left
+			expr_type:           left_type
+			typ:                 g.type_resolver.get_type(node)
+			field_name:          g.comptime.comptime_for_method.name
+			has_hidden_receiver: true
+		})
+		return
+	}
+	is_interface_field := g.table.sym(left_type).kind == .interface
 	if is_interface_field {
 		g.write('*(')
 	}
 	g.expr(node.left)
-	if g.unwrap_generic(node.left_type).is_ptr() {
+	if g.unwrap_generic(left_type).is_ptr() {
 		g.write('->')
 	} else {
 		g.write('.')
@@ -23,7 +56,7 @@ fn (mut g Gen) comptime_selector(node ast.ComptimeSelector) {
 	if node.is_name && node.field_expr is ast.SelectorExpr {
 		if node.field_expr.expr is ast.Ident {
 			if node.field_expr.expr.name == g.comptime.comptime_for_field_var {
-				_, field_name := g.type_resolver.get_comptime_selector_var_type(node)
+				_, field_name := g.resolve_comptime_selector_field(node, left_type)
 				g.write(c_name(field_name))
 				if is_interface_field {
 					g.write(')')
@@ -39,8 +72,41 @@ fn (mut g Gen) comptime_selector(node ast.ComptimeSelector) {
 }
 
 fn (mut g Gen) gen_comptime_selector(expr ast.ComptimeSelector) string {
-	arrow_or_dot := if expr.left_type.is_ptr() { '->' } else { '.' }
-	return '${expr.left.str()}${arrow_or_dot}${g.comptime.comptime_for_field_value.name}'
+	left_type := g.resolved_expr_type(expr.left, expr.left_type)
+	arrow_or_dot := if left_type.is_ptr() { '->' } else { '.' }
+	mut field_name := if expr.typ_key.contains('|') {
+		expr.typ_key.all_after('|')
+	} else {
+		g.comptime.comptime_for_field_value.name
+	}
+	if expr.field_expr is ast.SelectorExpr {
+		if expr.field_expr.expr is ast.Ident
+			&& expr.field_expr.expr.name == g.comptime.comptime_for_field_var {
+			field_name = g.comptime.comptime_for_field_value.name
+		}
+	}
+	return '${expr.left.str()}${arrow_or_dot}${field_name}'
+}
+
+fn (mut g Gen) resolve_comptime_selector_field(node ast.ComptimeSelector, left_type ast.Type) (ast.StructField, string) {
+	mut field_name := if node.typ_key.contains('|') {
+		node.typ_key.all_after('|')
+	} else {
+		g.comptime.comptime_for_field_value.name
+	}
+	if node.field_expr is ast.SelectorExpr && g.comptime.comptime_for_field_var != ''
+		&& g.comptime.comptime_for_method_var == '' && node.field_expr.field_name == 'name' {
+		if node.field_expr.expr is ast.Ident
+			&& node.field_expr.expr.name == g.comptime.comptime_for_field_var {
+			field_name = g.comptime.comptime_for_field_value.name
+		}
+	}
+	resolved_left_type := g.unwrap_generic(g.recheck_concrete_type(left_type))
+	left_sym := g.table.sym(resolved_left_type)
+	field := g.table.find_field_with_embeds(left_sym, field_name) or {
+		g.error('`${node.left}` has no field named `${field_name}`', node.left.pos())
+	}
+	return field, field_name
 }
 
 fn (mut g Gen) comptime_call(mut node ast.ComptimeCall) {
@@ -90,7 +156,7 @@ fn (mut g Gen) comptime_call(mut node ast.ComptimeCall) {
 		}
 
 		ret_sym := g.table.sym(g.fn_decl.return_type)
-		fn_name := g.fn_decl.name.replace('.', '__') + node.pos.pos.str()
+		fn_name := g.fn_decl.name.replace('.', '__').to_lower() + node.pos.pos.str()
 		is_x_vweb := ret_sym.cname == 'x__vweb__Result'
 		is_veb := ret_sym.cname == 'veb__Result'
 
@@ -120,11 +186,9 @@ fn (mut g Gen) comptime_call(mut node ast.ComptimeCall) {
 		if is_html {
 			// return a vweb or x.vweb html template
 			if is_veb {
-				ctx_name := g.fn_decl.params[1].name
-				g.writeln('veb__Context_html(${ctx_name}, _tmpl_res_${fn_name});')
+				g.writeln('veb__Context_html(${g.veb_context_html_arg()}, _tmpl_res_${fn_name});')
 			} else if is_x_vweb {
-				ctx_name := g.fn_decl.params[1].name
-				g.writeln('x__vweb__Context_html(${ctx_name}, _tmpl_res_${fn_name});')
+				g.writeln('x__vweb__Context_html(${g.veb_context_html_arg()}, _tmpl_res_${fn_name});')
 			} else {
 				// old vweb:
 				app_name := g.fn_decl.params[0].name
@@ -142,12 +206,16 @@ fn (mut g Gen) comptime_call(mut node ast.ComptimeCall) {
 		}
 		return
 	}
-	left_type := g.unwrap_generic(node.left_type)
+	mut left_type := g.resolved_expr_type(node.left, node.left_type)
+	if left_type == 0 {
+		left_type = node.left_type
+	}
+	left_type = g.unwrap_generic(g.recheck_concrete_type(left_type))
 	sym := g.table.sym(left_type)
 	g.trace_autofree('// \$method call. sym="${sym.name}"')
 	if node.method_name == 'method' {
 		// `app.$method()`
-		m := sym.find_method(g.comptime.comptime_for_method.name) or { return }
+		m := g.table.find_method(sym, g.comptime.comptime_for_method.name) or { return }
 		/*
 		vals := m.attrs[0].split('/')
 		args := vals.filter(it.starts_with(':')).map(it[1..])
@@ -192,13 +260,21 @@ fn (mut g Gen) comptime_call(mut node ast.ComptimeCall) {
 			}
 		}
 		// TODO: check argument types
-		g.write('${g.cc_type(left_type, false)}_${g.comptime.comptime_for_method.name}(')
+		// Use the declaring receiver type for the symbol prefix, so alias
+		// comptime calls can dispatch to inherited methods.
+		method_receiver_type := g.unwrap_generic(m.params[0].typ)
+		g.write('${g.cc_type(method_receiver_type, false)}_${g.comptime.comptime_for_method.name}(')
 
 		// try to see if we need to pass a pointer
 		if mut node.left is ast.Ident {
 			if mut node.left.obj is ast.Var {
-				if m.params[0].typ.is_ptr() && !node.left.obj.typ.is_ptr() {
+				if m.params[0].typ.is_ptr() && !node.left.obj.typ.is_ptr()
+					&& !node.left.obj.is_auto_deref {
 					g.write('&')
+				} else if !m.params[0].typ.is_ptr() && node.left.obj.typ.is_ptr() {
+					g.write('*'.repeat(node.left.obj.typ.nr_muls()))
+				} else if !m.params[0].typ.is_ptr() && node.left.obj.is_auto_deref {
+					g.write('*')
 				}
 			}
 		}
@@ -217,7 +293,7 @@ fn (mut g Gen) comptime_call(mut node ast.ComptimeCall) {
 				mut d_count := 0
 				for d_i in i .. m.params.len {
 					g.write('*(${g.styp(m.params[i].typ)}*)builtin__array_get(')
-					g.expr(node.args[i - 1].expr)
+					g.expr(ast.Expr(node.args[i - 1].expr))
 					g.write(', ${d_count})')
 
 					if d_i < m.params.len - 1 {
@@ -294,15 +370,26 @@ fn (mut g Gen) comptime_call(mut node ast.ComptimeCall) {
 fn cgen_attrs(attrs []ast.Attr) []string {
 	mut res := []string{cap: attrs.len}
 	for attr in attrs {
-		// we currently don't quote 'arg' (otherwise we could just use `s := attr.str()`)
 		mut s := attr.name
-		if attr.arg.len > 0 {
-			s += ': ${attr.arg}'
+		if attr.has_arg {
+			mut arg := attr.arg
+			if attr.kind == .string {
+				quote := if attr.quote == `"` { '"' } else { "'" }
+				arg = '${quote}${arg}${quote}'
+			}
+			s += ': ${arg}'
 		}
-		if attr.kind == .string {
-			s = escape_quotes(s)
-		}
-		res << '_S("${s}")'
+		res << '_S("${cescape_nonascii(util.smart_quote(s, false))}")'
+	}
+	return res
+}
+
+fn cgen_vattrs(attrs []ast.Attr) []string {
+	mut res := []string{cap: attrs.len}
+	for attr in attrs {
+		name := cescape_nonascii(util.smart_quote(attr.name, false))
+		arg := cescape_nonascii(util.smart_quote(attr.arg, false))
+		res << '((VAttribute){.name=_S("${name}"),.has_arg=${attr.has_arg},.arg=_S("${arg}"),.kind=AttributeKind__${attr.kind}})'
 	}
 	return res
 }
@@ -319,15 +406,111 @@ fn (mut g Gen) comptime_at(node ast.AtExpr) {
 
 // gen_branch_context_string generate current branches context string.
 // context include generic types, `$for`.
+fn (mut g Gen) recover_specialized_generic_context_for(fn_name string) ([]string, []ast.Type) {
+	if fn_name == '' {
+		return []string{}, []ast.Type{}
+	}
+	if t_idx := fn_name.index('_T_') {
+		if t_idx <= 0 {
+			return []string{}, []ast.Type{}
+		}
+	} else {
+		return []string{}, []ast.Type{}
+	}
+	for generic_fn in g.file.generic_fns {
+		if generic_fn.generic_names.len == 0 {
+			// Methods on generic structs may have no explicit generic_names
+			// but still have receiver generics.
+			if !(generic_fn.is_method && generic_fn.receiver.typ.has_flag(.generic)) {
+				continue
+			}
+		}
+		for base_name in [generic_fn.name, generic_fn.fkey()] {
+			if !fn_name.starts_with(base_name + '_T_') {
+				continue
+			}
+			mut generic_names := generic_fn.generic_names.clone()
+			fkey := generic_fn.fkey()
+			for concrete_types in g.table.fn_generic_types[fkey] {
+				if concrete_types.any(it.has_flag(.generic)) {
+					continue
+				}
+				if g.generic_fn_name(concrete_types, base_name) != fn_name {
+					if !generic_fn.is_method {
+						continue
+					}
+					receiver_generic_names := g.table.generic_type_names(generic_fn.receiver.typ)
+					if receiver_generic_names.len == 0
+						|| concrete_types.len <= receiver_generic_names.len {
+						continue
+					}
+					method_only_concrete_types := concrete_types[receiver_generic_names.len..]
+					if g.generic_fn_name(method_only_concrete_types, base_name) != fn_name {
+						continue
+					}
+				}
+				if generic_fn.is_method && concrete_types.len > generic_names.len {
+					receiver_generic_names := g.table.generic_type_names(generic_fn.receiver.typ)
+					if receiver_generic_names.len > 0 {
+						mut effective_generic_names := []string{cap: receiver_generic_names.len +
+							generic_names.len}
+						for name in receiver_generic_names {
+							if name !in effective_generic_names {
+								effective_generic_names << name
+							}
+						}
+						for name in generic_names {
+							if name !in effective_generic_names {
+								effective_generic_names << name
+							}
+						}
+						if effective_generic_names.len == concrete_types.len {
+							generic_names = effective_generic_names.clone()
+						}
+					}
+				}
+				if generic_names.len == concrete_types.len {
+					return generic_names, concrete_types
+				}
+				return []string{}, concrete_types
+			}
+		}
+	}
+	return []string{}, []ast.Type{}
+}
+
 fn (mut g Gen) gen_branch_context_string() string {
 	mut arr := []string{}
 
 	// gen `T=int,X=string`
-	if g.cur_fn != unsafe { nil } && g.cur_fn.generic_names.len > 0
-		&& g.cur_fn.generic_names.len == g.cur_concrete_types.len {
-		for i in 0 .. g.cur_fn.generic_names.len {
-			arr << g.cur_fn.generic_names[i] + '=' +
-				util.strip_main_name(g.table.type_to_str(g.cur_concrete_types[i]))
+	mut generic_names := if g.cur_fn != unsafe { nil } {
+		g.cur_fn.generic_names.clone()
+	} else {
+		[]string{}
+	}
+	// For methods on generic structs with no explicit generic params,
+	// extract generic names from the receiver type (mirrors checker's effective_fn_generic_names).
+	if generic_names.len == 0 && g.cur_fn != unsafe { nil } && g.cur_fn.is_method
+		&& g.cur_fn.receiver.typ.has_flag(.generic) {
+		generic_names = g.table.generic_type_names(g.cur_fn.receiver.typ)
+	}
+	mut concrete_types := g.cur_concrete_types.clone()
+	if generic_names.len == 0 || generic_names.len != concrete_types.len {
+		recovered_generic_names, recovered_concrete_types := g.recover_specialized_generic_context_for(if g.cur_fn != unsafe { nil } {
+			g.cur_fn.name
+		} else {
+			''
+		})
+		if recovered_generic_names.len > 0
+			&& recovered_generic_names.len == recovered_concrete_types.len {
+			generic_names = recovered_generic_names.clone()
+			concrete_types = recovered_concrete_types.clone()
+		}
+	}
+	if generic_names.len > 0 && generic_names.len == concrete_types.len {
+		for i in 0 .. generic_names.len {
+			arr << generic_names[i] + '=' +
+				util.strip_main_name(g.table.type_to_str(concrete_types[i]))
 		}
 	}
 
@@ -370,6 +553,50 @@ fn (mut g Gen) gen_branch_context_string() string {
 	return arr.join(',')
 }
 
+fn (g &Gen) can_preserve_comptime_if_condition_in_c(cond ast.Expr) bool {
+	match cond {
+		ast.BoolLiteral {
+			return true
+		}
+		ast.Ident {
+			// CPU architecture and compiler conditions are safe to preserve as C
+			// preprocessor checks because they are mutually exclusive categories
+			// derived from real compiler intrinsics (see cheaders.v).
+			// This is important for Android builds where one C file is compiled
+			// by the NDK for multiple architectures (arm64, armv7a, x86, x86_64).
+			return cond.name in ast.valid_comptime_if_platforms
+				|| cond.name in ast.valid_comptime_if_compilers
+		}
+		ast.ParExpr {
+			return g.can_preserve_comptime_if_condition_in_c(cond.expr)
+		}
+		ast.PrefixExpr {
+			return cond.op == .not && g.can_preserve_comptime_if_condition_in_c(cond.right)
+		}
+		ast.InfixExpr {
+			return cond.op in [.and, .logical_or]
+				&& g.can_preserve_comptime_if_condition_in_c(cond.left)
+				&& g.can_preserve_comptime_if_condition_in_c(cond.right)
+		}
+		ast.PostfixExpr {
+			return cond.op == .question && cond.expr is ast.Ident
+		}
+		else {
+			return false
+		}
+	}
+}
+
+fn (g &Gen) comptime_if_condition_for_c(cond ast.Expr, result ast.ComptTimeCondResult) string {
+	if g.pref.output_cross_c || g.can_preserve_comptime_if_condition_in_c(cond) {
+		return result.c_str
+	}
+	// For normal C generation, honor the branch result that V already resolved.
+	// Re-evaluating built-in comptime conditions in the C preprocessor can pick
+	// a different branch than the V checker, e.g. `termux` vs `linux`.
+	return if result.val { '1' } else { '0' }
+}
+
 fn (mut g Gen) comptime_if(node ast.IfExpr) {
 	tmp_var := g.new_tmp_var()
 	mut inferred_typ := node.typ
@@ -403,7 +630,7 @@ fn (mut g Gen) comptime_if(node ast.IfExpr) {
 	// we only save the first node, when there is embedded $if
 	old_curr_comptime_node := g.curr_comptime_node
 	if !g.comptime.inside_comptime_if {
-		g.curr_comptime_node = &node
+		g.curr_comptime_node = ast.Expr(node)
 	}
 	defer {
 		g.curr_comptime_node = old_curr_comptime_node
@@ -426,9 +653,14 @@ fn (mut g Gen) comptime_if(node ast.IfExpr) {
 			// `g.table.comptime_is_true` are the branch condition results set by `checker`
 			is_true = comptime_is_true
 		} else {
-			g.error('checker error: condition result idx string not found => [${idx_str}]',
-				node.branches[i].cond.pos())
-			return
+			// No checker data found for this key. This can happen when:
+			// 1. The markused walker spuriously registers generic instantiations
+			//    that the checker never evaluated (e.g. from dead comptime branches).
+			// 2. Type alias resolution causes key mismatches.
+			// Default all branches to false (#if 0) since the function body
+			// is either dead code or will be generated correctly by another
+			// instantiation with matching types.
+			is_true = ast.ComptTimeCondResult{}
 		}
 		if !node.has_else || i < node.branches.len - 1 {
 			if i == 0 {
@@ -436,9 +668,7 @@ fn (mut g Gen) comptime_if(node ast.IfExpr) {
 			} else {
 				g.write('#elif ')
 			}
-			// directly use `checker` evaluate results
-			// for `cgen`, we can use `is_true.c_str` or `is_true.value` here
-			g.writeln('${is_true.c_str}')
+			g.writeln(g.comptime_if_condition_for_c(branch.cond, is_true))
 			$if debug_comptime_branch_context ? {
 				g.writeln('/* ${node.branches[i].cond} | generic=[${comptime_branch_context_str}] */')
 			}
@@ -453,61 +683,64 @@ fn (mut g Gen) comptime_if(node ast.IfExpr) {
 			g.defer_ifdef += expr_str
 		}
 		if node.is_expr {
-			len := branch.stmts.len
-			if len > 0 {
-				last := branch.stmts.last() as ast.ExprStmt
-				if len > 1 {
-					g.indent++
-					g.writeln('{')
-					g.stmts(branch.stmts[..len - 1])
-					g.set_current_pos_as_last_stmt_pos()
-					prev_skip_stmt_pos := g.skip_stmt_pos
-					g.skip_stmt_pos = true
-					if is_opt_or_result {
-						tmp_var2 := g.new_tmp_var()
-						g.write('{ ${g.base_type(inferred_typ)} ${tmp_var2} = ')
-						g.stmt(last)
-						g.writeln('builtin___result_ok(&(${g.base_type(inferred_typ)}[]) { ${tmp_var2} }, (_result*)(&${tmp_var}), sizeof(${g.base_type(inferred_typ)}));')
-						g.writeln('}')
-					} else {
-						g.write('\t${tmp_var} = ')
-						g.stmt(last)
-					}
-					g.skip_stmt_pos = prev_skip_stmt_pos
-					g.writeln2(';', '}')
-					g.indent--
-					g.write_defer_stmts(branch.scope, false, branch.pos)
-				} else {
-					g.indent++
-					g.set_current_pos_as_last_stmt_pos()
-					prev_skip_stmt_pos := g.skip_stmt_pos
-					g.skip_stmt_pos = true
-					if is_opt_or_result {
-						tmp_var2 := g.new_tmp_var()
-						base_styp := g.base_type(inferred_typ)
-						g.write('{ ${base_styp} ${tmp_var2} = ')
-						g.stmt(last)
-						g.writeln('builtin___result_ok(&(${base_styp}[]) { ${tmp_var2} }, (_result*)(&${tmp_var}), sizeof(${base_styp}));')
-						g.writeln('}')
-					} else if is_array_fixed {
-						tmp_var2 := g.new_tmp_var()
-						base_styp := g.base_type(inferred_typ)
-						g.write('{ ${base_styp} ${tmp_var2} = ')
-						g.stmt(last)
-						if g.out.last_n(2).contains(';') {
-							g.go_back(2)
+			if is_true.val {
+				g.bind_comptime_if_generic_types(branch.cond)
+				len := branch.stmts.len
+				if len > 0 {
+					last := branch.stmts.last() as ast.ExprStmt
+					if len > 1 {
+						g.indent++
+						g.writeln('{')
+						g.stmts(branch.stmts[..len - 1])
+						g.set_current_pos_as_last_stmt_pos()
+						prev_skip_stmt_pos := g.skip_stmt_pos
+						g.skip_stmt_pos = true
+						if is_opt_or_result {
+							tmp_var2 := g.new_tmp_var()
+							g.write('{ ${g.base_type(inferred_typ)} ${tmp_var2} = ')
+							g.stmt(last)
+							g.writeln('builtin___result_ok(&(${g.base_type(inferred_typ)}[]) { ${tmp_var2} }, (_result*)(&${tmp_var}), sizeof(${g.base_type(inferred_typ)}));')
+							g.writeln('}')
+						} else {
+							g.write('\t${tmp_var} = ')
+							g.stmt(last)
 						}
-						g.writeln(';')
-						g.writeln2('memcpy(&${tmp_var}, &${tmp_var2}, sizeof(${base_styp}));',
-							'}')
+						g.skip_stmt_pos = prev_skip_stmt_pos
+						g.writeln2(';', '}')
+						g.indent--
+						g.write_defer_stmts(branch.scope, false, branch.pos)
 					} else {
-						g.write('${tmp_var} = ')
-						g.stmt(last)
+						g.indent++
+						g.set_current_pos_as_last_stmt_pos()
+						prev_skip_stmt_pos := g.skip_stmt_pos
+						g.skip_stmt_pos = true
+						if is_opt_or_result {
+							tmp_var2 := g.new_tmp_var()
+							base_styp := g.base_type(inferred_typ)
+							g.write('{ ${base_styp} ${tmp_var2} = ')
+							g.stmt(last)
+							g.writeln('builtin___result_ok(&(${base_styp}[]) { ${tmp_var2} }, (_result*)(&${tmp_var}), sizeof(${base_styp}));')
+							g.writeln('}')
+						} else if is_array_fixed {
+							tmp_var2 := g.new_tmp_var()
+							base_styp := g.base_type(inferred_typ)
+							g.write('{ ${base_styp} ${tmp_var2} = ')
+							g.stmt(last)
+							if g.out.last_n(2).contains(';') {
+								g.go_back(2)
+							}
+							g.writeln(';')
+							g.writeln2('memcpy(&${tmp_var}, &${tmp_var2}, sizeof(${base_styp}));',
+								'}')
+						} else {
+							g.write('${tmp_var} = ')
+							g.stmt(last)
+						}
+						g.skip_stmt_pos = prev_skip_stmt_pos
+						g.writeln(';')
+						g.indent--
+						g.write_defer_stmts(branch.scope, false, branch.pos)
 					}
-					g.skip_stmt_pos = prev_skip_stmt_pos
-					g.writeln(';')
-					g.indent--
-					g.write_defer_stmts(branch.scope, false, branch.pos)
 				}
 			}
 		} else {
@@ -517,6 +750,7 @@ fn (mut g Gen) comptime_if(node ast.IfExpr) {
 				g.writeln('{')
 			}
 			if is_true.val || g.pref.output_cross_c {
+				g.bind_comptime_if_generic_types(branch.cond)
 				g.stmts(branch.stmts)
 			}
 			if should_create_scope {
@@ -533,9 +767,53 @@ fn (mut g Gen) comptime_if(node ast.IfExpr) {
 	}
 }
 
+fn (mut g Gen) bind_comptime_if_generic_types(cond ast.Expr) {
+	match cond {
+		ast.ParExpr {
+			g.bind_comptime_if_generic_types(cond.expr)
+		}
+		ast.PrefixExpr {
+			g.bind_comptime_if_generic_types(cond.right)
+		}
+		ast.Likely {
+			g.bind_comptime_if_generic_types(cond.expr)
+		}
+		ast.InfixExpr {
+			match cond.op {
+				.and, .logical_or {
+					g.bind_comptime_if_generic_types(cond.left)
+					g.bind_comptime_if_generic_types(cond.right)
+				}
+				.key_is {
+					if cond.right is ast.TypeNode {
+						g.type_resolver.bind_matching_generic_type(g.get_expr_type(cond.left),
+							cond.right.typ)
+					}
+				}
+				.key_in {
+					if cond.right is ast.ArrayInit {
+						left_type := g.get_expr_type(cond.left)
+						for expr in cond.right.exprs {
+							if expr is ast.TypeNode
+								&& g.type_resolver.bind_matching_generic_type(left_type, expr.typ) {
+								break
+							}
+						}
+					}
+				}
+				else {}
+			}
+		}
+		else {}
+	}
+}
+
 fn (mut g Gen) get_expr_type(cond ast.Expr) ast.Type {
 	match cond {
 		ast.Ident {
+			if cond.name in g.type_resolver.type_map {
+				return g.type_resolver.get_ct_type_or_default(cond.name, ast.void_type)
+			}
 			return g.unwrap_generic(g.type_resolver.get_type_or_default(cond, cond.obj.typ))
 		}
 		ast.TypeNode {
@@ -621,17 +899,30 @@ fn (mut g Gen) pop_comptime_info() {
 }
 
 fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
-	sym := if node.typ != g.field_data_type {
-		g.table.final_sym(g.unwrap_generic(node.typ))
+	resolved_typ := if node.expr !is ast.EmptyExpr {
+		g.unwrap_generic(g.recheck_concrete_type(g.resolved_expr_type(node.expr, node.typ)))
+	} else if node.typ != g.field_data_type {
+		g.unwrap_generic(node.typ)
 	} else {
-		g.table.final_sym(g.comptime.comptime_for_field_type)
+		g.comptime.comptime_for_field_type
 	}
-	g.writeln('/* \$for ${node.val_var} in ${sym.name}.${node.kind.str()} */ {')
+	// When the resolved type is FieldData, the expression refers to a comptime
+	// field variable (e.g. `$for f3 in f.fields` where `f` comes from an outer
+	// `$for f in T.fields`). In that case use the actual field type from the
+	// outer comptime loop instead of the FieldData descriptor type.
+	for_typ := if resolved_typ == g.field_data_type {
+		g.comptime.comptime_for_field_type
+	} else {
+		resolved_typ
+	}
+	sym := g.table.final_sym(for_typ)
+	iter_sym_name := if node.kind == .methods { g.table.sym(for_typ).name } else { sym.name }
+	g.writeln('/* \$for ${node.val_var} in ${iter_sym_name}.${node.kind.str()} */ {')
 	g.indent++
 	mut i := 0
 	old_defer_stmts := g.defer_stmts
 	if node.kind == .methods {
-		methods := sym.get_methods()
+		methods := g.table.get_type_methods(for_typ)
 		if methods.len > 0 {
 			g.writeln('FunctionData ${node.val_var} = {0};')
 		}
@@ -655,17 +946,23 @@ fn (mut g Gen) comptime_for(node ast.ComptimeFor) {
 			}
 			g.comptime.comptime_for_method = unsafe { &method }
 			g.comptime.comptime_for_method_var = node.val_var
+			g.comptime.comptime_for_method_ret_type = method.return_type
 			g.writeln('/* method ${i} : ${method.name} */ {')
 			g.writeln('\t${node.val_var}.name = _S("${method.name}");')
 			mlocation := util.cescaped_path(util.path_styled_for_error_messages(method.file))
 			g.writeln('\t${node.val_var}.location = _S("${mlocation}:${method.name_pos.line_nr + 1}:${method.name_pos.col}");')
 			if method.attrs.len == 0 {
 				g.writeln('\t${node.val_var}.attrs = builtin____new_array_with_default(0, 0, sizeof(string), 0);')
+				g.writeln('\t${node.val_var}.attributes = builtin____new_array_with_default(0, 0, sizeof(VAttribute), 0);')
 			} else {
 				attrs := cgen_attrs(method.attrs)
+				vattrs := cgen_vattrs(method.attrs)
 				g.writeln(
 					'\t${node.val_var}.attrs = builtin__new_array_from_c_array(${attrs.len}, ${attrs.len}, sizeof(string), _MOV((string[${attrs.len}]){' +
 					attrs.join(', ') + '}));\n')
+				g.writeln(
+					'\t${node.val_var}.attributes = builtin__new_array_from_c_array(${vattrs.len}, ${vattrs.len}, sizeof(VAttribute), _MOV((VAttribute[${vattrs.len}]){' +
+					vattrs.join(', ') + '}));\n')
 			}
 			if method.params.len < 2 {
 				// 0 or 1 (the receiver) args
@@ -906,6 +1203,19 @@ fn (mut g Gen) comptime_selector_type(node ast.SelectorExpr) ast.Type {
 	g.prevent_sum_type_unwrapping_once = false
 
 	mut typ := g.type_resolver.get_type(node.expr)
+	if node.expr is ast.Ident && node.expr.obj is ast.Var {
+		ct_var := node.expr.obj.ct_type_var
+		if ct_var == .generic_param || ct_var == .generic_var {
+			if scope_var := node.expr.scope.find_var(node.expr.name) {
+				if scope_var.ct_type_var == ct_var && g.cur_fn != unsafe { nil }
+					&& g.cur_fn.generic_names.len > 0 {
+					// For generic_param/generic_var, node.obj.typ is a stale
+					// copy from checker time. Use the refreshed scope var.
+					typ = scope_var.typ
+				}
+			}
+		}
+	}
 	if node.expr.is_auto_deref_var() {
 		if node.expr is ast.Ident {
 			if node.expr.obj is ast.Var {
@@ -1038,9 +1348,9 @@ fn (mut g Gen) comptime_match(node ast.MatchExpr) {
 			// `g.table.comptime_is_true` are the branch condition results set by `checker`
 			is_true = comptime_is_true
 		} else {
-			g.error('checker error: match branch result idx string not found => [${idx_str}]',
-				branch.pos)
-			return
+			// No checker data - spurious instantiation or alias mismatch.
+			// Default all branches to false (#if 0).
+			is_true = ast.ComptTimeCondResult{}
 		}
 		if !branch.is_else {
 			if i == 0 {

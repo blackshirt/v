@@ -567,8 +567,10 @@ pub fn expand_tilde_to_home(path string) string {
 // If `path` already exists, it will be overwritten.
 pub fn write_file(path string, text string) ! {
 	mut f := create(path)!
+	defer {
+		f.close()
+	}
 	unsafe { f.write_full_buffer(text.str, usize(text.len))! }
-	f.close()
 }
 
 pub struct ExecutableNotFoundError {
@@ -913,13 +915,25 @@ pub fn cache_dir() string {
 }
 
 // data_dir returns the path to a *writable* user-specific folder, suitable for writing application data.
-// See: https://specifications.freedesktop.org/basedir-spec/latest/ .
-// There is a single base directory relative to which user-specific data files should be written.
-// This directory is defined by the environment variable `$XDG_DATA_HOME`.
-// If `$XDG_DATA_HOME` is either not set or empty, a default equal to
-// `$HOME/.local/share` should be used.
+// On Windows, that is `%LocalAppData%`, or if that is not available,
+// `%USERPROFILE%/AppData/Local`.
+// On the rest, that is `$XDG_DATA_HOME`, or if that is not available,
+// `$HOME/.local/share`.
 // Note: This function ensures that the returned directory exists and panics if directory creation fails.
 pub fn data_dir() string {
+	$if windows {
+		local_app_data := getenv('LocalAppData')
+		if local_app_data != '' {
+			create_folder_when_it_does_not_exist(local_app_data)
+			return local_app_data
+		}
+		home := home_dir()
+		if home != '' {
+			dir := join_path(home, 'AppData', 'Local')
+			create_folder_when_it_does_not_exist(dir)
+			return dir
+		}
+	}
 	return xdg_home_folder('XDG_DATA_HOME', '.local/share')
 }
 
@@ -1002,8 +1016,12 @@ pub fn vtmp_dir() string {
 
 fn default_vmodules_path() string {
 	hdir := home_dir()
-	res := join_path_single(hdir, '.vmodules')
-	return res
+	if hdir != '' {
+		return join_path_single(hdir, '.vmodules')
+	}
+	// In some hermetic CI/sandbox environments HOME/USERPROFILE is intentionally
+	// missing. Fall back to a writable user-specific temp path.
+	return join_path_single(vtmp_dir(), '.vmodules')
 }
 
 // vmodules_dir returns the path to a folder, where v stores its global modules.

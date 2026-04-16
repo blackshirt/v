@@ -1048,7 +1048,8 @@ fn (mut g Gen) allocate_string(s string, opsize i32, typ RelocType) i32 {
 // allocates a buffer variable: name, size of stored type (nb of bytes), nb of items
 fn (mut g Gen) allocate_array(name string, size i32, items i32) i32 { // TODO: remove when proper strings are implemented, should not be used
 	g.println('; allocate array `${name}` item-size:${size} items:${items}:')
-	pos := g.cg.cg_allocate_stack_var(name, 4, i64(items)) // store the length of the array on the stack in a 4 byte var
+	pos :=
+		g.cg.cg_allocate_stack_var(name, 4, i64(items)) // store the length of the array on the stack in a 4 byte var
 	g.stack_var_pos += (size * items) // reserve space on the stack for the items
 	return pos
 }
@@ -1067,6 +1068,24 @@ fn (mut g Gen) eval_str_lit_escape_codes(str_lit ast.StringLiteral) string {
 		return str_lit.val
 	} else {
 		return g.eval_escape_codes(str_lit.val)
+	}
+}
+
+fn encode_utf8(mut buffer []u8, cp u32) {
+	if cp <= 0x7F {
+		buffer << u8(cp)
+	} else if cp <= 0x7FF {
+		buffer << u8(0xC0 | (cp >> 6))
+		buffer << u8(0x80 | (cp & 0x3F))
+	} else if cp <= 0xFFFF {
+		buffer << u8(0xE0 | (cp >> 12))
+		buffer << u8(0x80 | ((cp >> 6) & 0x3F))
+		buffer << u8(0x80 | (cp & 0x3F))
+	} else if cp <= 0x10FFFF {
+		buffer << u8(0xF0 | (cp >> 18))
+		buffer << u8(0x80 | ((cp >> 12) & 0x3F))
+		buffer << u8(0x80 | ((cp >> 6) & 0x3F))
+		buffer << u8(0x80 | (cp & 0x3F))
 	}
 }
 
@@ -1106,13 +1125,21 @@ fn (mut g Gen) eval_escape_codes(str string) string {
 			}
 			`u` {
 				i++
-				utf8 := strconv.parse_int(str[i..i + 4], 16, 16) or {
+				cp := strconv.parse_int(str[i..i + 4], 16, 32) or {
 					g.n_error('${@LOCATION} invalid \\u escape code (${str[i..i + 4]})')
 					0
 				}
 				i += 4
-				buffer << u8(utf8)
-				buffer << u8(utf8 >> 8)
+				encode_utf8(mut buffer, u32(cp))
+			}
+			`U` {
+				i++
+				cp := strconv.parse_int(str[i..i + 8], 16, 32) or {
+					g.n_error('${@LOCATION} invalid \\U escape code (${str[i..i + 8]})')
+					0
+				}
+				i += 8
+				encode_utf8(mut buffer, u32(cp))
 			}
 			`v` {
 				buffer << `\v`
@@ -1174,7 +1201,7 @@ fn (mut g Gen) gen_to_string(reg Register, typ ast.Type) {
 	g.println('; to_string }')
 }
 
-fn (mut g Gen) gen_var_to_string(reg Register, expr ast.Expr, var Var, config VarConfig) {
+fn (mut g Gen) gen_var_to_string(reg Register, _expr ast.Expr, var Var, config VarConfig) {
 	g.println('; var_to_string {')
 	typ := g.get_type_from_var(var)
 	if typ == ast.rune_type_idx {

@@ -29,6 +29,7 @@ fn C._vcleanup()
 @[noreturn]
 pub fn exit(code int) {
 	C.exit(code)
+	for {}
 }
 
 // at_exit registers a fn callback, that will be called at normal process termination.
@@ -71,6 +72,11 @@ fn v_fixed_index(i int, len int) int {
 		}
 	}
 	return i
+}
+
+@[inline; markused]
+fn v_fixed_index_ni(i int, len int) int {
+	return v_fixed_index(v_ni_index(i, len), len)
 }
 
 // arguments returns the command line arguments, used for starting the current program as a V array of strings.

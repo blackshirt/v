@@ -1323,8 +1323,7 @@ fn (mut c Amd64) cg_gen_syscall(node ast.CallExpr) {
 				c.mov64(ra[i], i64(1))
 			}
 			else {
-				c.g.v_error('Unknown syscall ${expr.type_name()} argument type ${expr}',
-					node.pos)
+				c.g.v_error('Unknown syscall ${expr.type_name()} argument type ${expr}', node.pos)
 				return
 			}
 		}
@@ -2251,16 +2250,13 @@ pub fn (mut c Amd64) cg_call_fn(node ast.CallExpr) {
 				c.movabs(.rcx, i64(0xffffffffffffffff - (u64(1) << (return_size * 8)) + 1))
 				c.bitand_reg(.rdx, .rcx)
 				c.bitor_reg(.rdx, .rax)
-				c.cg_mov_reg_to_var(LocalVar{ offset: return_pos, typ: ast.i64_type_idx },
-					.reg2)
+				c.cg_mov_reg_to_var(LocalVar{ offset: return_pos, typ: ast.i64_type_idx }, .reg2)
 			}
 			8 {
-				c.cg_mov_reg_to_var(LocalVar{ offset: return_pos, typ: ast.i64_type_idx },
-					.reg0)
+				c.cg_mov_reg_to_var(LocalVar{ offset: return_pos, typ: ast.i64_type_idx }, .reg0)
 			}
 			9...15 {
-				c.cg_mov_reg_to_var(LocalVar{ offset: return_pos, typ: ast.i64_type_idx },
-					.reg0)
+				c.cg_mov_reg_to_var(LocalVar{ offset: return_pos, typ: ast.i64_type_idx }, .reg0)
 				c.cg_mov_var_to_reg(.reg0, LocalVar{
 					offset: return_pos
 					typ:    ast.i64_type_idx
@@ -2270,16 +2266,13 @@ pub fn (mut c Amd64) cg_call_fn(node ast.CallExpr) {
 				c.movabs(.rcx, i64(0xffffffffffffffff - (u64(1) << (return_size * 8)) + 1))
 				c.bitand_reg(.rax, .rcx)
 				c.bitor_reg(.rax, .rdx)
-				c.cg_mov_reg_to_var(LocalVar{ offset: return_pos, typ: ast.i64_type_idx },
-					.reg0,
+				c.cg_mov_reg_to_var(LocalVar{ offset: return_pos, typ: ast.i64_type_idx }, .reg0,
 					offset: 8
 				)
 			}
 			16 {
-				c.cg_mov_reg_to_var(LocalVar{ offset: return_pos, typ: ast.i64_type_idx },
-					.reg0)
-				c.cg_mov_reg_to_var(LocalVar{ offset: return_pos, typ: ast.i64_type_idx },
-					.reg2,
+				c.cg_mov_reg_to_var(LocalVar{ offset: return_pos, typ: ast.i64_type_idx }, .reg0)
+				c.cg_mov_reg_to_var(LocalVar{ offset: return_pos, typ: ast.i64_type_idx }, .reg2,
 					offset: 8
 				)
 			}
@@ -2300,11 +2293,12 @@ pub fn (mut c Amd64) cg_call_fn(node ast.CallExpr) {
 
 fn (mut c Amd64) cg_call_builtin(name Builtin) i64 {
 	c.g.println('; call builtin `${name}`: (the 0 will get replaced)')
-	call_addr := c.call(0) // the 0 will get replaced by the right addr when the function will be generated
+	call_addr :=
+		c.call(0) // the 0 will get replaced by the right addr when the function will be generated
 	return call_addr
 }
 
-fn (mut c Amd64) assign_struct_var(ident_var IdentVar, typ ast.Type, s i32) {
+fn (mut c Amd64) assign_struct_var(ident_var IdentVar, _typ ast.Type, s i32) {
 	// struct types bigger are passed around as a pointer in rax.
 	// we need to dereference and copy the contents one after the other
 	if ident_var !is LocalVar {
@@ -2418,7 +2412,7 @@ fn (mut c Amd64) cg_assign_var(var IdentVar, raw_type ast.Type) {
 
 // Could be nice to have left as an expr to be able to take all int assigns
 // TODO: may have a problem if the literal is bigger than max_i64: needs u64
-fn (mut c Amd64) assign_ident_int_lit(node ast.AssignStmt, i i32, int_lit ast.IntegerLiteral, left ast.Ident) {
+fn (mut c Amd64) assign_ident_int_lit(node ast.AssignStmt, _i i32, int_lit ast.IntegerLiteral, left ast.Ident) {
 	match node.op {
 		.decl_assign {
 			c.cg_allocate_stack_var(left.name, 8, i64(int_lit.val.int()))
@@ -2604,8 +2598,7 @@ fn (mut c Amd64) assign_ident_right_expr(node ast.AssignStmt, i i32, right ast.E
 					if right.is_fixed {
 						dest := c.g.allocate_by_type(name, ast.voidptr_type_idx)
 						c.g.expr(right)
-						c.cg_mov_reg_to_var(LocalVar{dest, ast.voidptr_type_idx, name},
-							.reg0)
+						c.cg_mov_reg_to_var(LocalVar{dest, ast.voidptr_type_idx, name}, .reg0)
 					} else if right.exprs.len == 0 {
 						// TODO: remove when ArrayInit for dynarrays will be solved in the transformer
 						// `[]int{len: 6, cap:10, init:22}`
@@ -4009,7 +4002,8 @@ fn (mut c Amd64) cg_fn_decl(node ast.FnDecl) {
 		name := params[i].name
 		offset := c.g.allocate_by_type(name, params[i].typ)
 		// copy
-		c.mov_ssereg_to_var(LocalVar{ offset: offset, typ: params[i].typ }, c.fn_arg_sse_registers[idx])
+		c.mov_ssereg_to_var(LocalVar{ offset: offset, typ: params[i].typ },
+			c.fn_arg_sse_registers[idx])
 	}
 	// define args on stack
 	mut offset := i32(-2)
@@ -4292,8 +4286,7 @@ fn (mut c Amd64) copy_struct_to_struct(field ast.StructField, f_offset i32, data
 		f2_ts := c.g.table.sym(field2.typ)
 
 		if f2_ts.info is ast.Struct {
-			c.copy_struct_to_struct(field2, f_offset + f2_offset, data_offset + f2_offset,
-				var)
+			c.copy_struct_to_struct(field2, f_offset + f2_offset, data_offset + f2_offset, var)
 		} else {
 			c.mov_reg(.rdx, .rax)
 			c.add(.rdx, data_offset + f2_offset)
@@ -4342,10 +4335,172 @@ fn (mut c Amd64) cg_convert_rune_to_string(reg Register, buffer i32, var Var, co
 
 	match reg.amd64() {
 		.rax {
-			c.mov_var_to_reg(.rdi, var, config)
-			c.g.write8(0x48)
-			c.g.write8(0x89)
-			c.g.write8(0x38)
+			c.mov_reg(.rdi, .rax)
+			c.mov_var_to_reg(.rbx, var, config)
+			end_label := c.g.labels.new_label()
+
+			one_byte_label := c.g.labels.new_label()
+			c.cmp(.rbx, ._32, 0x80)
+			one_byte_jmp := c.cjmp(.jl)
+			c.g.labels.patches << LabelPatch{
+				id:  one_byte_label
+				pos: one_byte_jmp
+			}
+
+			two_byte_label := c.g.labels.new_label()
+			c.cmp(.rbx, ._32, 0x800)
+			two_byte_jmp := c.cjmp(.jl)
+			c.g.labels.patches << LabelPatch{
+				id:  two_byte_label
+				pos: two_byte_jmp
+			}
+
+			three_byte_label := c.g.labels.new_label()
+			c.cmp(.rbx, ._32, 0x10000)
+			three_byte_jmp := c.cjmp(.jl)
+			c.g.labels.patches << LabelPatch{
+				id:  three_byte_label
+				pos: three_byte_jmp
+			}
+
+			valid_four_byte_label := c.g.labels.new_label()
+			c.cmp(.rbx, ._32, 0x110000)
+			valid_four_byte_jmp := c.cjmp(.jl)
+			c.g.labels.patches << LabelPatch{
+				id:  valid_four_byte_label
+				pos: valid_four_byte_jmp
+			}
+
+			invalid_to_end_jmp := c.jmp(0)
+			c.g.labels.patches << LabelPatch{
+				id:  end_label
+				pos: invalid_to_end_jmp
+			}
+
+			c.g.labels.addrs[valid_four_byte_label] = c.g.pos()
+
+			// 4-byte utf8: 11110xxx 10xxxxxx 10xxxxxx 10xxxxxx
+			c.mov_reg(.rdx, .rbx)
+			c.mov(.rcx, 18)
+			c.shr_reg(.rdx, .rcx)
+			c.mov(.rsi, 0xf0)
+			c.bitor_reg(.rdx, .rsi)
+			c.mov_store(.rdi, .rdx, ._8)
+			c.add8(.rdi, 1)
+
+			c.mov_reg(.rdx, .rbx)
+			c.mov(.rcx, 12)
+			c.shr_reg(.rdx, .rcx)
+			c.mov(.rsi, 0x3f)
+			c.bitand_reg(.rdx, .rsi)
+			c.mov(.rsi, 0x80)
+			c.bitor_reg(.rdx, .rsi)
+			c.mov_store(.rdi, .rdx, ._8)
+			c.add8(.rdi, 1)
+
+			c.mov_reg(.rdx, .rbx)
+			c.mov(.rcx, 6)
+			c.shr_reg(.rdx, .rcx)
+			c.mov(.rsi, 0x3f)
+			c.bitand_reg(.rdx, .rsi)
+			c.mov(.rsi, 0x80)
+			c.bitor_reg(.rdx, .rsi)
+			c.mov_store(.rdi, .rdx, ._8)
+			c.add8(.rdi, 1)
+
+			c.mov_reg(.rdx, .rbx)
+			c.mov(.rsi, 0x3f)
+			c.bitand_reg(.rdx, .rsi)
+			c.mov(.rsi, 0x80)
+			c.bitor_reg(.rdx, .rsi)
+			c.mov_store(.rdi, .rdx, ._8)
+			c.add8(.rdi, 1)
+
+			mut to_end_jmp := c.jmp(0)
+			c.g.labels.patches << LabelPatch{
+				id:  end_label
+				pos: to_end_jmp
+			}
+
+			// 1-byte utf8: 0xxxxxxx
+			c.g.labels.addrs[one_byte_label] = c.g.pos()
+			c.mov_reg(.rdx, .rbx)
+			c.mov_store(.rdi, .rdx, ._8)
+			c.add8(.rdi, 1)
+			to_end_jmp = c.jmp(0)
+			c.g.labels.patches << LabelPatch{
+				id:  end_label
+				pos: to_end_jmp
+			}
+
+			// 2-byte utf8: 110xxxxx 10xxxxxx
+			c.g.labels.addrs[two_byte_label] = c.g.pos()
+			c.mov_reg(.rdx, .rbx)
+			c.mov(.rcx, 6)
+			c.shr_reg(.rdx, .rcx)
+			c.mov(.rsi, 0xc0)
+			c.bitor_reg(.rdx, .rsi)
+			c.mov_store(.rdi, .rdx, ._8)
+			c.add8(.rdi, 1)
+
+			c.mov_reg(.rdx, .rbx)
+			c.mov(.rsi, 0x3f)
+			c.bitand_reg(.rdx, .rsi)
+			c.mov(.rsi, 0x80)
+			c.bitor_reg(.rdx, .rsi)
+			c.mov_store(.rdi, .rdx, ._8)
+			c.add8(.rdi, 1)
+			to_end_jmp = c.jmp(0)
+			c.g.labels.patches << LabelPatch{
+				id:  end_label
+				pos: to_end_jmp
+			}
+
+			// 3-byte utf8: 1110xxxx 10xxxxxx 10xxxxxx
+			c.g.labels.addrs[three_byte_label] = c.g.pos()
+			valid_three_byte_label := c.g.labels.new_label()
+			c.cmp(.rbx, ._32, 0xd800)
+			valid_three_byte_jmp := c.cjmp(.jl)
+			c.g.labels.patches << LabelPatch{
+				id:  valid_three_byte_label
+				pos: valid_three_byte_jmp
+			}
+			c.cmp(.rbx, ._32, 0xe000)
+			invalid_surrogate_jmp := c.cjmp(.jl)
+			c.g.labels.patches << LabelPatch{
+				id:  end_label
+				pos: invalid_surrogate_jmp
+			}
+			c.g.labels.addrs[valid_three_byte_label] = c.g.pos()
+			c.mov_reg(.rdx, .rbx)
+			c.mov(.rcx, 12)
+			c.shr_reg(.rdx, .rcx)
+			c.mov(.rsi, 0xe0)
+			c.bitor_reg(.rdx, .rsi)
+			c.mov_store(.rdi, .rdx, ._8)
+			c.add8(.rdi, 1)
+
+			c.mov_reg(.rdx, .rbx)
+			c.mov(.rcx, 6)
+			c.shr_reg(.rdx, .rcx)
+			c.mov(.rsi, 0x3f)
+			c.bitand_reg(.rdx, .rsi)
+			c.mov(.rsi, 0x80)
+			c.bitor_reg(.rdx, .rsi)
+			c.mov_store(.rdi, .rdx, ._8)
+			c.add8(.rdi, 1)
+
+			c.mov_reg(.rdx, .rbx)
+			c.mov(.rsi, 0x3f)
+			c.bitand_reg(.rdx, .rsi)
+			c.mov(.rsi, 0x80)
+			c.bitor_reg(.rdx, .rsi)
+			c.mov_store(.rdi, .rdx, ._8)
+			c.add8(.rdi, 1)
+
+			c.g.labels.addrs[end_label] = c.g.pos()
+			c.mov(.rdx, 0)
+			c.mov_store(.rdi, .rdx, ._8)
 		}
 		else {
 			c.g.n_error('${@LOCATION} rune to string not implemented for ${reg}')
@@ -5015,6 +5170,6 @@ fn (mut c Amd64) cg_gen_cast_expr(expr ast.CastExpr) {
 }
 
 // Temporary!
-fn (mut c Amd64) adr(r Arm64Register, delta i32) {
+fn (mut c Amd64) adr(_r Arm64Register, _delta i32) {
 	c.g.n_error('`adr` instruction not supported with amd64')
 }

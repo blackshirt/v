@@ -34,6 +34,7 @@ fn (mut state State) update(line string) {
 }
 
 const tmpl_str_end = "')\n"
+const tmpl_literal_dollar_marker = '__V_TMPL_LITERAL_DOLLAR__'
 
 // check HTML open tag `<name attr="x" >`
 fn is_html_open_tag(name string, s string) bool {
@@ -74,20 +75,370 @@ fn is_html_open_tag(name string, s string) bool {
 	}
 }
 
+fn is_tmpl_ident_start(c u8) bool {
+	return c.is_letter() || c == `_`
+}
+
+fn is_tmpl_ident_part(c u8) bool {
+	return c.is_letter() || c.is_digit() || c == `_`
+}
+
+fn find_tmpl_balanced_end(line string, start int, open u8, close u8) int {
+	if start >= line.len || line[start] != open {
+		return -1
+	}
+	mut depth := 0
+	mut i := start
+	mut in_single_quote := false
+	mut in_double_quote := false
+	for i < line.len {
+		ch := line[i]
+		if ch == `\\` {
+			i += 2
+			continue
+		}
+		if in_single_quote {
+			if ch == `'` {
+				in_single_quote = false
+			}
+			i++
+			continue
+		}
+		if in_double_quote {
+			if ch == `"` {
+				in_double_quote = false
+			}
+			i++
+			continue
+		}
+		if ch == `'` {
+			in_single_quote = true
+			i++
+			continue
+		}
+		if ch == `"` {
+			in_double_quote = true
+			i++
+			continue
+		}
+		if ch == open {
+			depth++
+		} else if ch == close {
+			depth--
+			if depth == 0 {
+				return i + 1
+			}
+		}
+		i++
+	}
+	return -1
+}
+
+fn find_tmpl_complex_at_expr_end(line string, start int) int {
+	mut i := start
+	if i >= line.len || !is_tmpl_ident_start(line[i]) {
+		return -1
+	}
+	i++
+	for i < line.len && is_tmpl_ident_part(line[i]) {
+		i++
+	}
+	for i + 1 < line.len && line[i] == `.` && is_tmpl_ident_start(line[i + 1]) {
+		i += 2
+		for i < line.len && is_tmpl_ident_part(line[i]) {
+			i++
+		}
+	}
+	mut has_complex_suffix := false
+	for i < line.len {
+		if line[i] == `[` {
+			expr_end := find_tmpl_balanced_end(line, i, `[`, `]`)
+			if expr_end == -1 {
+				return -1
+			}
+			i = expr_end
+			has_complex_suffix = true
+			continue
+		}
+		if line[i] == `(` {
+			expr_end := find_tmpl_balanced_end(line, i, `(`, `)`)
+			if expr_end == -1 {
+				return -1
+			}
+			i = expr_end
+			has_complex_suffix = true
+			continue
+		}
+		if i + 1 < line.len && line[i] == `.` && is_tmpl_ident_start(line[i + 1]) {
+			i += 2
+			for i < line.len && is_tmpl_ident_part(line[i]) {
+				i++
+			}
+			continue
+		}
+		break
+	}
+	if !has_complex_suffix {
+		return -1
+	}
+	return i
+}
+
+fn rewrite_complex_template_at_expressions(line string) string {
+	mut b := strings.new_builder(line.len + 8)
+	mut i := 0
+	for i < line.len {
+		if line[i] != `@` {
+			b.write_u8(line[i])
+			i++
+			continue
+		}
+		if i > 0 && line[i - 1] == `\\` {
+			b.write_u8(`@`)
+			i++
+			continue
+		}
+		if i + 1 >= line.len {
+			b.write_u8(`@`)
+			i++
+			continue
+		}
+		next := line[i + 1]
+		if next == `@` || next == `{` {
+			b.write_u8(`@`)
+			i++
+			continue
+		}
+		if next == `(` {
+			expr_end := find_tmpl_balanced_end(line, i + 1, `(`, `)`)
+			if expr_end != -1 && expr_end > i + 2 {
+				b.write_string('@{')
+				b.write_string(line[i + 2..expr_end - 1])
+				b.write_u8(`}`)
+				i = expr_end
+				continue
+			}
+			b.write_u8(`@`)
+			i++
+			continue
+		}
+		expr_end := find_tmpl_complex_at_expr_end(line, i + 1)
+		if expr_end != -1 {
+			b.write_string('@{')
+			b.write_string(line[i + 1..expr_end])
+			b.write_u8(`}`)
+			i = expr_end
+			continue
+		}
+		b.write_u8(`@`)
+		i++
+	}
+	return b.str()
+}
+
+fn escape_bare_tmpl_dollar_interpolations(line string) string {
+	mut sb := strings.new_builder(line.len)
+	mut i := 0
+	for i < line.len {
+		if i + 1 < line.len && ((line[i] == `@` && line[i + 1] == `{`)
+			|| (line[i] == `$` && line[i + 1] == `{`)) {
+			expr_end := find_tmpl_balanced_end(line, i + 1, `{`, `}`)
+			if expr_end != -1 {
+				sb.write_string(line[i..expr_end])
+				i = expr_end
+				continue
+			}
+		}
+		if line[i] == `$` && i + 1 < line.len && is_tmpl_ident_start(line[i + 1]) {
+			sb.write_string(tmpl_literal_dollar_marker)
+			i++
+			continue
+		}
+		sb.write_u8(line[i])
+		i++
+	}
+	return sb.str()
+}
+
 fn insert_template_code(fn_name string, tmpl_str_start string, line string) string {
 	// HTML, may include `@var`
 	// escaped by cgen, unless it's a `veb.RawHtml` string
 	trailing_bs := tmpl_str_end + 'sb_${fn_name}.write_u8(92)\n' + tmpl_str_start
-	replace_pairs := ['\\', '\\\\', r"'", "\\'", r'@@', r'@', r'@', r'$', r'$$', r'\@']
-	mut rline := line.replace_each(replace_pairs)
+	literal_dollar := tmpl_str_end + 'sb_${fn_name}.write_u8(36)\n' + tmpl_str_start
+	rewritten_line :=
+		escape_bare_tmpl_dollar_interpolations(rewrite_complex_template_at_expressions(line))
+	mut sb := strings.new_builder(rewritten_line.len + 16)
+	mut i := 0
+	for i < rewritten_line.len {
+		ch := rewritten_line[i]
+		match ch {
+			`\\` {
+				sb.write_string('\\\\')
+				i++
+				continue
+			}
+			`'` {
+				sb.write_string("\\'")
+				i++
+				continue
+			}
+			`@` {
+				if i + 1 < rewritten_line.len && rewritten_line[i + 1] == `@` {
+					sb.write_u8(`@`)
+					i += 2
+					continue
+				}
+				// Keep package-version URLs like `jquery@3.6.0` unchanged.
+				if i + 1 < rewritten_line.len && rewritten_line[i + 1].is_digit() {
+					sb.write_u8(`@`)
+					i++
+					continue
+				}
+				sb.write_u8(`$`)
+				i++
+				continue
+			}
+			`$` {
+				if i + 1 < rewritten_line.len && rewritten_line[i + 1] == `$` {
+					sb.write_string(r'\@')
+					i += 2
+					continue
+				}
+			}
+			else {}
+		}
+		sb.write_u8(ch)
+		i++
+	}
+	mut rline := sb.str()
+	rline = normalize_keyword_template_interpolations(rline)
 	comptime_call_str := rline.find_between('\${', '}')
 	if comptime_call_str.contains("\\'") {
 		rline = rline.replace(comptime_call_str, comptime_call_str.replace("\\'", r"'"))
 	}
+	rline = rline.replace(tmpl_literal_dollar_marker, literal_dollar)
 	if rline.ends_with('\\') {
 		rline = rline[0..rline.len - 2] + trailing_bs
 	}
 	return rline
+}
+
+fn normalize_keyword_template_interpolations(line string) string {
+	mut sb := strings.new_builder(line.len)
+	mut i := 0
+	for i < line.len {
+		ch := line[i]
+		if ch == `$` && i > 0 && line[i - 1] == `\\` {
+			sb.write_u8(ch)
+			i++
+			continue
+		}
+		if ch == `$` && i + 1 < line.len && (line[i + 1].is_letter() || line[i + 1] == `_`) {
+			mut j := i + 1
+			for j < line.len && (line[j].is_letter() || line[j].is_digit() || line[j] == `_`) {
+				j++
+			}
+			name := line[i + 1..j]
+			if token.is_key(name) {
+				// Force keyword names into the escaped identifier form to avoid parser/scanner issues.
+				sb.write_string('\${@${name}}')
+				i = j
+				continue
+			}
+		}
+		sb.write_u8(ch)
+		i++
+	}
+	return sb.str()
+}
+
+struct TmplControlLine {
+	header              string
+	inline_body         string
+	has_inline_body     bool
+	opens_brace_block   bool
+	closes_inline_block bool
+}
+
+fn parse_tmpl_control_line(line string, directive string) TmplControlLine {
+	pos := line.index(directive) or { return TmplControlLine{} }
+	remainder := line[pos + directive.len..].trim_space()
+	if remainder.len == 0 {
+		return TmplControlLine{}
+	}
+	if remainder.ends_with('{') {
+		return TmplControlLine{
+			header:            remainder[..remainder.len - 1].trim_space()
+			opens_brace_block: true
+		}
+	}
+	if !remainder.ends_with('}') {
+		return TmplControlLine{
+			header: remainder
+		}
+	}
+	close_pos := remainder.last_index('}') or { return TmplControlLine{
+		header: remainder
+	} }
+	open_pos := remainder.index('{') or { return TmplControlLine{
+		header: remainder
+	} }
+	return TmplControlLine{
+		header:              remainder[..open_pos].trim_space()
+		inline_body:         remainder[open_pos + 1..close_pos].trim_space()
+		has_inline_body:     open_pos + 1 < close_pos
+		opens_brace_block:   true
+		closes_inline_block: true
+	}
+}
+
+fn parse_tmpl_else_line(line string) TmplControlLine {
+	pos := line.index('@else') or { return TmplControlLine{} }
+	remainder := line[pos + '@else'.len..].trim_space()
+	if remainder.len == 0 {
+		return TmplControlLine{
+			header: 'else'
+		}
+	}
+	if remainder.ends_with('{') {
+		suffix := remainder[..remainder.len - 1].trim_space()
+		return TmplControlLine{
+			header:            if suffix.len == 0 { 'else' } else { 'else ${suffix}' }
+			opens_brace_block: true
+		}
+	}
+	if !remainder.ends_with('}') {
+		return TmplControlLine{
+			header: if remainder.len == 0 { 'else' } else { 'else ${remainder}' }
+		}
+	}
+	close_pos := remainder.last_index('}') or {
+		return TmplControlLine{
+			header: if remainder.len == 0 { 'else' } else { 'else ${remainder}' }
+		}
+	}
+	open_pos := remainder.index('{') or {
+		return TmplControlLine{
+			header: if remainder.len == 0 { 'else' } else { 'else ${remainder}' }
+		}
+	}
+	suffix := remainder[..open_pos].trim_space()
+	return TmplControlLine{
+		header:              if suffix.len == 0 { 'else' } else { 'else ${suffix}' }
+		inline_body:         remainder[open_pos + 1..close_pos].trim_space()
+		has_inline_body:     open_pos + 1 < close_pos
+		opens_brace_block:   true
+		closes_inline_block: true
+	}
+}
+
+fn (mut p Parser) append_tmpl_line_info(template_file string, tmpl_line int, count int) {
+	for _ in 0 .. count {
+		p.template_line_map << ast.TemplateLineInfo{
+			tmpl_path: template_file
+			tmpl_line: tmpl_line
+		}
+	}
 }
 
 // struct to track dependecies and cache templates for reuse without io
@@ -162,6 +513,9 @@ fn (mut p Parser) process_includes(calling_file string, line_number int, line st
 	}
 
 	// If file hasnt been called before then add to dependency tree
+	if file_path !in dc.dependencies {
+		dc.dependencies[file_path] = []string{}
+	}
 	if !dc.dependencies[file_path].contains(calling_file) {
 		dc.dependencies[file_path] << calling_file
 	}
@@ -253,11 +607,14 @@ fn veb_tmpl_${fn_name}() string {
 	}
 
 	mut in_span := false
+	mut in_html_comment := false
+	mut simple_brace_block_depth := 0
 	mut end_of_line_pos := 0
 	mut start_of_line_pos := 0
 	mut tline_number := -1 // keep the original line numbers, even after insert/delete ops on lines; `i` changes
 	for i := 0; i < lines.len; i++ {
 		line := lines[i]
+		trimmed_line := line.trim_space()
 		tline_number++
 		start_of_line_pos = end_of_line_pos
 		end_of_line_pos += line.len + 1
@@ -266,6 +623,35 @@ fn veb_tmpl_${fn_name}() string {
 		}
 		$if trace_tmpl ? {
 			eprintln('>>> tfile: ${template_file}, spos: ${start_of_line_pos:6}, epos:${end_of_line_pos:6}, fi: ${tline_number:5}, i: ${i:5}, state: ${state:10}, line: ${line}')
+		}
+		// Track HTML comments: skip @-interpolation inside <!-- ... -->
+		if state == .html {
+			if in_html_comment {
+				if line.contains('-->') {
+					in_html_comment = false
+				}
+				// Output comment line literally (no @-interpolation)
+				escaped := line.replace('\\', '\\\\').replace("'", "\\'")
+				source.writeln(escaped)
+				p.template_line_map << ast.TemplateLineInfo{
+					tmpl_path: template_file
+					tmpl_line: tline_number
+				}
+				continue
+			}
+			if line.contains('<!--') {
+				if !line.contains('-->') {
+					in_html_comment = true
+				}
+				// Single-line or start of multi-line comment: output literally
+				escaped := line.replace('\\', '\\\\').replace("'", "\\'")
+				source.writeln(escaped)
+				p.template_line_map << ast.TemplateLineInfo{
+					tmpl_path: template_file
+					tmpl_line: tline_number
+				}
+				continue
+			}
 		}
 		if line.contains('@header') {
 			position := line.index('@header') or { 0 }
@@ -337,93 +723,133 @@ fn veb_tmpl_${fn_name}() string {
 			i--
 			continue
 		}
-		if line.contains('@if ') {
+		if state == .simple && simple_brace_block_depth > 0 && trimmed_line == '}' {
 			source.writeln(tmpl_str_end)
 			// tmpl_str_end contains '\n', so writeln creates 2 lines: ')' and empty
-			p.template_line_map << ast.TemplateLineInfo{
-				tmpl_path: template_file
-				tmpl_line: tline_number
+			p.append_tmpl_line_info(template_file, tline_number, 2)
+			source.writeln('}')
+			p.append_tmpl_line_info(template_file, tline_number, 1)
+			source.write_string(tmpl_str_start)
+			simple_brace_block_depth--
+			continue
+		}
+		if line.contains('@if ') {
+			if state == .simple {
+				control := parse_tmpl_control_line(line, '@if')
+				source.writeln(tmpl_str_end)
+				// tmpl_str_end contains '\n', so writeln creates 2 lines: ')' and empty
+				p.append_tmpl_line_info(template_file, tline_number, 2)
+				source.writeln('if ${control.header} {')
+				p.append_tmpl_line_info(template_file, tline_number, 1)
+				source.write_string(tmpl_str_start)
+				if control.has_inline_body {
+					source.writeln(insert_template_code(fn_name, tmpl_str_start,
+						control.inline_body))
+					p.append_tmpl_line_info(template_file, tline_number, 1)
+				}
+				if control.closes_inline_block {
+					source.writeln(tmpl_str_end)
+					// tmpl_str_end contains '\n', so writeln creates 2 lines: ')' and empty
+					p.append_tmpl_line_info(template_file, tline_number, 2)
+					source.writeln('}')
+					p.append_tmpl_line_info(template_file, tline_number, 1)
+					source.write_string(tmpl_str_start)
+				} else if control.opens_brace_block {
+					simple_brace_block_depth++
+				}
+				continue
 			}
-			p.template_line_map << ast.TemplateLineInfo{
-				tmpl_path: template_file
-				tmpl_line: tline_number
-			}
+			source.writeln(tmpl_str_end)
+			// tmpl_str_end contains '\n', so writeln creates 2 lines: ')' and empty
+			p.append_tmpl_line_info(template_file, tline_number, 2)
 			pos := line.index('@if') or { continue }
 			source.writeln('if ' + line[pos + 4..] + '{')
-			p.template_line_map << ast.TemplateLineInfo{
-				tmpl_path: template_file
-				tmpl_line: tline_number
-			}
+			p.append_tmpl_line_info(template_file, tline_number, 1)
 			source.write_string(tmpl_str_start)
 			continue
 		}
 		if line.contains('@end') {
 			source.writeln(tmpl_str_end)
 			// tmpl_str_end contains '\n', so writeln creates 2 lines: ')' and empty
-			p.template_line_map << ast.TemplateLineInfo{
-				tmpl_path: template_file
-				tmpl_line: tline_number
-			}
-			p.template_line_map << ast.TemplateLineInfo{
-				tmpl_path: template_file
-				tmpl_line: tline_number
-			}
+			p.append_tmpl_line_info(template_file, tline_number, 2)
 			source.writeln('}')
-			p.template_line_map << ast.TemplateLineInfo{
-				tmpl_path: template_file
-				tmpl_line: tline_number
-			}
+			p.append_tmpl_line_info(template_file, tline_number, 1)
 			source.write_string(tmpl_str_start)
 			continue
 		}
 		if line.contains('@else') {
+			if state == .simple {
+				control := parse_tmpl_else_line(line)
+				source.writeln(tmpl_str_end)
+				// tmpl_str_end contains '\n', so writeln creates 2 lines: ')' and empty
+				p.append_tmpl_line_info(template_file, tline_number, 2)
+				source.writeln('} ${control.header} {')
+				p.append_tmpl_line_info(template_file, tline_number, 1)
+				source.write_string(tmpl_str_start)
+				if control.has_inline_body {
+					source.writeln(insert_template_code(fn_name, tmpl_str_start,
+						control.inline_body))
+					p.append_tmpl_line_info(template_file, tline_number, 1)
+				}
+				if control.closes_inline_block {
+					source.writeln(tmpl_str_end)
+					// tmpl_str_end contains '\n', so writeln creates 2 lines: ')' and empty
+					p.append_tmpl_line_info(template_file, tline_number, 2)
+					source.writeln('}')
+					p.append_tmpl_line_info(template_file, tline_number, 1)
+					source.write_string(tmpl_str_start)
+				}
+				continue
+			}
 			source.writeln(tmpl_str_end)
 			// tmpl_str_end contains '\n', so writeln creates 2 lines: ')' and empty
-			p.template_line_map << ast.TemplateLineInfo{
-				tmpl_path: template_file
-				tmpl_line: tline_number
-			}
-			p.template_line_map << ast.TemplateLineInfo{
-				tmpl_path: template_file
-				tmpl_line: tline_number
-			}
+			p.append_tmpl_line_info(template_file, tline_number, 2)
 			pos := line.index('@else') or { continue }
 			source.writeln('}' + line[pos + 1..] + '{')
-			p.template_line_map << ast.TemplateLineInfo{
-				tmpl_path: template_file
-				tmpl_line: tline_number
-			}
+			p.append_tmpl_line_info(template_file, tline_number, 1)
 			// source.writeln(' } else { ')
 			source.write_string(tmpl_str_start)
 			continue
 		}
 		if line.contains('@for') {
+			if state == .simple {
+				control := parse_tmpl_control_line(line, '@for')
+				source.writeln(tmpl_str_end)
+				// tmpl_str_end contains '\n', so writeln creates 2 lines: ')' and empty
+				p.append_tmpl_line_info(template_file, tline_number, 2)
+				source.writeln('for ${control.header} {')
+				p.append_tmpl_line_info(template_file, tline_number, 1)
+				source.write_string(tmpl_str_start)
+				if control.has_inline_body {
+					source.writeln(insert_template_code(fn_name, tmpl_str_start,
+						control.inline_body))
+					p.append_tmpl_line_info(template_file, tline_number, 1)
+				}
+				if control.closes_inline_block {
+					source.writeln(tmpl_str_end)
+					// tmpl_str_end contains '\n', so writeln creates 2 lines: ')' and empty
+					p.append_tmpl_line_info(template_file, tline_number, 2)
+					source.writeln('}')
+					p.append_tmpl_line_info(template_file, tline_number, 1)
+					source.write_string(tmpl_str_start)
+				} else if control.opens_brace_block {
+					simple_brace_block_depth++
+				}
+				continue
+			}
 			source.writeln(tmpl_str_end)
 			// tmpl_str_end contains '\n', so writeln creates 2 lines: ')' and empty
-			p.template_line_map << ast.TemplateLineInfo{
-				tmpl_path: template_file
-				tmpl_line: tline_number
-			}
-			p.template_line_map << ast.TemplateLineInfo{
-				tmpl_path: template_file
-				tmpl_line: tline_number
-			}
+			p.append_tmpl_line_info(template_file, tline_number, 2)
 			pos := line.index('@for') or { continue }
 			source.writeln('for ' + line[pos + 4..] + '{')
-			p.template_line_map << ast.TemplateLineInfo{
-				tmpl_path: template_file
-				tmpl_line: tline_number
-			}
+			p.append_tmpl_line_info(template_file, tline_number, 1)
 			source.write_string(tmpl_str_start)
 			continue
 		}
 		if state == .simple {
 			// by default, just copy 1:1
 			source.writeln(insert_template_code(fn_name, tmpl_str_start, line))
-			p.template_line_map << ast.TemplateLineInfo{
-				tmpl_path: template_file
-				tmpl_line: tline_number
-			}
+			p.append_tmpl_line_info(template_file, tline_number, 1)
 			continue
 		}
 		// in_write = false
@@ -547,7 +973,8 @@ fn veb_tmpl_${fn_name}() string {
 				key := line_[pos + 5..end]
 				if key.len > 0 {
 					// Replace '%raw key' with just '${key}'
-					line_ = line_.replace('%raw ${key}', '\${veb.raw(veb.tr(ctx.lang.str(), "${key}"))}')
+					line_ = line_.replace('%raw ${key}',
+						'\${veb.raw(veb.tr(ctx.lang.str(), "${key}"))}')
 				}
 				search_start = pos + 1
 			} else {

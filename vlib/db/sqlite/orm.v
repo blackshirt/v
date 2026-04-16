@@ -5,12 +5,13 @@ import time
 
 // select is used internally by V's ORM for processing `SELECT ` queries
 pub fn (db DB) select(config orm.SelectConfig, data orm.QueryData, where orm.QueryData) ![][]orm.Primitive {
+	where_with_tenant := orm.apply_tenant_filter(config.table, where)
 	$if trace_orm_where ? {
 		eprintln('> sqlite.select: where.fields.len = ${where.fields.len}')
 		eprintln('> sqlite.select: where.kinds.len = ${where.kinds.len}')
 	}
 	// 1. Create query and bind necessary data
-	query := orm.orm_select_gen(config, '`', true, '?', 1, where)
+	query := orm.orm_select_gen(config, '`', true, '?', 1, where_with_tenant)
 	$if trace_sqlite ? {
 		eprintln('> select query: "${query}"')
 	}
@@ -19,21 +20,10 @@ pub fn (db DB) select(config orm.SelectConfig, data orm.QueryData, where orm.Que
 		stmt.finalize()
 	}
 	mut c := 1
-	sqlite_stmt_binder(stmt, where, query, mut c)!
+	sqlite_stmt_binder(stmt, where_with_tenant, query, mut c)!
 	sqlite_stmt_binder(stmt, data, query, mut c)!
 
 	mut ret := [][]orm.Primitive{}
-
-	if config.is_count {
-		// 2. Get count of returned values & add it to ret array
-		step := stmt.step()
-		if step !in [sqlite_row, sqlite_ok, sqlite_done] {
-			return db.error_message(step, query)
-		}
-		count := stmt.sqlite_select_column(0, 8)!
-		ret << [count]
-		return ret
-	}
 	for {
 		// 2. Parse returned values
 		step := stmt.step()
@@ -57,22 +47,25 @@ pub fn (db DB) select(config orm.SelectConfig, data orm.QueryData, where orm.Que
 
 // insert is used internally by V's ORM for processing `INSERT ` queries
 pub fn (db DB) insert(table orm.Table, data orm.QueryData) ! {
-	query, converted_data := orm.orm_stmt_gen(.sqlite, table, '`', .insert, true, '?',
-		1, data, orm.QueryData{})
+	query, converted_data :=
+		orm.orm_stmt_gen(.sqlite, table, '`', .insert, true, '?', 1, data, orm.QueryData{})
 	sqlite_stmt_worker(db, query, converted_data, orm.QueryData{})!
 }
 
 // update is used internally by V's ORM for processing `UPDATE ` queries
 pub fn (db DB) update(table orm.Table, data orm.QueryData, where orm.QueryData) ! {
-	query, _ := orm.orm_stmt_gen(.sqlite, table, '`', .update, true, '?', 1, data, where)
-	sqlite_stmt_worker(db, query, data, where)!
+	where_with_tenant := orm.apply_tenant_filter(table, where)
+	query, _ := orm.orm_stmt_gen(.sqlite, table, '`', .update, true, '?', 1, data,
+		where_with_tenant)
+	sqlite_stmt_worker(db, query, data, where_with_tenant)!
 }
 
 // delete is used internally by V's ORM for processing `DELETE ` queries
 pub fn (db DB) delete(table orm.Table, where orm.QueryData) ! {
+	where_with_tenant := orm.apply_tenant_filter(table, where)
 	query, _ := orm.orm_stmt_gen(.sqlite, table, '`', .delete, true, '?', 1, orm.QueryData{},
-		where)
-	sqlite_stmt_worker(db, query, orm.QueryData{}, where)!
+		where_with_tenant)
+	sqlite_stmt_worker(db, query, orm.QueryData{}, where_with_tenant)!
 }
 
 // last_id is used internally by V's ORM for post-processing `INSERT ` queries
@@ -86,8 +79,9 @@ pub fn (db DB) last_id() int {
 
 // create is used internally by V's ORM for processing table creation queries (DDL)
 pub fn (db DB) create(table orm.Table, fields []orm.TableField) ! {
-	query := orm.orm_table_gen(.sqlite, table, '`', true, 0, fields, sqlite_type_from_v,
-		false) or { return err }
+	query := orm.orm_table_gen(.sqlite, table, '`', true, 0, fields, sqlite_type_from_v, false) or {
+		return err
+	}
 	sqlite_stmt_worker(db, query, orm.QueryData{}, orm.QueryData{})!
 }
 
@@ -95,6 +89,36 @@ pub fn (db DB) create(table orm.Table, fields []orm.TableField) ! {
 pub fn (db DB) drop(table orm.Table) ! {
 	query := 'DROP TABLE `${table.name}`;'
 	sqlite_stmt_worker(db, query, orm.QueryData{}, orm.QueryData{})!
+}
+
+// orm_begin starts a transaction for ORM helpers.
+pub fn (mut db DB) orm_begin() ! {
+	db.begin()!
+}
+
+// orm_commit commits a transaction for ORM helpers.
+pub fn (mut db DB) orm_commit() ! {
+	db.commit()!
+}
+
+// orm_rollback rolls back a transaction for ORM helpers.
+pub fn (mut db DB) orm_rollback() ! {
+	db.rollback()!
+}
+
+// orm_savepoint creates a savepoint for ORM helpers.
+pub fn (mut db DB) orm_savepoint(name string) ! {
+	db.savepoint(name)!
+}
+
+// orm_rollback_to rolls back to a savepoint for ORM helpers.
+pub fn (mut db DB) orm_rollback_to(name string) ! {
+	db.rollback_to(name)!
+}
+
+// orm_release_savepoint releases a savepoint for ORM helpers.
+pub fn (mut db DB) orm_release_savepoint(name string) ! {
+	db.release_savepoint(name)!
 }
 
 // helper
@@ -126,6 +150,19 @@ fn sqlite_stmt_binder(stmt Stmt, d orm.QueryData, query string, mut c &int) ! {
 	}
 }
 
+fn bind_array[T](stmt Stmt, mut c &int, data []T) int {
+	mut err := 0
+	for element in data {
+		tmp_err := bind(stmt, mut c, orm.Primitive(element))
+		c++
+		if tmp_err != 0 {
+			err = tmp_err
+			break
+		}
+	}
+	return err
+}
+
 // Universal bind function
 fn bind(stmt Stmt, mut c &int, data orm.Primitive) int {
 	mut err := 0
@@ -152,14 +189,49 @@ fn bind(stmt Stmt, mut c &int, data orm.Primitive) int {
 			err = stmt.bind_null(c)
 		}
 		[]orm.Primitive {
-			for element in data {
-				tmp_err := bind(stmt, mut c, element)
-				c++
-				if tmp_err != 0 {
-					err = tmp_err
-					break
-				}
-			}
+			err = bind_array(stmt, mut c, data)
+		}
+		[]bool {
+			err = bind_array(stmt, mut c, data)
+		}
+		[]f32 {
+			err = bind_array(stmt, mut c, data)
+		}
+		[]f64 {
+			err = bind_array(stmt, mut c, data)
+		}
+		[]i16 {
+			err = bind_array(stmt, mut c, data)
+		}
+		[]i64 {
+			err = bind_array(stmt, mut c, data)
+		}
+		[]i8 {
+			err = bind_array(stmt, mut c, data)
+		}
+		[]int {
+			err = bind_array(stmt, mut c, data)
+		}
+		[]string {
+			err = bind_array(stmt, mut c, data)
+		}
+		[]time.Time {
+			err = bind_array(stmt, mut c, data)
+		}
+		[]u16 {
+			err = bind_array(stmt, mut c, data)
+		}
+		[]u32 {
+			err = bind_array(stmt, mut c, data)
+		}
+		[]u64 {
+			err = bind_array(stmt, mut c, data)
+		}
+		[]u8 {
+			err = bind_array(stmt, mut c, data)
+		}
+		[]orm.InfixType {
+			err = bind_array(stmt, mut c, data)
 		}
 	}
 	return err

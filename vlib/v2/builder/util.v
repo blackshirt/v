@@ -4,15 +4,23 @@
 module builder
 
 import os
+import v2.pref
 
 fn list_dir_entries(path string) []string {
 	return os.ls(path) or { []string{} }
 }
 
 pub fn get_v_files_from_dir(dir string, user_defines []string) []string {
+	if dir == '' {
+		return []string{}
+	}
 	mod_files := list_dir_entries(dir)
 	mut v_files := []string{}
+	mut defaults := []string{}
 	for file in mod_files {
+		if file == '' {
+			continue
+		}
 		// Include .v files (including .c.v), exclude .js.v and test files
 		if !file.ends_with('.v') || file.ends_with('.js.v') || file.contains('_test.') {
 			continue
@@ -21,22 +29,9 @@ pub fn get_v_files_from_dir(dir string, user_defines []string) []string {
 		if file.contains('.arm64.') || file.contains('.arm32.') || file.contains('.amd64.') {
 			continue
 		}
-		// skip OS-specific files for other platforms
-		// Note: _nix files are for Unix-like systems including macOS and Linux
-		$if macos {
-			if file.contains('_windows.') || file.contains('_linux.') || file.contains('_android') {
-				continue
-			}
-		} $else $if linux {
-			if file.contains('_windows.') || file.contains('_macos.') || file.contains('_darwin.')
-				|| file.contains('_android') {
-				continue
-			}
-		} $else $if windows {
-			if file.contains('_linux.') || file.contains('_macos.') || file.contains('_nix.')
-				|| file.contains('_android') {
-				continue
-			}
+		// Skip files specialized for a different target OS before parsing/type checking.
+		if pref.file_has_incompatible_os_suffix(file, os.user_os()) {
+			continue
 		}
 		// Conditional compilation files: _d_<feature> included when -d <feature> is set,
 		// _notd_<feature> included when -d <feature> is NOT set.
@@ -56,9 +51,69 @@ pub fn get_v_files_from_dir(dir string, user_defines []string) []string {
 				}
 			}
 		}
-		v_files << os.join_path(dir, file)
+		path := os.join_path(dir, file)
+		if path == '' {
+			continue
+		}
+		// Collect _default.c.v files separately; they are only included when
+		// no platform-specific variant exists (e.g. _darwin.c.v, _linux.c.v).
+		if file.contains('default.c.v') {
+			defaults << path
+		} else {
+			v_files << path
+		}
+	}
+	// Add _default.c.v files only when no platform-specific variant was selected.
+	for dfile in defaults {
+		no_postfix := fname_without_platform_postfix(dfile)
+		mut has_specialized := false
+		for vf in v_files {
+			if fname_without_platform_postfix(vf) == no_postfix {
+				has_specialized = true
+				break
+			}
+		}
+		if !has_specialized {
+			v_files << dfile
+		}
 	}
 	return v_files
+}
+
+// fname_without_platform_postfix strips the platform-specific suffix from a file path,
+// so that e.g. "free_memory_impl_darwin.c.v" and "free_memory_impl_default.c.v" both
+// map to the same key, allowing detection of specialized vs default variants.
+fn fname_without_platform_postfix(file string) string {
+	return file.replace_each([
+		'default.c.v',
+		'_',
+		'nix.c.v',
+		'_',
+		'windows.c.v',
+		'_',
+		'linux.c.v',
+		'_',
+		'darwin.c.v',
+		'_',
+		'macos.c.v',
+		'_',
+		'android.c.v',
+		'_',
+		'termux.c.v',
+		'_',
+		'android_outside_termux.c.v',
+		'_',
+		'freebsd.c.v',
+		'_',
+		'openbsd.c.v',
+		'_',
+		'netbsd.c.v',
+		'_',
+		'dragonfly.c.v',
+		'_',
+		'solaris.c.v',
+		'_',
+	])
 }
 
 // extract_define_feature extracts the feature name from a _d_ or _notd_ filename.

@@ -33,6 +33,21 @@
   ./v2 -nomarkused -backend cleanc file.v
 ```
 
+# Eval backend
+```
+  # Execute a small V program directly from the v2 AST:
+  ./v2 -backend eval file.v
+
+  # Pass runtime args to the interpreted program:
+  ./v2 -backend eval file.v -- arg1 arg2
+
+  # Self-host under eval without recursively reusing the outer compiler flags:
+  ./v2 -backend eval cmd/v2/v2.v -- -o /tmp/v2self cmd/v2/v2.v
+
+  # Current scope: literals, locals/consts, plain fn calls, if/for/range,
+  # arrays, indexing, len, println/print, and basic string interpolation.
+```
+
 # SSA C backend (restored)
 ```
   # Run the SSA -> C backend directly:

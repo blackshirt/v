@@ -1,16 +1,21 @@
 module fasthttp
 
 import net
+import sync.stdatomic
 
 #include <sys/event.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <signal.h>
+
+fn C.signal(sig int, handler voidptr) voidptr
 
 const buf_size = max_connection_size
 const kqueue_max_events = 128
 const backlog = max_connection_size
+const kqueue_wait_timeout_ms = 100
 
 fn C.kevent(kq i32, changelist &C.kevent, nchanges i32, eventlist &C.kevent, nevents i32, timeout &C.timespec) i32
 fn C.kqueue() i32
@@ -28,7 +33,7 @@ struct C.kevent {
 	udata  voidptr
 }
 
-// Helper to set fields of a kevent struct
+// Helper to set fields of a kevent struct.
 fn ev_set(mut ev C.kevent, ident u64, filter i16, flags u16, fflags u32, data isize, udata voidptr) {
 	ev.ident = ident
 	ev.filter = filter
@@ -42,10 +47,11 @@ struct Conn {
 	fd        int
 	user_data voidptr
 mut:
-	read_buf  [buf_size]u8
-	read_len  int
-	write_buf []u8
-	write_pos int
+	read_buf       [buf_size]u8
+	read_len       int
+	write_buf      []u8
+	write_pos      int
+	request_active bool
 
 	// Sendfile state
 	file_fd  int = -1
@@ -58,10 +64,14 @@ pub mut:
 	family                  net.AddrFamily = .ip6
 	port                    int
 	max_request_buffer_size int = 8192
-	socket_fd               int
-	poll_fd                 int // kqueue fd
+	socket_fd               int = -1
+	poll_fd                 int = -1 // kqueue fd
 	user_data               voidptr
 	request_handler         fn (HttpRequest) !HttpResponse @[required]
+	running                 &stdatomic.AtomicVal[bool] = stdatomic.new_atomic(false)
+	shutting_down           &stdatomic.AtomicVal[bool] = stdatomic.new_atomic(false)
+	stopped                 &stdatomic.AtomicVal[bool] = stdatomic.new_atomic(true)
+	active_requests         &stdatomic.AtomicVal[int]  = stdatomic.new_atomic(0)
 }
 
 // new_server creates and initializes a new Server instance.
@@ -72,6 +82,10 @@ pub fn new_server(config ServerConfig) !&Server {
 		max_request_buffer_size: config.max_request_buffer_size
 		user_data:               config.user_data
 		request_handler:         config.handler
+		running:                 stdatomic.new_atomic(false)
+		shutting_down:           stdatomic.new_atomic(false)
+		stopped:                 stdatomic.new_atomic(true)
+		active_requests:         stdatomic.new_atomic(0)
 	}
 	return server
 }
@@ -96,11 +110,16 @@ fn delete_event(kq int, ident u64, filter i16, udata voidptr) {
 	C.kevent(kq, &ev, 1, unsafe { nil }, 0, unsafe { nil })
 }
 
-fn close_conn(kq int, c_ptr voidptr) {
+fn close_conn(server Server, kq int, c_ptr voidptr, mut clients map[int]voidptr) {
 	mut c := unsafe { &Conn(c_ptr) }
+	clients.delete(c.fd)
 	delete_event(kq, u64(c.fd), i16(C.EVFILT_READ), c)
 	delete_event(kq, u64(c.fd), i16(C.EVFILT_WRITE), c)
 	C.close(c.fd)
+	if c.request_active {
+		server.end_request()
+		c.request_active = false
+	}
 	if c.write_buf.len > 0 {
 		c.write_buf.clear()
 	}
@@ -126,86 +145,53 @@ fn send_pending(c_ptr voidptr) bool {
 			if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
 				return true
 			}
-			return false // Error
+			return false
 		}
 	}
 
 	// 2. Send file if buffer is fully sent
 	if c.write_pos >= c.write_buf.len && c.file_fd != -1 {
-		mut len := i64(0) // Input 0 means send until EOF
+		mut len := i64(0)
 		ret := C.sendfile(c.file_fd, c.fd, c.file_pos, &len, unsafe { nil }, 0)
-
 		if len > 0 {
 			c.file_pos += len
 		}
-
 		if ret == -1 {
 			if C.errno == C.EAGAIN || C.errno == C.EWOULDBLOCK {
 				return true
 			}
-			// Error sending file
 			C.close(c.file_fd)
 			c.file_fd = -1
 			return false
 		}
-
 		if c.file_pos >= c.file_len {
-			// Done sending file
 			C.close(c.file_fd)
 			c.file_fd = -1
 		} else {
-			// Not done yet
 			return true
 		}
 	}
 
-	// Check if completely done (both buffer and file)
-	if c.write_pos >= c.write_buf.len && c.file_fd == -1 {
-		return false // Done
-	}
-
-	return true // Still pending (partial buffer write or file not done)
+	return !(c.write_pos >= c.write_buf.len && c.file_fd == -1)
 }
 
 fn send_bad_request(fd int) {
 	C.send(fd, tiny_bad_request_response.data, tiny_bad_request_response.len, 0)
 }
 
-fn handle_write(kq int, c_ptr voidptr) {
+fn handle_write(server Server, kq int, c_ptr voidptr, mut clients map[int]voidptr) {
 	mut c := unsafe { &Conn(c_ptr) }
 	if send_pending(c_ptr) {
 		return
 	}
 	delete_event(kq, u64(c.fd), i16(C.EVFILT_WRITE), c)
-	close_conn(kq, c_ptr)
+	close_conn(server, kq, c_ptr, mut clients)
 }
 
-fn handle_read(mut s Server, kq int, c_ptr voidptr) {
+// process_request handles a complete HTTP request: decodes, calls the handler,
+// sends the response (or handles takeover/sendfile). Runs in a spawned thread.
+fn process_request(server Server, kq int, c_ptr voidptr, mut clients map[int]voidptr) {
 	mut c := unsafe { &Conn(c_ptr) }
-	n := C.recv(c.fd, &c.read_buf[c.read_len], buf_size - c.read_len, 0)
-	if n <= 0 {
-		if n < 0 && C.errno != C.EAGAIN && C.errno != C.EWOULDBLOCK {
-			// Unexpected recv error - send 444 No Response
-			C.send(c.fd, status_444_response.data, status_444_response.len, 0)
-			close_conn(kq, c_ptr)
-			return
-		}
-		// Normal client closure (n == 0 or would block)
-		close_conn(kq, c_ptr)
-		return
-	}
-
-	c.read_len += int(n)
-	if c.read_len == 0 {
-		return
-	}
-
-	// Check if request exceeds buffer size
-	if c.read_len >= buf_size {
-		C.send(c.fd, status_413_response.data, status_413_response.len, 0)
-		close_conn(kq, c_ptr)
-		return
-	}
 
 	mut req_buf := []u8{cap: c.read_len}
 	unsafe {
@@ -214,15 +200,31 @@ fn handle_read(mut s Server, kq int, c_ptr voidptr) {
 
 	mut decoded := decode_http_request(req_buf) or {
 		send_bad_request(c.fd)
-		close_conn(kq, c_ptr)
+		close_conn(server, kq, c_ptr, mut clients)
 		return
 	}
+	server.begin_request()
+	c.request_active = true
 	decoded.client_conn_fd = c.fd
-	decoded.user_data = s.user_data
+	decoded.user_data = server.user_data
 
-	resp := s.request_handler(decoded) or {
+	resp := server.request_handler(decoded) or {
 		send_bad_request(c.fd)
-		close_conn(kq, c_ptr)
+		close_conn(server, kq, c_ptr, mut clients)
+		return
+	}
+
+	if resp.takeover {
+		// The handler has taken ownership of the connection.
+		// Remove from kqueue and tracking, but do NOT close the fd.
+		clients.delete(c.fd)
+		delete_event(kq, u64(c.fd), i16(C.EVFILT_READ), c)
+		delete_event(kq, u64(c.fd), i16(C.EVFILT_WRITE), c)
+		if c.request_active {
+			server.end_request()
+			c.request_active = false
+		}
+		unsafe { free(c_ptr) }
 		return
 	}
 
@@ -245,15 +247,41 @@ fn handle_read(mut s Server, kq int, c_ptr voidptr) {
 	c.read_len = 0
 
 	if send_pending(c_ptr) {
-		add_event(kq, u64(c.fd), i16(C.EVFILT_WRITE), u16(C.EV_ADD | C.EV_ENABLE | C.EV_CLEAR),
-			c)
+		add_event(kq, u64(c.fd), i16(C.EVFILT_WRITE), u16(C.EV_ADD | C.EV_ENABLE | C.EV_CLEAR), c)
 		return
 	}
 
-	close_conn(kq, c_ptr)
+	close_conn(server, kq, c_ptr, mut clients)
 }
 
-fn accept_clients(kq int, listen_fd int) {
+fn handle_read(server Server, kq int, c_ptr voidptr, mut clients map[int]voidptr) {
+	mut c := unsafe { &Conn(c_ptr) }
+	n := C.recv(c.fd, &c.read_buf[c.read_len], buf_size - c.read_len, 0)
+	if n <= 0 {
+		if n < 0 && C.errno != C.EAGAIN && C.errno != C.EWOULDBLOCK {
+			C.send(c.fd, status_444_response.data, status_444_response.len, 0)
+			close_conn(server, kq, c_ptr, mut clients)
+			return
+		}
+		close_conn(server, kq, c_ptr, mut clients)
+		return
+	}
+
+	c.read_len += int(n)
+	if c.read_len == 0 {
+		return
+	}
+
+	if c.read_len >= buf_size {
+		C.send(c.fd, status_413_response.data, status_413_response.len, 0)
+		close_conn(server, kq, c_ptr, mut clients)
+		return
+	}
+
+	process_request(server, kq, c_ptr, mut clients)
+}
+
+fn accept_clients(kq int, listen_fd int, mut clients map[int]voidptr) {
 	for {
 		client_fd := C.accept(listen_fd, unsafe { nil }, unsafe { nil })
 		if client_fd < 0 {
@@ -264,6 +292,10 @@ fn accept_clients(kq int, listen_fd int) {
 			break
 		}
 		set_nonblocking(client_fd)
+		// Prevent SIGPIPE on writes to disconnected clients (macOS-specific).
+		// Without this, writing to a closed connection kills the entire server process.
+		nosigpipe_opt := 1
+		C.setsockopt(client_fd, C.SOL_SOCKET, C.SO_NOSIGPIPE, &nosigpipe_opt, sizeof(int))
 		mut c := &Conn{
 			fd:        client_fd
 			user_data: unsafe { nil }
@@ -271,11 +303,35 @@ fn accept_clients(kq int, listen_fd int) {
 		}
 		add_event(kq, u64(client_fd), i16(C.EVFILT_READ), u16(C.EV_ADD | C.EV_ENABLE | C.EV_CLEAR),
 			c)
+		clients[client_fd] = c
+	}
+}
+
+fn close_all_conns(server Server, kq int, mut clients map[int]voidptr) {
+	for client_fd in clients.keys() {
+		c_ptr := clients[client_fd] or { continue }
+		close_conn(server, kq, c_ptr, mut clients)
+	}
+}
+
+fn (mut s Server) stop_accepting() {
+	if s.poll_fd >= 0 && s.socket_fd >= 0 {
+		delete_event(s.poll_fd, u64(s.socket_fd), i16(C.EVFILT_READ), unsafe { nil })
+	}
+	if s.socket_fd >= 0 {
+		C.close(s.socket_fd)
+		s.socket_fd = -1
 	}
 }
 
 // run starts the server and enters the main event loop (Kqueue version).
 pub fn (mut s Server) run() ! {
+	// Ignore SIGPIPE process-wide. On macOS, writing to a disconnected socket
+	// sends SIGPIPE which terminates the process by default. SO_NOSIGPIPE is set
+	// per-socket on accept, but this is a safety net for any code path that might
+	// miss it (e.g. spawned SSE/WebSocket threads using TcpConn.write).
+	C.signal(C.SIGPIPE, C.SIG_IGN)
+
 	s.socket_fd = C.socket(s.family, net.SocketType.tcp, 0)
 	if s.socket_fd < 0 {
 		C.perror(c'socket')
@@ -309,15 +365,29 @@ pub fn (mut s Server) run() ! {
 		return error('kqueue creation failed')
 	}
 
-	add_event(s.poll_fd, u64(s.socket_fd), i16(C.EVFILT_READ), u16(C.EV_ADD | C.EV_ENABLE | C.EV_CLEAR),
-		unsafe { nil })
+	add_event(s.poll_fd, u64(s.socket_fd), i16(C.EVFILT_READ),
+		u16(C.EV_ADD | C.EV_ENABLE | C.EV_CLEAR), unsafe { nil })
 
+	listen_fd := s.socket_fd
+	s.mark_running()
 	println('listening on http://0.0.0.0:${s.port}/')
 
 	mut events := [kqueue_max_events]C.kevent{}
+	mut clients := map[int]voidptr{}
 	for {
-		nev := C.kevent(s.poll_fd, unsafe { nil }, 0, &events[0], kqueue_max_events, unsafe { nil })
+		if s.is_shutting_down() && s.active_request_count() == 0 {
+			close_all_conns(s, s.poll_fd, mut clients)
+			break
+		}
+		timeout := C.timespec{
+			tv_sec:  0
+			tv_nsec: kqueue_wait_timeout_ms * 1_000_000
+		}
+		nev := C.kevent(s.poll_fd, unsafe { nil }, 0, &events[0], kqueue_max_events, &timeout)
 		if nev < 0 {
+			if s.is_shutting_down() {
+				continue
+			}
 			C.perror(c'kevent')
 			break
 		}
@@ -325,18 +395,21 @@ pub fn (mut s Server) run() ! {
 		for i := 0; i < nev; i++ {
 			event := events[i]
 			if event.flags & u16(C.EV_ERROR) != 0 {
-				if event.ident == u64(s.socket_fd) {
+				if event.ident == u64(listen_fd) {
 					C.perror(c'listener error')
 					continue
 				}
 				if event.udata != unsafe { nil } {
-					close_conn(s.poll_fd, event.udata)
+					close_conn(s, s.poll_fd, event.udata, mut clients)
 				}
 				continue
 			}
 
-			if event.ident == u64(s.socket_fd) {
-				accept_clients(s.poll_fd, s.socket_fd)
+			if event.ident == u64(listen_fd) {
+				if s.is_shutting_down() {
+					continue
+				}
+				accept_clients(s.poll_fd, listen_fd, mut clients)
 				continue
 			}
 
@@ -345,18 +418,29 @@ pub fn (mut s Server) run() ! {
 			}
 
 			if event.flags & u16(C.EV_EOF) != 0 {
-				close_conn(s.poll_fd, event.udata)
+				close_conn(s, s.poll_fd, event.udata, mut clients)
 				continue
 			}
 
 			if event.filter == i16(C.EVFILT_READ) {
-				handle_read(mut s, s.poll_fd, event.udata)
+				if s.is_shutting_down() {
+					close_conn(s, s.poll_fd, event.udata, mut clients)
+					continue
+				}
+				handle_read(s, s.poll_fd, event.udata, mut clients)
 			} else if event.filter == i16(C.EVFILT_WRITE) {
-				handle_write(s.poll_fd, event.udata)
+				handle_write(s, s.poll_fd, event.udata, mut clients)
 			}
 		}
 	}
 
-	C.close(s.socket_fd)
-	C.close(s.poll_fd)
+	if s.socket_fd >= 0 {
+		C.close(s.socket_fd)
+		s.socket_fd = -1
+	}
+	if s.poll_fd >= 0 {
+		C.close(s.poll_fd)
+		s.poll_fd = -1
+	}
+	s.mark_stopped()
 }

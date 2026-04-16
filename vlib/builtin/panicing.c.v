@@ -57,6 +57,7 @@ fn panic_debug(line_no int, file string, mod string, fn_name string, s string) {
 		}
 	}
 	C.exit(1)
+	for {}
 }
 
 // panic_option_not_set is called by V, when you use option error propagation in your main function.
@@ -120,6 +121,7 @@ pub fn panic(s string) {
 		}
 	}
 	C.exit(1)
+	for {}
 }
 
 // return a C-API error message matching to `errnum`
@@ -132,7 +134,7 @@ pub fn c_error_number_str(errnum int) string {
 			c_msg := C.strerror(errnum)
 			err_msg = string{
 				str:    &u8(c_msg)
-				len:    unsafe { C.strlen(c_msg) }
+				len:    int(unsafe { C.strlen(c_msg) })
 				is_lit: 1
 			}
 		}

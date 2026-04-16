@@ -13,6 +13,16 @@ fn testsuite_end() {
 	os.rmdir_all(test_path) or {}
 }
 
+fn run_v_ok(command string) string {
+	res := os.execute(command)
+	if res.exit_code != 0 {
+		eprintln('> failing cmd: ${command}')
+		eprintln('> output:\n${res.output}')
+		assert res.exit_code == 0
+	}
+	return res.output
+}
+
 fn test_conditional_executable_removal() {
 	os.chdir(test_path)!
 	os.mkdir_all('src')!
@@ -81,4 +91,67 @@ pub struct BS{}
 	dump(after_compile_file_list)
 	assert executable in after_compile_file_list
 	assert os.execute('./${executable}').output.trim_space() == 'AS{}=>BS{}'
+}
+
+fn test_run_explicit_src_directory_uses_project_root_lookup() {
+	os.chdir(test_path)!
+	project_dir := os.join_path(test_path, 'run_src_project')
+	defer {
+		os.chdir(test_path) or {}
+	}
+	os.mkdir_all(os.join_path(project_dir, 'src'))!
+	os.mkdir_all(os.join_path(project_dir, 'modules', 'somemoduletwo'))!
+	os.write_file(os.join_path(project_dir, 'src', 'main.v'), 'module main
+import somemoduletwo
+
+fn main() {
+	println(somemoduletwo.name())
+}
+')!
+	os.write_file(os.join_path(project_dir, 'modules', 'somemoduletwo', 'somemoduletwo.v'), 'module somemoduletwo
+
+pub fn name() string {
+	return "somemoduletwo"
+}
+')!
+	os.chdir(project_dir)!
+	assert run_v_ok('${os.quoted_path(vexe)} run src').trim_space() == 'somemoduletwo'
+	assert run_v_ok('${os.quoted_path(vexe)} run ./src').trim_space() == 'somemoduletwo'
+}
+
+fn test_thirdparty_object_build_with_multiline_cflags() {
+	mut env := os.environ()
+	existing_cflags := if 'CFLAGS' in env { env['CFLAGS'] } else { '' }
+	env['CFLAGS'] = if existing_cflags == '' {
+		'-DTHIRDPARTY_MULTILINE_1=1\n-DTHIRDPARTY_MULTILINE_2=1'
+	} else {
+		'${existing_cflags}\n-DTHIRDPARTY_MULTILINE_1=1\n-DTHIRDPARTY_MULTILINE_2=1'
+	}
+	mut p := os.new_process(vexe)
+	p.set_work_folder(@VEXEROOT)
+	p.set_args(['run', os.join_path(@VEXEROOT, 'vlib', 'v', 'tests', 'project_with_c_code', 'main.v')])
+	p.set_environment(env)
+	p.set_redirect_stdio()
+	p.wait()
+	stdout := p.stdout_slurp()
+	stderr := p.stderr_slurp()
+	p.close()
+	assert p.code == 0, 'stdout:\n${stdout}\nstderr:\n${stderr}'
+}
+
+fn test_missing_library_is_reported_without_compiler_bug_hint() {
+	os.chdir(test_path)!
+	os.mkdir_all('missing_library')!
+	lib_name := 'v_missing_lib_25499'
+	src_file := os.join_path('missing_library', 'main.v')
+	os.write_file(src_file, '#flag -l${lib_name}\nfn main() {}\n')!
+
+	res := os.execute('${os.quoted_path(vexe)} ${os.quoted_path(src_file)}')
+	normalized_output := res.output.replace('\r\n', '\n')
+
+	assert res.exit_code != 0
+	assert normalized_output.contains('builder error:')
+	assert normalized_output.contains('C library `${lib_name}` was not found while linking the generated program.')
+	assert normalized_output.contains('Please install the corresponding development package/libraries')
+	assert !normalized_output.contains('This is a V compiler bug')
 }

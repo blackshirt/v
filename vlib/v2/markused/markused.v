@@ -55,6 +55,7 @@ mut:
 	used_keys map[string]bool
 
 	module_names           map[string]bool
+	module_alias_to_real   map[string]string
 	type_names             map[string]bool
 	interface_type_names   map[string]bool
 	interface_method_names map[string][]string
@@ -63,6 +64,7 @@ mut:
 	lookup map[string][]int
 
 	cur_fn_scope &types.Scope = unsafe { nil }
+	cur_fn_decl  ast.FnDecl
 }
 
 // mark_used walks reachable function/method bodies and returns declaration keys
@@ -108,11 +110,13 @@ fn (mut w Walker) walk() map[string]bool {
 		}
 		return all
 	}
-	for w.queue.len > 0 {
-		idx := w.queue[0]
-		w.queue.delete(0)
+	mut qi := 0
+	for qi < w.queue.len {
+		idx := w.queue[qi]
+		qi++
 		info := w.fns[idx]
 		w.cur_fn_scope = w.lookup_fn_scope(info)
+		w.cur_fn_decl = info.decl
 		w.walk_stmts(info.decl.stmts, info.mod)
 		w.cur_fn_scope = unsafe { nil }
 	}
@@ -127,6 +131,14 @@ fn (mut w Walker) collect_defs() {
 			w.add_module_name(imp.name)
 			if imp.alias != '' {
 				w.add_module_name(imp.alias)
+				// Map alias to real module name for correct symbol resolution.
+				// e.g., 'import v2.ssa.optimize as ssa_optimize' → 'ssa_optimize' → 'optimize'
+				real_name := if imp.name.contains('.') {
+					imp.name.all_after_last('.')
+				} else {
+					imp.name
+				}
+				w.module_alias_to_real[imp.alias] = real_name
 			}
 		}
 		for stmt in file.stmts {
@@ -175,10 +187,16 @@ fn (mut w Walker) seed_roots() bool {
 		}
 	}
 	if has_root {
+		// Also seed module init() functions (called from synthesized main)
+		for i, info in w.fns {
+			if is_module_init(info) {
+				w.mark_fn(i)
+			}
+		}
 		return true
 	}
 	for i, info in w.fns {
-		if is_test_root(info) {
+		if is_test_root(info) || is_module_init(info) {
 			w.mark_fn(i)
 			has_root = true
 		}
@@ -197,6 +215,10 @@ fn is_test_root(info FnInfo) bool {
 
 fn is_method_decl(decl ast.FnDecl) bool {
 	return decl.is_method || decl.is_static
+}
+
+fn is_module_init(info FnInfo) bool {
+	return !is_method_decl(info.decl) && (info.decl.name == 'init' || info.decl.name == 'deinit')
 }
 
 fn normalize_module_name(module_name string) string {
@@ -270,6 +292,15 @@ fn type_name_candidates_from_type(mod_name string, typ types.Type) []string {
 		} else if mod_name != '' && mod_name != 'main' {
 			add_unique_string(mut out, '${mod_name}__${name}')
 		}
+		// For array types like []Attribute, also add Array_Attribute form.
+		if name.starts_with('[]') {
+			elem := name[2..]
+			add_unique_string(mut out, 'Array_${elem}')
+			add_unique_string(mut out, maybe_trim_module_prefix(mod_name, 'Array_${elem}'))
+			if mod_name != '' && mod_name != 'main' {
+				add_unique_string(mut out, 'Array_${mod_name}__${elem}')
+			}
+		}
 	}
 	return out
 }
@@ -296,6 +327,20 @@ fn receiver_names_from_decl(mod_name string, decl ast.FnDecl, env &types.Environ
 			}
 		}
 		else {}
+	}
+	// Method on []ElemType — receiver name is Array_ElemType.
+	// Use the string name which includes [] prefix for array types.
+	recv_name := decl.receiver.typ.name()
+	if recv_name.starts_with('[]') {
+		elem_name := recv_name[2..]
+		if elem_name.len > 0 {
+			arr_name := 'Array_${elem_name}'
+			add_unique_string(mut out, arr_name)
+			add_unique_string(mut out, maybe_trim_module_prefix(mod_name, arr_name))
+			if mod_name != '' && mod_name != 'main' {
+				add_unique_string(mut out, 'Array_${mod_name}__${elem_name}')
+			}
+		}
 	}
 	pos := decl.receiver.typ.pos()
 	if env != unsafe { nil } && pos.is_valid() {
@@ -487,17 +532,19 @@ fn (mut w Walker) mark_fn(idx int) {
 	w.queue << idx
 }
 
-fn (mut w Walker) mark_indices(indices []int) {
-	for idx in indices {
-		w.mark_fn(idx)
+fn (w &Walker) lookup_count(key string) int {
+	if key in w.lookup {
+		return w.lookup[key].len
 	}
+	return 0
 }
 
-fn (w &Walker) lookup_indices(key string) []int {
+fn (mut w Walker) mark_lookup(key string) {
 	if key in w.lookup {
-		return w.lookup[key]
+		for idx in w.lookup[key] {
+			w.mark_fn(idx)
+		}
 	}
-	return []int{}
 }
 
 fn called_fn_name_candidates(name string) []string {
@@ -535,43 +582,30 @@ fn should_mark_ident_as_fn(name string) bool {
 		|| name.starts_with('_result_')
 }
 
-fn (w &Walker) resolve_fn_name(name string, mod_name string) []int {
-	mut out := []int{}
+fn (mut w Walker) mark_fn_name(name string, mod_name string) {
 	if name == '' {
-		return out
+		return
 	}
 	for candidate in called_fn_name_candidates(name) {
-		for idx in w.lookup_indices('mod:${mod_name}:${candidate}') {
-			add_unique_int(mut out, idx)
-		}
-		for idx in w.lookup_indices('fn:${candidate}') {
-			add_unique_int(mut out, idx)
-		}
+		w.mark_lookup('mod:${mod_name}:${candidate}')
+		w.mark_lookup('fn:${candidate}')
 		if !candidate.contains('__') && mod_name != '' && mod_name != 'main'
 			&& mod_name != 'builtin' {
-			for idx in w.lookup_indices('fn:${mod_name}__${candidate}') {
-				add_unique_int(mut out, idx)
-			}
+			w.mark_lookup('fn:${mod_name}__${candidate}')
 		}
 	}
-	return out
 }
 
-fn (w &Walker) resolve_method_name(name string, receivers []string) []int {
-	mut out := []int{}
-	mut names := []string{}
-	add_unique_string(mut names, name)
-	add_unique_string(mut names, normalize_method_name(name))
-	for method_name in names {
-		for receiver in receivers {
-			for candidate in receiver_lookup_candidates(receiver) {
-				for idx in w.lookup_indices('meth:${candidate}:${method_name}') {
-					add_unique_int(mut out, idx)
-				}
+fn (mut w Walker) mark_method_name(name string, receivers []string) {
+	normalized := normalize_method_name(name)
+	for receiver in receivers {
+		for candidate in receiver_lookup_candidates(receiver) {
+			w.mark_lookup('meth:${candidate}:${name}')
+			if normalized != name {
+				w.mark_lookup('meth:${candidate}:${normalized}')
 			}
 		}
 	}
-	return out
 }
 
 fn receiver_lookup_candidates(receiver string) []string {
@@ -595,41 +629,36 @@ fn receiver_lookup_candidates(receiver string) []string {
 	return out
 }
 
-fn (w &Walker) resolve_method_name_fallback(name string) []int {
-	mut names := []string{}
-	add_unique_string(mut names, name)
-	add_unique_string(mut names, normalize_method_name(name))
-	mut out := []int{}
-	for method_name in names {
-		for idx in w.lookup_indices('mname:${method_name}') {
-			add_unique_int(mut out, idx)
-		}
+fn (mut w Walker) mark_method_name_fallback(name string) {
+	normalized := normalize_method_name(name)
+	// Check count first to avoid pulling in everything for common names.
+	count := w.lookup_count('mname:${name}') +
+		if normalized != name { w.lookup_count('mname:${normalized}') } else { 0 }
+	if count == 0 || count > 64 {
+		return
 	}
-	// Keep fallback bounded to avoid pulling in everything for common names.
-	if out.len > 0 && out.len <= 64 {
-		return out
+	w.mark_lookup('mname:${name}')
+	if normalized != name {
+		w.mark_lookup('mname:${normalized}')
 	}
-	return []int{}
 }
 
-fn (w &Walker) resolve_all_methods_for_receivers(receivers []string) []int {
-	mut out := []int{}
+fn (mut w Walker) mark_all_methods_for_receivers(receivers []string) {
 	for receiver in receivers {
 		if receiver in w.methods_by_receiver {
 			for idx in w.methods_by_receiver[receiver] {
-				add_unique_int(mut out, idx)
+				w.mark_fn(idx)
 			}
 		}
 		if receiver.contains('__') {
 			short_name := receiver.all_after_last('__')
 			if short_name in w.methods_by_receiver {
 				for idx in w.methods_by_receiver[short_name] {
-					add_unique_int(mut out, idx)
+					w.mark_fn(idx)
 				}
 			}
 		}
 	}
-	return out
 }
 
 fn ierror_wrapper_base_from_ident(name string) string {
@@ -654,9 +683,9 @@ fn (mut w Walker) mark_ierror_wrapper_dependencies(name string, mod_name string)
 	if base == '' {
 		return
 	}
-	w.mark_indices(w.resolve_fn_name('${base}__msg', mod_name))
-	w.mark_indices(w.resolve_fn_name('${base}__code', mod_name))
-	w.mark_indices(w.resolve_fn_name('Error__code', mod_name))
+	w.mark_fn_name('${base}__msg', mod_name)
+	w.mark_fn_name('${base}__code', mod_name)
+	w.mark_fn_name('Error__code', mod_name)
 }
 
 fn (w &Walker) interface_name_from_expr(expr ast.Expr, mod_name string) string {
@@ -704,17 +733,14 @@ fn (mut w Walker) mark_interface_conversion_methods(target_expr ast.Expr, value_
 	}
 	mut marked := false
 	if iface_name in w.interface_method_names {
+		prev_len := w.queue.len
 		for method_name in w.interface_method_names[iface_name] {
-			indices := w.resolve_method_name(method_name, receivers)
-			if indices.len == 0 {
-				continue
-			}
-			w.mark_indices(indices)
-			marked = true
+			w.mark_method_name(method_name, receivers)
 		}
+		marked = w.queue.len > prev_len
 	}
 	if !marked {
-		w.mark_indices(w.resolve_all_methods_for_receivers(receivers))
+		w.mark_all_methods_for_receivers(receivers)
 	}
 }
 
@@ -758,6 +784,12 @@ fn (w &Walker) receiver_candidates_for_expr(expr ast.Expr, mod_name string) []st
 				add_unique_string(mut out, name)
 			}
 		}
+		ast.InitExpr {
+			// InitExpr has a .typ that names the struct being constructed.
+			for name in w.receiver_candidates_for_expr(expr.typ, mod_name) {
+				add_unique_string(mut out, name)
+			}
+		}
 		else {}
 	}
 	return out
@@ -770,30 +802,35 @@ fn (w &Walker) is_cast_type_name(name string) bool {
 	return name in w.type_names
 }
 
-fn (w &Walker) resolve_call_lhs(lhs ast.Expr, mod_name string) []int {
+fn (mut w Walker) mark_call_lhs(lhs ast.Expr, mod_name string) {
 	match lhs {
 		ast.Ident {
-			return w.resolve_fn_name(lhs.name, mod_name)
+			w.mark_fn_name(lhs.name, mod_name)
 		}
 		ast.GenericArgs {
-			return w.resolve_call_lhs(lhs.lhs, mod_name)
+			w.mark_call_lhs(lhs.lhs, mod_name)
 		}
 		ast.GenericArgOrIndexExpr {
-			return w.resolve_call_lhs(lhs.lhs, mod_name)
+			w.mark_call_lhs(lhs.lhs, mod_name)
 		}
 		ast.SelectorExpr {
 			method_name := lhs.rhs.name
 			if lhs.lhs is ast.Ident {
 				left_name := lhs.lhs.name
 				if left_name == 'C' {
-					return w.resolve_fn_name(method_name, mod_name)
+					w.mark_fn_name(method_name, mod_name)
+					return
 				}
 				if left_name in w.module_names {
-					return w.resolve_fn_name('${left_name}__${method_name}', mod_name)
+					// Resolve import aliases (e.g., 'ssa_optimize' → 'optimize')
+					// so lookup finds 'optimize__func' not 'ssa_optimize__func'.
+					real_mod := w.module_alias_to_real[left_name] or { left_name }
+					w.mark_fn_name('${real_mod}__${method_name}', mod_name)
+					return
 				}
 				if left_name in w.type_names {
-					return w.resolve_method_name(method_name, [left_name,
-						'${mod_name}__${left_name}'])
+					w.mark_method_name(method_name, [left_name, '${mod_name}__${left_name}'])
+					return
 				}
 			}
 			if lhs.lhs is ast.SelectorExpr {
@@ -807,22 +844,19 @@ fn (w &Walker) resolve_call_lhs(lhs ast.Expr, mod_name string) []int {
 							'${mod_name}__${type_name}',
 							'${mod_ident}__${type_name}',
 						]
-						resolved := w.resolve_method_name(method_name, candidates)
-						if resolved.len > 0 {
-							return resolved
-						}
+						w.mark_method_name(method_name, candidates)
+						return
 					}
 				}
 			}
 			receivers := w.receiver_candidates_for_expr(lhs.lhs, mod_name)
 			if receivers.len > 0 {
-				return w.resolve_method_name(method_name, receivers)
+				w.mark_method_name(method_name, receivers)
+				return
 			}
-			return w.resolve_method_name_fallback(method_name)
+			w.mark_method_name_fallback(method_name)
 		}
-		else {
-			return []int{}
-		}
+		else {}
 	}
 }
 
@@ -894,6 +928,10 @@ fn (mut w Walker) walk_stmt(stmt ast.Stmt, mod_name string) {
 		ast.ReturnStmt {
 			for expr in stmt.exprs {
 				w.walk_expr(expr, mod_name)
+				// If the function returns an interface type and the return expr
+				// is a concrete struct InitExpr, mark the concrete type's
+				// interface methods so the vtable wrapper can call them.
+				w.mark_interface_conversion_methods(w.cur_fn_decl.typ.return_type, expr, mod_name)
 			}
 		}
 		ast.StructDecl {
@@ -945,7 +983,7 @@ fn (mut w Walker) walk_expr(expr ast.Expr, mod_name string) {
 			}
 		}
 		ast.CallExpr {
-			w.mark_indices(w.resolve_call_lhs(expr.lhs, mod_name))
+			w.mark_call_lhs(expr.lhs, mod_name)
 			w.walk_expr(expr.lhs, mod_name)
 			for arg in expr.args {
 				w.walk_expr(arg, mod_name)
@@ -957,7 +995,7 @@ fn (mut w Walker) walk_expr(expr ast.Expr, mod_name string) {
 				w.walk_expr(expr.expr, mod_name)
 				return
 			}
-			w.mark_indices(w.resolve_call_lhs(expr.lhs, mod_name))
+			w.mark_call_lhs(expr.lhs, mod_name)
 			w.walk_expr(expr.lhs, mod_name)
 			w.walk_expr(expr.expr, mod_name)
 		}
@@ -984,8 +1022,8 @@ fn (mut w Walker) walk_expr(expr ast.Expr, mod_name string) {
 		}
 		ast.Ident {
 			w.mark_ierror_wrapper_dependencies(expr.name, mod_name)
-			if !w.is_cast_type_name(expr.name) && should_mark_ident_as_fn(expr.name) {
-				w.mark_indices(w.resolve_fn_name(expr.name, mod_name))
+			if !w.is_cast_type_name(expr.name) {
+				w.mark_fn_name(expr.name, mod_name)
 			}
 		}
 		ast.IfExpr {

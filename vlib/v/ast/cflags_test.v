@@ -36,7 +36,8 @@ fn test_parse_valid_cflags() {
 	parse_valid_flag(mut t, 'mingw -mwindows')
 	parse_valid_flag(mut t, 'solaris -L/opt/local/lib')
 	parse_valid_flag(mut t, 'windows -lgdi32')
-	parse_valid_flag(mut t, 'linux -I/usr/include/SDL2 -D_REENTRANT -L/usr/lib/x86_64-linux-gnu -lSDL2')
+	parse_valid_flag(mut t,
+		'linux -I/usr/include/SDL2 -D_REENTRANT -L/usr/lib/x86_64-linux-gnu -lSDL2')
 	parse_valid_flag(mut t, '-I/usr/include/mysql -m64 -I/usr/include')
 	parse_valid_flag(mut t, '/v/thirdparty/tcc/lib/libgc.a')
 	parse_valid_flag(mut t, '-I/usr/include/你好 my , @с интервали')
@@ -52,6 +53,7 @@ fn test_parse_invalid_cflags() {
 	assert_parse_invalid_flag(mut t, 'windows -l')
 	assert_parse_invalid_flag(mut t, '-I')
 	assert_parse_invalid_flag(mut t, '-L')
+	assert_parse_invalid_flag(mut t, 'darwin `sdl2-config --cflags --libs` -lSDL2')
 	// OS/compiler name only is not allowed
 	assert_parse_invalid_flag(mut t, 'darwin')
 	assert_parse_invalid_flag(mut t, 'freebsd')

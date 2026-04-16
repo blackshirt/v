@@ -8,9 +8,10 @@ import v2.ast
 import strings
 
 fn (mut g Gen) gen_string_inter_literal(node ast.StringInterLiteral) {
-	// Use sprintf approach with asprintf (allocates automatically)
+	// Two-pass snprintf: first into a 256-byte stack buffer to measure,
+	// then use it directly or heap-allocate only when it doesn't fit.
+	// This avoids the unconditional heap allocation of asprintf.
 	// Wrapped in GCC compound expression ({ ... })
-	// Build format string, stripping V string delimiters from values
 	mut fmt_str := strings.new_builder(64)
 	for i, raw_val in node.values {
 		mut val := raw_val
@@ -22,40 +23,51 @@ fn (mut g Gen) gen_string_inter_literal(node ast.StringInterLiteral) {
 		if i == node.values.len - 1 && val.len > 0 && val[val.len - 1] in [`'`, `"`] {
 			val = val[..val.len - 1]
 		}
-		// `c_string_literal_content_to_c` escapes quotes and preserves multiline
-		// content; keep only tab escaping here to preserve `\t` marker semantics.
-		// Escape `%` to `%%` so literal percent signs in the V string are not
-		// consumed as printf format specifiers by asprintf.
 		escaped := val.replace('%', '%%').replace('\t', '\\t')
 		fmt_str.write_string(escaped)
 		if i < node.inters.len {
 			inter := node.inters[i]
-			if inter.resolved_fmt != '' {
-				// Transformer already resolved the format specifier
-				fmt_str.write_string(inter.resolved_fmt)
-			} else {
-				fmt_str.write_string(g.get_sprintf_format(inter))
-			}
+			fmt_str.write_string(g.get_sprintf_format(inter))
 		}
 	}
 	fmt_lit := c_string_literal_content_to_c(fmt_str.str())
-	g.sb.write_string('({ char* _sip; int _sil = asprintf(&_sip, ${fmt_lit}')
-	// Write arguments
+
+	// Build the argument list string once (used in both snprintf calls).
+	// write_sprintf_arg writes to g.sb, so we temporarily swap it out,
+	// capture the result, and restore it.
+	mut args_sb := strings.new_builder(64)
 	for inter in node.inters {
-		g.sb.write_string(', ')
-		if inter.resolved_fmt != '' {
-			// Transformer already transformed the arg, emit directly
-			g.expr(inter.expr)
-		} else {
-			g.write_sprintf_arg(inter)
-		}
+		args_sb.write_string(', ')
+		saved := g.sb
+		g.sb = strings.new_builder(64)
+		g.write_sprintf_arg(inter)
+		arg_str := g.sb.str()
+		g.sb = saved
+		args_sb.write_string(arg_str)
 	}
-	g.sb.write_string('); ${c_v_string_expr_from_ptr_len('_sip', '_sil', false)}; })')
+	args_str := args_sb.str()
+
+	// Emit: try stack buffer first, fall back to malloc only if needed.
+	g.sb.write_string('({ char _sib[256]; int _sil = snprintf(_sib, sizeof(_sib), ${fmt_lit}${args_str}); ')
+	g.sb.write_string('char* _sip; if (_sil < (int)sizeof(_sib)) { _sip = memdup(_sib, _sil + 1); } ')
+	g.sb.write_string('else { _sip = (char*)malloc(_sil + 1); snprintf(_sip, _sil + 1, ${fmt_lit}${args_str}); } ')
+	g.sb.write_string('${c_v_string_expr_from_ptr_len('_sip', '_sil', false)}; })')
 }
 
 fn (mut g Gen) write_sprintf_arg(inter ast.StringInter) {
 	expr_type := g.get_expr_type(inter.expr)
 	expr_src := g.expr_to_string(inter.expr)
+	fmt := g.get_sprintf_format(inter)
+	// Keep vararg C types aligned with the emitted format string.
+	// If formatter expects a non-string argument, pass expression as-is.
+	if !fmt.ends_with('s') {
+		if expr_src == '' {
+			g.sb.write_string('0')
+		} else {
+			g.sb.write_string(expr_src)
+		}
+		return
+	}
 	str_fn := g.get_str_fn_for_type(expr_type) or { '' }
 	// Float types: use V's str() for default formatting ('0.0' not '0.000000')
 	if expr_type in ['f64', 'f32', 'float_literal'] && inter.format == .unformatted {
@@ -102,6 +114,9 @@ fn (mut g Gen) write_sprintf_arg(inter ast.StringInter) {
 }
 
 fn (mut g Gen) get_sprintf_format(inter ast.StringInter) string {
+	if inter.resolved_fmt != '' {
+		return inter.resolved_fmt
+	}
 	mut fmt := '%'
 	mut width := inter.width
 	mut precision := inter.precision

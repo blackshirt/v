@@ -1,5 +1,18 @@
 import os
 
+fn env_snapshot(name string) (string, bool) {
+	val := os.getenv_opt(name) or { return '', false }
+	return val, true
+}
+
+fn restore_env(name string, value string, existed bool) {
+	if existed {
+		os.setenv(name, value, true)
+	} else {
+		os.unsetenv(name)
+	}
+}
+
 fn test_tmpdir() {
 	t := os.temp_dir()
 	assert t.len > 0
@@ -26,8 +39,7 @@ fn test_expand_tilde_to_home() {
 	os.setenv('USERPROFILE', r'\tmp\home\folder', true)
 
 	home_test := os.join_path(os.home_dir(), 'test', 'tilde', 'expansion')
-	home_expansion_test := os.expand_tilde_to_home(os.join_path('~', 'test', 'tilde',
-		'expansion'))
+	home_expansion_test := os.expand_tilde_to_home(os.join_path('~', 'test', 'tilde', 'expansion'))
 	assert home_test == home_expansion_test
 	assert os.expand_tilde_to_home('~') == os.home_dir()
 }
@@ -39,4 +51,51 @@ fn test_config_dir() {
 	os.mkdir_all(adir)!
 	os.rmdir(adir)!
 	assert os.is_dir(cdir)
+}
+
+fn test_data_dir_prefers_platform_location() {
+	xdg_data_home, had_xdg_data_home := env_snapshot('XDG_DATA_HOME')
+	defer {
+		restore_env('XDG_DATA_HOME', xdg_data_home, had_xdg_data_home)
+	}
+	$if windows {
+		local_app_data, had_local_app_data := env_snapshot('LocalAppData')
+		userprofile, had_userprofile := env_snapshot('USERPROFILE')
+		test_root := os.join_path(os.temp_dir(), 'v_data_dir_windows_test_${os.getpid()}')
+		defer {
+			restore_env('LocalAppData', local_app_data, had_local_app_data)
+			restore_env('USERPROFILE', userprofile, had_userprofile)
+			os.rmdir_all(test_root) or {}
+		}
+		expected := os.join_path(test_root, 'LocalAppData')
+		os.setenv('XDG_DATA_HOME', os.join_path(test_root, 'XdgDataHome'), true)
+		os.setenv('LocalAppData', expected, true)
+		os.setenv('USERPROFILE', os.join_path(test_root, 'UserProfile'), true)
+		assert os.data_dir() == expected
+		assert os.is_dir(expected)
+	} $else {
+		test_root := os.join_path(os.temp_dir(), 'v_data_dir_xdg_test_${os.getpid()}')
+		defer {
+			os.rmdir_all(test_root) or {}
+		}
+		expected := os.join_path(test_root, 'XdgDataHome')
+		os.setenv('XDG_DATA_HOME', expected, true)
+		assert os.data_dir() == expected
+		assert os.is_dir(expected)
+	}
+}
+
+fn test_vmodules_dir_without_home_falls_back_to_vtmp() {
+	home, had_home := env_snapshot('HOME')
+	userprofile, had_userprofile := env_snapshot('USERPROFILE')
+	vmodules, had_vmodules := env_snapshot('VMODULES')
+	defer {
+		restore_env('HOME', home, had_home)
+		restore_env('USERPROFILE', userprofile, had_userprofile)
+		restore_env('VMODULES', vmodules, had_vmodules)
+	}
+	os.unsetenv('HOME')
+	os.unsetenv('USERPROFILE')
+	os.unsetenv('VMODULES')
+	assert os.vmodules_dir() == os.join_path_single(os.vtmp_dir(), '.vmodules')
 }

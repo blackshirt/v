@@ -229,7 +229,7 @@ fn (t &Table) stringify_fn_after_name(node &FnDecl, mut f strings.Builder, cur_m
 					s = t.type_to_str(param_typ.clear_flag(.shared_f).deref())
 				}
 			}
-			s = util.no_cur_mod(s, cur_mod)
+			s = shorten_full_name_based_on_cur_mod(s, cur_mod)
 			s = shorten_full_name_based_on_aliases(s, m2a)
 			if !is_type_only {
 				f.write_string(' ')
@@ -254,7 +254,7 @@ fn (t &Table) stringify_fn_after_name(node &FnDecl, mut f strings.Builder, cur_m
 		} else {
 			node.return_type
 		}
-		sreturn_type := util.no_cur_mod(t.type_to_str(return_type), cur_mod)
+		sreturn_type := shorten_full_name_based_on_cur_mod(t.type_to_str(return_type), cur_mod)
 		short_sreturn_type := shorten_full_name_based_on_aliases(sreturn_type, m2a)
 		f.write_string(' ${short_sreturn_type}')
 	}
@@ -292,6 +292,39 @@ struct StringifyModReplacement {
 	mod    string
 	alias  string
 	weight int
+}
+
+fn is_qualified_name_boundary(c u8) bool {
+	return !(c.is_letter() || c.is_digit() || c == `_` || c == `.`)
+}
+
+fn replace_qualified_name_based_on_alias(input string, mod string, alias string) string {
+	if mod.len == 0 || !input.contains(mod) {
+		return input
+	}
+	mut start := 0
+	mut changed := false
+	mut sb := strings.new_builder(input.len)
+	for {
+		idx := input.index_after(mod, start) or { break }
+		end := idx + mod.len
+		before_ok := idx == 0 || is_qualified_name_boundary(input[idx - 1])
+		after_ok := end == input.len || input[end] == `.` || is_qualified_name_boundary(input[end])
+		if before_ok && after_ok {
+			sb.write_string(input[start..idx])
+			sb.write_string(alias)
+			start = end
+			changed = true
+			continue
+		}
+		sb.write_string(input[start..end])
+		start = end
+	}
+	if !changed {
+		return input
+	}
+	sb.write_string(input[start..])
+	return sb.str()
 }
 
 fn shorten_full_name_based_on_aliases(input string, m2a map[string]string) string {
@@ -341,30 +374,54 @@ fn shorten_full_name_based_on_aliases(input string, m2a map[string]string) strin
 		// r.mod: `v.token` | r.alias: `xyz` | res: `v.token.Abc`                -> `xyz.Abc`
 		// r.mod: `v.ast`   | r.alias: `ast` | res: `v.ast.AliasTypeDecl`        -> `ast.AliasTypeDecl`
 		// r.mod: `v.ast`   | r.alias: `ast` | res: `[]v.ast.InterfaceEmbedding` -> `[]ast.InterfaceEmbedding`
-		res = res.replace(r.mod, r.alias)
+		res = replace_qualified_name_based_on_alias(res, r.mod, r.alias)
 	}
 	return res
+}
+
+fn shorten_full_name_based_on_cur_mod(input string, cur_mod string) string {
+	if cur_mod == '' || !input.contains('${cur_mod}.') {
+		return input
+	}
+	pattern := '${cur_mod}.'
+	mut out := strings.new_builder(input.len)
+	for i := 0; i < input.len; i++ {
+		if input[i..].starts_with(pattern)
+			&& (i == 0 || input[i - 1] in [` `, `(`, `[`, `,`, `|`, `&`, `?`, `!`, `:`]) {
+			i += pattern.len - 1
+			continue
+		}
+		out.write_u8(input[i])
+	}
+	return out.str()
 }
 
 // This method creates the format specifier (including the colon) or an empty
 // string if none is needed. For example, '${z:8.3f} ${a:-20} ${a>b+2}'
 pub fn (lit &StringInterLiteral) get_fspec(i int) string {
 	mut res := []string{}
+	has_dynamic_width := i < lit.fwidth_exprs.len && lit.fwidth_exprs[i] !is EmptyExpr
+	has_dynamic_precision := i < lit.precision_exprs.len && lit.precision_exprs[i] !is EmptyExpr
 	needs_fspec := lit.need_fmts[i] || lit.pluss[i]
-		|| (lit.fills[i] && lit.fwidths[i] >= 0) || lit.fwidths[i] != 0
-		|| lit.precisions[i] != 987698
+		|| (lit.fills[i] && (lit.fwidths[i] >= 0 || has_dynamic_width))
+		|| lit.fwidths[i] != 0 || lit.precisions[i] != 987698 || has_dynamic_width
+		|| has_dynamic_precision
 	if needs_fspec {
 		res << ':'
 		if lit.pluss[i] {
 			res << '+'
 		}
-		if lit.fills[i] && lit.fwidths[i] >= 0 {
+		if lit.fills[i] && (lit.fwidths[i] >= 0 || has_dynamic_width) {
 			res << '0'
 		}
-		if lit.fwidths[i] != 0 {
+		if has_dynamic_width {
+			res << '(${lit.fwidth_exprs[i].str()})'
+		} else if lit.fwidths[i] != 0 {
 			res << '${lit.fwidths[i]}'
 		}
-		if lit.precisions[i] != 987698 {
+		if has_dynamic_precision {
+			res << '.(${lit.precision_exprs[i].str()})'
+		} else if lit.precisions[i] != 987698 {
 			res << '.${lit.precisions[i]}'
 		}
 		if lit.need_fmts[i] {
@@ -657,7 +714,12 @@ pub fn (x Expr) str() string {
 			return s + ' := ' + x.expr.str()
 		}
 		StructInit {
-			sname := global_table.sym(x.typ).name
+			idx := x.typ.idx()
+			sname := if idx > 0 && idx < global_table.type_symbols.len {
+				global_table.type_symbols[idx].name
+			} else {
+				'unknown'
+			}
 			return '${sname}{....}'
 		}
 		ArrayDecompose {

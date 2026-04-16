@@ -68,28 +68,128 @@ const vlib_cached_module_names = [
 	'textscanner',
 ]
 
-const core_cache_format = 'cc6'
+const v2compiler_cache_name = 'v2compiler'
 
-const core_headers_format = 'vh44'
+const v2compiler_cached_module_paths = [
+	'v2.ast',
+	'v2.abi',
+	'v2.builder',
+	'v2.errors',
+	'v2.eval',
+	'v2.gen.arm64',
+	'v2.gen.c',
+	'v2.gen.cleanc',
+	'v2.gen.v',
+	'v2.gen.x64',
+	'v2.insel',
+	'v2.markused',
+	'v2.mir',
+	'v2.parser',
+	'v2.pref',
+	'v2.scanner',
+	'v2.ssa',
+	'v2.ssa.optimize',
+	'v2.token',
+	'v2.transformer',
+	'v2.types',
+]
+
+const v2compiler_cached_module_names = [
+	'ast',
+	'abi',
+	'builder',
+	'errors',
+	'eval',
+	'arm64',
+	'c',
+	'cleanc',
+	'v',
+	'x64',
+	'insel',
+	'markused',
+	'mir',
+	'parser',
+	'pref',
+	'scanner',
+	'ssa',
+	'optimize',
+	'token',
+	'transformer',
+	'types',
+]
+
+const core_cache_format = 'cc8'
+
+const core_headers_format = 'vh48'
+
+const core_cache_compiler_dependency_dirs = [
+	'vlib/v2/abi',
+	'vlib/v2/ast',
+	'vlib/v2/builder',
+	'vlib/v2/errors',
+	'vlib/v2/eval',
+	'vlib/v2/gen/arm64',
+	'vlib/v2/gen/c',
+	'vlib/v2/gen/cleanc',
+	'vlib/v2/gen/v',
+	'vlib/v2/gen/x64',
+	'vlib/v2/insel',
+	'vlib/v2/markused',
+	'vlib/v2/mir',
+	'vlib/v2/parser',
+	'vlib/v2/pref',
+	'vlib/v2/scanner',
+	'vlib/v2/ssa',
+	'vlib/v2/ssa/optimize',
+	'vlib/v2/token',
+	'vlib/v2/transformer',
+	'vlib/v2/types',
+	'vlib/v2/util',
+]
+
+const core_cache_compiler_dependency_file_paths = ['cmd/v2/v2.v']
 
 fn (b &Builder) core_cache_dir() string {
-	return os.join_path(os.temp_dir(), 'v2_cleanc_obj_cache')
+	base := if b.pref.is_prod { 'v2_cleanc_obj_cache_prod' } else { 'v2_cleanc_obj_cache' }
+	return cache_path_join(os.temp_dir(), base)
+}
+
+fn (b &Builder) ensure_core_cache_dir() bool {
+	cache_dir := b.core_cache_dir()
+	if !os.exists(cache_dir) {
+		os.mkdir_all(cache_dir, mode: 0o700) or { return false }
+	}
+	if !os.is_dir(cache_dir) {
+		return false
+	}
+	if !os.is_readable(cache_dir) || !os.is_writable(cache_dir) {
+		os.chmod(cache_dir, 0o700) or {}
+	}
+	return os.is_readable(cache_dir) && os.is_writable(cache_dir)
 }
 
 fn (b &Builder) core_cache_obj_path() string {
-	return os.join_path(b.core_cache_dir(), '${builtin_cache_name}.o')
+	return cache_path_join(b.core_cache_dir(), '${builtin_cache_name}.o')
 }
 
 fn (b &Builder) core_cache_stamp_path() string {
-	return os.join_path(b.core_cache_dir(), '${builtin_cache_name}.stamp')
+	return cache_path_join(b.core_cache_dir(), '${builtin_cache_name}.stamp')
 }
 
 fn (b &Builder) core_headers_stamp_path() string {
-	return os.join_path(b.core_cache_dir(), 'cached_modules.vh.stamp')
+	return cache_path_join(b.core_cache_dir(), 'cached_modules.vh.stamp')
 }
 
 fn (b &Builder) core_header_path(module_name string) string {
-	return os.join_path(b.core_cache_dir(), '${module_name}.vh')
+	return cache_path_join(b.core_cache_dir(), '${module_name}.vh')
+}
+
+fn cache_path_join(dir string, file string) string {
+	base := dir.trim_right('/\\')
+	if base == '' {
+		return file
+	}
+	return '${base}/${file}'
 }
 
 fn (b &Builder) core_header_paths() []string {
@@ -102,6 +202,20 @@ fn (b &Builder) core_header_paths() []string {
 
 fn (b &Builder) core_cached_parse_paths() []string {
 	return b.core_header_paths()
+}
+
+// vlib_only_header_paths returns .vh paths for only the builtin+vlib modules
+// (not v2compiler modules). Used when generating the main .c file to avoid
+// type/function conflicts with the v2compiler.o cached object.
+fn (b &Builder) vlib_only_header_paths() []string {
+	mut paths := []string{cap: builtin_cached_module_names.len + vlib_cached_module_names.len}
+	for module_name in builtin_cached_module_names {
+		paths << b.core_header_path(module_name)
+	}
+	for module_name in vlib_cached_module_names {
+		paths << b.core_header_path(module_name)
+	}
+	return paths
 }
 
 fn (b &Builder) use_builtin_header_for_parse() bool {
@@ -127,15 +241,49 @@ fn (b &Builder) module_source_files(modules []string) []string {
 	return files
 }
 
+fn (b &Builder) core_cache_compiler_dependency_files() []string {
+	root := if b.pref.vroot.len > 0 { b.pref.vroot } else { os.getwd() }
+	mut files_set := map[string]bool{}
+	for rel_dir in core_cache_compiler_dependency_dirs {
+		dir := os.join_path(root, rel_dir)
+		if !os.is_dir(dir) {
+			continue
+		}
+		for file in get_v_files_from_dir(dir, b.pref.user_defines) {
+			files_set[os.norm_path(file)] = true
+		}
+	}
+	for rel_file in core_cache_compiler_dependency_file_paths {
+		file := os.join_path(root, rel_file)
+		if os.exists(file) {
+			files_set[os.norm_path(file)] = true
+		}
+	}
+	mut files := files_set.keys()
+	files.sort()
+	return files
+}
+
 fn (b &Builder) cache_stamp_for_modules(cache_name string, modules []string, cc string, cc_flags string) string {
 	source_files := b.module_source_files(modules)
-	mut lines := []string{cap: source_files.len + 10}
+	compiler_files := b.core_cache_compiler_dependency_files()
+	mut lines := []string{cap: source_files.len + compiler_files.len + 10}
 	lines << 'cache=${cache_name}'
 	lines << 'format=${core_cache_format}'
 	lines << 'cc=${cc}'
 	lines << 'cc_flags=${cc_flags}'
 	lines << 'context_alloc=${b.pref.use_context_allocator}'
+	// Include user entry files in cache stamp: the transformer injects
+	// helper functions (str, eq, sort comparators) into builtin module AST
+	// based on types from the user's source file. Different source files
+	// produce different generated functions, so the cache must invalidate.
+	for file in b.user_files {
+		lines << 'entry:${file}:${os.file_last_mod_unix(file)}'
+	}
 	for file in source_files {
+		lines << '${file}:${os.file_last_mod_unix(file)}'
+	}
+	for file in compiler_files {
 		lines << '${file}:${os.file_last_mod_unix(file)}'
 	}
 	return lines.join('\n')
@@ -155,22 +303,59 @@ fn (b &Builder) core_cache_context_stamp() string {
 
 fn (b &Builder) header_stamp_for_modules(modules []string) string {
 	source_files := b.module_source_files(modules)
-	mut lines := []string{cap: source_files.len + 4}
+	compiler_files := b.core_cache_compiler_dependency_files()
+	mut lines := []string{cap: source_files.len + compiler_files.len + 4}
 	lines << 'format=${core_headers_format}'
 	for file in source_files {
 		lines << '${file}:${os.file_last_mod_unix(file)}'
 	}
+	for file in compiler_files {
+		lines << '${file}:${os.file_last_mod_unix(file)}'
+	}
 	return lines.join('\n')
+}
+
+// can_use_cached_core_headers_for_parse checks whether .vh header files
+// exist, are non-empty, and their stamp matches the current source/compiler
+// file timestamps.  The .o stamp validation is skipped (the gen phase
+// rebuilds stale .o files via ensure_cached_module_object), but the .vh
+// stamp IS validated so that stale headers trigger a full parse — otherwise
+// the gen phase would regenerate .o from incomplete .vh ASTs.
+fn (b &Builder) can_use_cached_core_headers_for_parse() bool {
+	if b.pref.no_cache || b.pref.skip_builtin {
+		return false
+	}
+	if !b.ensure_core_cache_dir() {
+		return false
+	}
+	// Validate .vh header stamp (no cc/cc_flags — only source + compiler timestamps).
+	expected_header_stamp := b.header_stamp_for_modules(core_cached_module_paths)
+	current_header_stamp := os.read_file(b.core_headers_stamp_path()) or { return false }
+	if current_header_stamp != expected_header_stamp {
+		return false
+	}
+	for header_path in b.core_header_paths() {
+		if !os.exists(header_path) {
+			return false
+		}
+		if os.file_size(header_path) == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 fn (b &Builder) can_use_cached_core_headers() bool {
 	if b.pref.no_cache || b.pref.skip_builtin {
 		return false
 	}
-	cc := os.getenv_opt('V2CC') or { 'cc' }
-	cc_flags := os.getenv_opt('V2CFLAGS') or { '' }
-	if !b.can_use_cached_module_bundle(builtin_cache_name, builtin_cached_module_paths,
-		cc, cc_flags) {
+	if !b.ensure_core_cache_dir() {
+		return false
+	}
+	cc := configured_cc(b.pref.vroot)
+	cc_flags := configured_cflags()
+	if !b.can_use_cached_module_bundle(builtin_cache_name, builtin_cached_module_paths, cc,
+		cc_flags) {
 		return false
 	}
 	if vlib_cached_module_paths.len > 0
@@ -186,11 +371,20 @@ fn (b &Builder) can_use_cached_core_headers() bool {
 		if !os.exists(header_path) {
 			return false
 		}
+		// .vh files must have content — empty headers cause missing
+		// symbol errors during split compilation.
+		header_size := os.file_size(header_path)
+		if header_size == 0 {
+			return false
+		}
 	}
 	return true
 }
 
 fn (b &Builder) can_use_cached_module_bundle(cache_name string, module_paths []string, cc string, cc_flags string) bool {
+	if !b.ensure_core_cache_dir() {
+		return false
+	}
 	obj_file := cache_name + '.o'
 	stamp_file := cache_name + '.stamp'
 	obj_path := os.join_path(b.core_cache_dir(), obj_file)
@@ -204,8 +398,9 @@ fn (b &Builder) can_use_cached_module_bundle(cache_name string, module_paths []s
 }
 
 fn (mut b Builder) ensure_core_module_headers() {
-	cache_dir := b.core_cache_dir()
-	os.mkdir_all(cache_dir) or { return }
+	if !b.ensure_core_cache_dir() {
+		return
+	}
 	expected_stamp := b.header_stamp_for_modules(core_cached_module_paths)
 	mut has_headers := true
 	for header_path in b.core_header_paths() {
@@ -235,8 +430,14 @@ fn (mut b Builder) ensure_core_module_headers() {
 		header_source = merge_missing_source_fn_decls(header_source, source_fn_decls)
 		source_struct_fields := b.source_struct_field_types_for_module(module_name)
 		header_source = repair_missing_struct_field_types(header_source, source_struct_fields)
-		header_source = ensure_ierror_interface_methods(header_source)
 		if header_source.len == 0 {
+			// Empty header would cause missing symbols in split compilation.
+			// Remove any partial headers already written and skip stamp update
+			// so the next build retries generation.
+			for cleanup_name in core_cached_module_names {
+				os.rm(b.core_header_path(cleanup_name)) or {}
+			}
+			os.rm(b.core_headers_stamp_path()) or {}
 			return
 		}
 		if !header_source.ends_with('\n') {
@@ -326,6 +527,9 @@ fn (b &Builder) source_fn_decls_for_module(module_name string) map[string]string
 				in_interface = true
 				continue
 			}
+			if !line.starts_with('fn ') && !line.starts_with('pub fn ') {
+				continue
+			}
 			info := parse_fn_signature_and_return(line) or { continue }
 			mut decl_line := info.signature
 			if info.return_type.len > 0 {
@@ -407,7 +611,7 @@ fn (b &Builder) build_module_header_ast(source_files []ast.File, module_name str
 	mut type_decl_seen := map[string]bool{}
 	mut decl_stmts := []ast.Stmt{}
 	for file in source_files {
-		if file_module_name(file) != module_name {
+		if ast_file_module_name(file) != module_name {
 			continue
 		}
 		for stmt in file.stmts {
@@ -446,6 +650,7 @@ fn (b &Builder) build_module_header_ast(source_files []ast.File, module_name str
 					decl_stmts << ast.Stmt(ast.StructDecl{
 						is_public:      stmt.is_public
 						is_union:       stmt.is_union
+						implements:     stmt.implements
 						embedded:       stmt.embedded
 						language:       stmt.language
 						name:           stmt.name
@@ -480,8 +685,7 @@ fn (b &Builder) build_module_header_ast(source_files []ast.File, module_name str
 					type_decl_seen[type_decl.name] = true
 				}
 				ast.InterfaceDecl {
-					decl_stmts << ast.Stmt(b.resolved_header_interface_decl(module_name,
-						stmt))
+					decl_stmts << ast.Stmt(b.resolved_header_interface_decl(module_name, stmt))
 				}
 				ast.GlobalDecl {
 					mut gfields := []ast.FieldDecl{cap: stmt.fields.len}
@@ -667,10 +871,10 @@ fn (b &Builder) lookup_alias_base_type_expr(module_name string, type_name string
 		mut mod_scope := unsafe { scope }
 		if obj := mod_scope.lookup_parent(type_name, 0) {
 			obj_typ := obj.typ()
-			if obj_typ is types.Alias {
-				return type_name_to_ast_expr(obj_typ.base_type.name())
+			if base_type_name := types.alias_base_type_name(obj_typ) {
+				return type_name_to_ast_expr(base_type_name)
 			}
-			obj_type_name := normalize_header_type_name(obj_typ.name())
+			obj_type_name := normalize_header_type_name(types.type_name(obj_typ))
 			if obj_type_name != '' && obj_type_name != type_name {
 				return type_name_to_ast_expr(obj_type_name)
 			}
@@ -733,7 +937,7 @@ fn merge_header_fn_type(source_fn ast.FnType, resolved_type types.Type) ast.FnTy
 			mut merged_return := source_fn.return_type
 			if merged_return is ast.EmptyExpr {
 				if return_type := resolved_type.get_return_type() {
-					merged_return = type_name_to_ast_expr(return_type.name())
+					merged_return = type_name_to_ast_expr(types.type_name(return_type))
 				}
 			}
 			mut merged_params := source_fn.params.clone()
@@ -748,7 +952,7 @@ fn merge_header_fn_type(source_fn ast.FnType, resolved_type types.Type) ast.FnTy
 					if merged_params[i].typ !is ast.EmptyExpr {
 						continue
 					}
-					param_type := type_name_to_ast_expr(param_types[i].name())
+					param_type := type_name_to_ast_expr(types.type_name(param_types[i]))
 					merged_params[i] = ast.Parameter{
 						name:   merged_params[i].name
 						typ:    param_type
@@ -792,6 +996,27 @@ fn (b &Builder) module_name_to_path(module_name string) string {
 		'sha256' { 'crypto.sha256' }
 		'textscanner' { 'strings.textscanner' }
 		'termios' { 'term.termios' }
+		'ast' { 'v2.ast' }
+		'abi' { 'v2.abi' }
+		'builder' { 'v2.builder' }
+		'errors' { 'v2.errors' }
+		'eval' { 'v2.eval' }
+		'arm64' { 'v2.gen.arm64' }
+		'c' { 'v2.gen.c' }
+		'cleanc' { 'v2.gen.cleanc' }
+		'v' { 'v2.gen.v' }
+		'x64' { 'v2.gen.x64' }
+		'insel' { 'v2.insel' }
+		'markused' { 'v2.markused' }
+		'mir' { 'v2.mir' }
+		'parser' { 'v2.parser' }
+		'pref' { 'v2.pref' }
+		'scanner' { 'v2.scanner' }
+		'ssa' { 'v2.ssa' }
+		'optimize' { 'v2.ssa.optimize' }
+		'token' { 'v2.token' }
+		'transformer' { 'v2.transformer' }
+		'types' { 'v2.types' }
 		else { module_name }
 	}
 }
@@ -870,7 +1095,7 @@ fn (b &Builder) lookup_const_type_expr(module_name string, const_name string) ?a
 	scope := b.env.get_scope(module_name) or { return none }
 	mut mod_scope := unsafe { scope }
 	obj := mod_scope.lookup_parent(const_name, 0) or { return none }
-	mut type_name := normalize_const_type_name(module_name, obj.typ().name())
+	mut type_name := normalize_const_type_name(module_name, types.type_name(obj.typ()))
 	if type_name.len == 0 || !header_type_name_is_sane(type_name) {
 		return none
 	}
@@ -927,9 +1152,16 @@ fn (b &Builder) module_defines_c_type(module_name string, type_name string) bool
 	for file in get_v_files_from_dir(module_dir, b.pref.user_defines) {
 		content := os.read_file(file) or { continue }
 		for pattern in patterns {
-			if content.contains(pattern) {
-				return true
+			idx := content.index(pattern) or { continue }
+			// Ensure whole-word match: char after pattern must not be alphanumeric or '_'.
+			end := idx + pattern.len
+			if end < content.len {
+				c := content[end]
+				if c == `_` || c.is_alnum() {
+					continue
+				}
 			}
+			return true
 		}
 	}
 	return false
@@ -1276,20 +1508,6 @@ fn merge_missing_source_fn_decls(header_source string, source_fn_decls map[strin
 	return merged
 }
 
-fn ensure_ierror_interface_methods(header_source string) string {
-	empty_pub := 'pub interface IError {\n}\n'
-	full_pub := 'pub interface IError {\n\tmsg fn() string\n\tcode fn() int\n}\n'
-	if header_source.contains(empty_pub) {
-		return header_source.replace(empty_pub, full_pub)
-	}
-	empty_plain := 'interface IError {\n}\n'
-	full_plain := 'interface IError {\n\tmsg fn() string\n\tcode fn() int\n}\n'
-	if header_source.contains(empty_plain) {
-		return header_source.replace(empty_plain, full_plain)
-	}
-	return header_source
-}
-
 fn header_struct_block_name(trimmed string) ?string {
 	if !trimmed.ends_with('{') {
 		return none
@@ -1379,6 +1597,7 @@ fn sanitize_header_source(source string, source_fn_returns map[string]string) st
 	mut global_start_line := ''
 	mut global_body_lines := []string{}
 	mut in_type_block := false
+	mut in_enum_block := false
 	for source_line in lines {
 		mut line := source_line
 		line = restore_fn_return_type_from_source(line, source_fn_returns)
@@ -1386,16 +1605,18 @@ fn sanitize_header_source(source string, source_fn_returns map[string]string) st
 		if !in_global_block {
 			if header_starts_type_block(trimmed) {
 				in_type_block = true
+				in_enum_block = trimmed.starts_with('enum ') || trimmed.starts_with('pub enum ')
 				out << line
 				continue
 			}
 			if in_type_block {
 				if trimmed == '}' {
 					in_type_block = false
+					in_enum_block = false
 					out << line
 					continue
 				}
-				if header_type_block_line_is_malformed(trimmed) {
+				if !in_enum_block && header_type_block_line_is_malformed(trimmed) {
 					continue
 				}
 			}
@@ -1434,9 +1655,37 @@ fn sanitize_header_source(source string, source_fn_returns map[string]string) st
 			&& header_const_decl_line_is_malformed(trimmed) {
 			continue
 		}
+		// Drop stray code lines that are not valid module-level declarations.
+		// These can leak from the V gen output for complex modules.
+		if !in_type_block && !in_global_block && trimmed.len > 0
+			&& !header_is_module_level_line(trimmed) {
+			continue
+		}
 		out << line
 	}
 	return out.join('\n')
+}
+
+fn header_is_module_level_line(trimmed string) bool {
+	if trimmed.len == 0 {
+		return true
+	}
+	if trimmed.starts_with('//') || trimmed.starts_with('[') || trimmed.starts_with('@[') {
+		return true
+	}
+	if trimmed == '}' || trimmed == ')' || trimmed == 'mut:' || trimmed == 'pub:'
+		|| trimmed == 'pub mut:' {
+		return true
+	}
+	return trimmed.starts_with('module ') || trimmed.starts_with('import ')
+		|| trimmed.starts_with('fn ') || trimmed.starts_with('pub fn ')
+		|| trimmed.starts_with('struct ') || trimmed.starts_with('pub struct ')
+		|| trimmed.starts_with('enum ') || trimmed.starts_with('pub enum ')
+		|| trimmed.starts_with('type ') || trimmed.starts_with('pub type ')
+		|| trimmed.starts_with('const ') || trimmed.starts_with('pub const ')
+		|| trimmed.starts_with('interface ') || trimmed.starts_with('pub interface ')
+		|| trimmed.starts_with('union ') || trimmed.starts_with('pub union ')
+		|| trimmed.starts_with('__global')
 }
 
 fn header_starts_type_block(trimmed string) bool {
@@ -1446,6 +1695,7 @@ fn header_starts_type_block(trimmed string) bool {
 	return trimmed.starts_with('struct ') || trimmed.starts_with('pub struct ')
 		|| trimmed.starts_with('union ') || trimmed.starts_with('pub union ')
 		|| trimmed.starts_with('interface ') || trimmed.starts_with('pub interface ')
+		|| trimmed.starts_with('enum ') || trimmed.starts_with('pub enum ')
 }
 
 fn header_is_c_fn_decl_line(trimmed string) bool {
