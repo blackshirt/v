@@ -9,12 +9,39 @@ module sha3
 
 @[noinit]
 pub struct Shake {
-	rate int // bytes per permutation (168 for shake-128, 136 for shake-256)
+	rate   int // bytes per permutation (168 for shake-128, 136 for shake-256)
+	suffix u8
 mut:
 	s            State
 	input_buffer []u8
 	finalized    bool
 	squeeze_buf  []u8
+}
+
+fn new_cshake128(n []u8, s []u8) !&Shake {
+	mut c := &Shake{
+		rate:   cshake_rate128
+		suffix: u8(0x04)
+	}
+	mut initblock := []u8{cap: 9 + n.len + 9 + s.len}
+	initblock << left_encode(u64(n.len) << 3)
+	initblock << n
+	initblock << left_encode(u64(s.len) << 3)
+	initblock << s
+	write_bytepad(mut c, initblock, c.rate)!
+
+	return c
+}
+
+fn write_bytepad(mut c Shake, data []u8, rate int) ! {
+	rate_encoded := left_encode(u64(rate))
+	c.write(rate_encoded)
+	c.write(data)
+	padlen := rate - (rate_encoded.len + data.len) % rate
+	if padlen < rate {
+		padbytes := []u8{len: padlen, cap: cshake_rate128}
+		c.write(padbytes)
+	}
 }
 
 // new_shake128 returns a new Shake instance for SHAKE-128 extended output function.
@@ -82,9 +109,9 @@ fn (mut s Shake) finalize() {
 	// pad10*1 with xof domain separator 0x1f (FIPS 202 sec B.2)
 	mut padded := s.input_buffer.clone()
 	if padded.len == s.rate - 1 {
-		padded << u8(0x80 | 0x1f)
+		padded << u8(0x80 | s.suffix)
 	} else {
-		padded << u8(0x1f)
+		padded << s.suffix
 		for padded.len < s.rate - 1 {
 			padded << u8(0x00)
 		}

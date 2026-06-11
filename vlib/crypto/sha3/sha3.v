@@ -125,6 +125,8 @@ pub enum Padding as u8 {
 	keccak = 0x01
 	sha3   = 0x06
 	xof    = 0x1f
+	// The padding byte is 0x04 for cSHAKE
+	cshake = 0x04
 }
 
 @[params]
@@ -147,6 +149,7 @@ pub fn new_digest(absorption_rate int, hash_size int, config PaddingConfig) !&Di
 	match config.padding {
 		.sha3, .keccak { validate_sha3(absorption_rate, hash_size)! }
 		.xof { validate_xof(absorption_rate, hash_size)! }
+		.cshake {}
 	}
 
 	return new_digest_unchecked(absorption_rate, hash_size, config.padding)
