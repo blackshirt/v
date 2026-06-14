@@ -47,14 +47,16 @@ fn write_bytepad(mut c Shake, data []u8, rate int) ! {
 // new_shake128 returns a new Shake instance for SHAKE-128 extended output function.
 pub fn new_shake128() &Shake {
 	return &Shake{
-		rate: xof_rate_128
+		rate:   xof_rate_128
+		suffix: u8(Padding.xof)
 	}
 }
 
 // new_shake256 returns a new Shake instance for SHAKE-256 extended output function.
 pub fn new_shake256() &Shake {
 	return &Shake{
-		rate: xof_rate_256
+		rate:   xof_rate_256
+		suffix: u8(Padding.xof)
 	}
 }
 

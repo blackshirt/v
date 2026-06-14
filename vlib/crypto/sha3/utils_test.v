@@ -13,7 +13,7 @@ struct CShakeTest {
 const cshake_test_data = [
 	CShakeTest{4, '7dfcfa65'},
 	CShakeTest{32, '7dfcfa659c4f806b5e35e7f5416cd88eed105d027060a12ddf0df09882a4f042'},
-	CShakeTest{64, '7dfcfa659c4f806b5e35e7f5416cd88eed105d027060a12ddf0df09882a4f042dcef78095d2e54a14f9d973a2db3ca397e39ff2f30c2b125bcbf8c4432124c1d'}, 
+	CShakeTest{64, '7dfcfa659c4f806b5e35e7f5416cd88eed105d027060a12ddf0df09882a4f042dcef78095d2e54a14f9d973a2db3ca397e39ff2f30c2b125bcbf8c4432124c1d'},
 ]
 
 fn test_cshake_hash() ! {
