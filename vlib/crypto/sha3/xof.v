@@ -18,18 +18,36 @@ mut:
 	squeeze_buf  []u8
 }
 
-fn new_cshake128(n []u8, s []u8) !&Shake {
+// new_cshake128 returns a new cSHAKE128 instance customized with function name n and
+// customization string s. When both n and s are empty, it returns SHAKE128.
+pub fn new_cshake128(n []u8, s []u8) !&Shake {
+	if n.len == 0 && s.len == 0 {
+		return new_shake128()
+	}
+	return new_cshake(cshake_rate128, n, s)!
+}
+
+// new_cshake256 returns a new cSHAKE256 instance customized with function name n and
+// customization string s. When both n and s are empty, it returns SHAKE256.
+pub fn new_cshake256(n []u8, s []u8) !&Shake {
+	if n.len == 0 && s.len == 0 {
+		return new_shake256()
+	}
+	return new_cshake(cshake_rate256, n, s)!
+}
+
+fn new_cshake(rate int, n []u8, s []u8) !&Shake {
+	if rate !in [cshake_rate128, cshake_rate256] {
+		return error('unsupported cSHAKE absorption rate: ${rate}')
+	}
 	mut c := &Shake{
-		rate:   cshake_rate128
-		suffix: u8(0x04)
+		rate:   rate
+		suffix: u8(Padding.cshake)
 	}
 	mut initblock := []u8{cap: 9 + n.len + 9 + s.len}
-	initblock << left_encode(u64(n.len) << 3)
-	initblock << n
-	initblock << left_encode(u64(s.len) << 3)
-	initblock << s
+	initblock << encode_string(n)
+	initblock << encode_string(s)
 	write_bytepad(mut c, initblock, c.rate)!
-
 	return c
 }
 

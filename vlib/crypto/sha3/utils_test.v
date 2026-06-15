@@ -66,3 +66,47 @@ fn test_left_encode() ! {
 		assert out == v
 	}
 }
+
+fn test_cshake_empty_customization_matches_shake() ! {
+	msg := 'abc'.bytes()
+	assert cshake128(msg, 64, []u8{}, []u8{}) == shake128(msg, 64)
+	assert cshake256(msg, 64, []u8{}, []u8{}) == shake256(msg, 64)
+}
+
+fn test_cshake_one_shot_matches_streaming() ! {
+	msg := 'message'.bytes()
+	name := 'name'.bytes()
+	custom := 'custom'.bytes()
+	mut h128 := new_cshake128(name, custom)!
+	h128.write(msg[..3])
+	h128.write(msg[3..])
+	assert h128.read(64) == cshake128(msg, 64, name, custom)
+	mut h256 := new_cshake256(name, custom)!
+	h256.write(msg[..3])
+	h256.write(msg[3..])
+	assert h256.read(64) == cshake256(msg, 64, name, custom)
+}
+
+fn test_parallel_hash_errors() ! {
+	if _ := parallel_hash128('abc'.bytes(), 32, 0, []u8{}) {
+		assert false, 'parallel_hash128 should reject zero block size'
+	} else {
+		assert err.msg() == 'ParallelHash block size must be > 0'
+	}
+	if _ := parallel_hash256('abc'.bytes(), -1, 8, []u8{}) {
+		assert false, 'parallel_hash256 should reject negative output length'
+	} else {
+		assert err.msg() == 'ParallelHash output length must be >= 0'
+	}
+}
+
+fn test_parallel_hash_is_deterministic_and_customizable() ! {
+	msg := 'ParallelHash input message'.bytes()
+	a := parallel_hash128(msg, 32, 8, 'A'.bytes())!
+	b := parallel_hash128(msg, 32, 8, 'A'.bytes())!
+	c := parallel_hash128(msg, 32, 8, 'B'.bytes())!
+	assert a == b
+	assert a != c
+	out := parallel_hash256(msg, 64, 8, 'A'.bytes())!
+	assert out.len == 64
+}
