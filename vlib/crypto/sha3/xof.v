@@ -10,6 +10,7 @@ module sha3
 @[noinit]
 pub struct Shake {
 	rate int // bytes per permutation (168 for shake-128, 136 for shake-256)
+	ds   u8 = 0x1f // domain separator: 0x1f for SHAKE, 0x04 for cSHAKE/KMAC/TupleHash
 mut:
 	s            State
 	input_buffer []u8
@@ -79,12 +80,12 @@ fn (mut s Shake) finalize() {
 	}
 	s.finalized = true
 
-	// pad10*1 with xof domain separator 0x1f (FIPS 202 sec B.2)
+	// pad10*1 with the configured domain separator (FIPS 202 sec B.2)
 	mut padded := s.input_buffer.clone()
 	if padded.len == s.rate - 1 {
-		padded << u8(0x80 | 0x1f)
+		padded << u8(0x80 | s.ds)
 	} else {
-		padded << u8(0x1f)
+		padded << s.ds
 		for padded.len < s.rate - 1 {
 			padded << u8(0x00)
 		}
