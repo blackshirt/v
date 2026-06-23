@@ -2,6 +2,7 @@ module main
 
 import os
 import v3.bench
+import v3.eval
 import v3.flat
 import v3.gen.arm64
 import v3.gen.c as cgen
@@ -13,6 +14,13 @@ import v3.ssa.optimize
 import v3.transform
 import v3.types
 
+fn run_compile_command(cmd string) os.Result {
+	exit_code := os.system(cmd)
+	return os.Result{
+		exit_code: exit_code
+	}
+}
+
 fn C.open(charptr, int, int) int
 fn C.write(int, voidptr, int) int
 fn C.close(int) int
@@ -23,7 +31,7 @@ const o_wronly_creat_trunc = 0x601 // O_WRONLY | O_CREAT | O_TRUNC on Darwin
 fn main() {
 	args := os.args[1..]
 	if args.len == 0 {
-		eprintln('usage: v3 <file.v> [-o output] [-b c|arm64]')
+		eprintln('usage: v3 <file.v> [-o output|file.c] [-b c|arm64|eval]')
 		exit(1)
 	}
 
@@ -32,6 +40,7 @@ fn main() {
 	mut backend := 'c'
 	mut is_prod := false
 	mut is_strict := false
+	mut is_selfhost := false
 	mut no_parallel := false
 	mut i := 0
 	for i < args.len {
@@ -45,6 +54,7 @@ fn main() {
 			is_prod = true
 			i++
 		} else if args[i] == '-selfhost' {
+			is_selfhost = true
 			i++
 		} else if args[i] == '-strict' {
 			is_strict = true
@@ -64,9 +74,13 @@ fn main() {
 	}
 
 	mut bin_file := ''
+	mut c_only := false
 	if output_file == '' {
 		bin_file = input_file.all_before_last('.v')
 		output_file = bin_file + '.c'
+	} else if backend == 'c' && output_file.ends_with('.c') {
+		c_only = true
+		bin_file = output_file.all_before_last('.c')
 	} else {
 		bin_file = output_file
 		output_file = bin_file + '.c'
@@ -103,48 +117,58 @@ fn main() {
 
 	// Resolve imports recursively
 	resolve_imports(mut a, mut p, prefs, user_files)
+	diagnostic_root := if is_selfhost {
+		diagnostic_root_for_input(input_file, user_files)
+	} else {
+		''
+	}
 
 	b.step('parse')
 
-	// Type-collect + annotate expression types BEFORE transform, so the
-	// transformer is type-aware (like v2: check runs before transform). The
-	// transformer reads per-expression types to own type-dependent lowering.
+	// Type-collect + check BEFORE transform, so the transformer is type-aware
+	// (like v2: check runs before transform). The transformer reads cached
+	// per-expression types for type-dependent lowering.
 	mut pre_tc := types.TypeChecker.new(a)
+	pre_tc.reject_unsupported_generics = is_selfhost
 	pre_tc.collect(a)
-	pre_tc.annotate_types()
 	pre_tc.diagnose_unknown_calls = true
-	for uf in user_files {
-		pre_tc.diagnostic_files[uf] = true
-	}
+	set_diagnostic_files(mut pre_tc, user_files)
+	set_unsupported_generic_files(mut pre_tc, a, is_selfhost, diagnostic_root)
 	pre_tc.check_semantics()
 	if pre_tc.errors.len > 0 {
 		print_type_errors(pre_tc.errors)
 		exit(1)
-	}
-
-	// Transform (match lowering, string/in lowering, etc.)
-	transform.transform(mut a, &pre_tc)
-	b.step('transform')
-
-	// Reuse the pre-transform checker. Transform does not add declarations, so
-	// recollecting all type/index maps only duplicates memory when GC is off.
-	pre_tc.diagnose_unknown_calls = false
-	pre_tc.reject_unlowered_map_mutation = true
-	pre_tc.annotate_types()
-	for uf in user_files {
-		pre_tc.diagnostic_files[uf] = true
 	}
 	b.step('check')
 
-	pre_tc.check_semantics()
-	if pre_tc.errors.len > 0 {
-		print_type_errors(pre_tc.errors)
-		exit(1)
+	if backend == 'eval' {
+		mut runner := eval.new(prefs)
+		runner.run_files(a) or {
+			eprintln('error: ${err.msg()}')
+			exit(1)
+		}
+		b.step('eval')
+		b.print_report()
+		return
 	}
 
-	// Mark used functions (dead-code elimination)
+	// Mark used functions (dead-code elimination). This is done before transform
+	// so the transformer can skip function bodies that the C backend will prune.
 	used_fns := markused.mark_used(a, pre_tc)
 	b.step('markused')
+
+	// Transform (match lowering, string/in lowering, etc.)
+	transform.transform_with_used(mut a, &pre_tc, used_fns)
+	b.step('transform')
+
+	// Reuse the pre-transform checker for metadata only. Transform does not add
+	// declarations, and v1/v2 do not run a second semantic checker after lowering.
+	pre_tc.diagnose_unknown_calls = false
+	pre_tc.reject_unlowered_map_mutation = true
+	set_diagnostic_files(mut pre_tc, user_files)
+	set_unsupported_generic_files(mut pre_tc, a, is_selfhost, diagnostic_root)
+	pre_tc.annotate_types()
+	b.step('annotate types')
 
 	if backend == 'arm64' {
 		// SSA + ARM64 native backend
@@ -170,7 +194,12 @@ fn main() {
 			eprintln('error writing ${output_file}')
 			exit(1)
 		}
-		b.step('gen C/write')
+		gen_step_name := if g.was_parallel() { 'gen C/write (parallel)' } else { 'gen C/write' }
+		b.step(gen_step_name)
+		if c_only {
+			b.print_report()
+			return
+		}
 
 		opt_flag := if is_prod { '-O2 ' } else { '' }
 		warn_flags := if is_strict {
@@ -188,7 +217,7 @@ fn main() {
 			tcc_lib := '-L${tcc_lib_dir}'
 			cc_cmd = '${tcc_path} ${tcc_includes} ${tcc_lib} ${warn_flags} -o ${bin_file} ${output_file} -lm'
 			println('  > ${cc_cmd}')
-			result = os.execute(cc_cmd)
+			result = run_compile_command(cc_cmd)
 		}
 		if is_prod || result.exit_code != 0 {
 			if result.exit_code != 0 && result.output.len > 0 {
@@ -196,7 +225,7 @@ fn main() {
 			}
 			cc_cmd = 'cc -std=gnu11 ${opt_flag}${warn_flags} -Wno-int-conversion -Wl,-stack_size,0x4000000 -o ${bin_file} ${output_file} -lm'
 			println('  > ${cc_cmd}')
-			result = os.execute(cc_cmd)
+			result = run_compile_command(cc_cmd)
 			if result.exit_code != 0 {
 				eprintln('C compilation failed:')
 				eprintln(result.output)
@@ -264,6 +293,42 @@ fn print_type_errors(errors []types.TypeError) {
 	}
 }
 
+fn diagnostic_root_for_input(input_file string, user_files []string) string {
+	if input_file.len > 0 && os.is_dir(input_file) {
+		return os.real_path(input_file)
+	}
+	if user_files.len > 0 {
+		return os.real_path(os.dir(user_files[0]))
+	}
+	return os.real_path(os.getwd())
+}
+
+fn set_diagnostic_files(mut tc types.TypeChecker, user_files []string) {
+	for uf in user_files {
+		tc.diagnostic_files[uf] = true
+	}
+}
+
+fn set_unsupported_generic_files(mut tc types.TypeChecker, a &flat.FlatAst, include_imports bool, diagnostic_root string) {
+	if !include_imports {
+		return
+	}
+	for i, node in a.nodes {
+		if i < a.user_code_start || node.kind != .file || node.value.len == 0 {
+			continue
+		}
+		if path_is_in_dir(node.value, diagnostic_root) {
+			tc.diagnostic_files['generic:' + node.value] = true
+		}
+	}
+}
+
+fn path_is_in_dir(path string, dir string) bool {
+	real_path := os.real_path(path)
+	real_dir := os.real_path(dir)
+	return real_path == real_dir || real_path.starts_with(real_dir + os.path_separator)
+}
+
 fn resolve_imports(mut a flat.FlatAst, mut p parser.Parser, prefs &pref.Preferences, initial_files []string) {
 	mut parsed_modules := map[string]bool{}
 	parsed_modules['builtin'] = true
@@ -273,6 +338,7 @@ fn resolve_imports(mut a flat.FlatAst, mut p parser.Parser, prefs &pref.Preferen
 	if initial_files.len > 0 {
 		first_file = initial_files[0]
 	}
+	project_root := if first_file.len > 0 { os.dir(first_file) } else { os.getwd() }
 
 	mut changed := true
 	for changed {
@@ -296,7 +362,13 @@ fn resolve_imports(mut a flat.FlatAst, mut p parser.Parser, prefs &pref.Preferen
 			changed = true
 
 			importing_file := if cur_file.len > 0 { cur_file } else { first_file }
-			mod_dir := prefs.get_module_path(mod_name, importing_file)
+			mut mod_dir := prefs.get_module_path(mod_name, importing_file)
+			if mod_dir == '' {
+				root_mod_dir := os.join_path(project_root, mod_name.replace('.', os.path_separator))
+				if os.is_dir(root_mod_dir) {
+					mod_dir = root_mod_dir
+				}
+			}
 			if mod_dir == '' || !os.is_dir(mod_dir) {
 				continue
 			}
